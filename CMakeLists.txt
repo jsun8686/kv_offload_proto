@@ -29,7 +29,8 @@ if(_TARGET STREQUAL "emsd" OR _TARGET STREQUAL "all")
         ems/emsd/hcomm_host.cc
         ems/emsd/pool_mgr.cc
     )
-    target_include_directories(emsd PRIVATE common)
+    # include 形如 "common/kv_proto.h"（带前缀）→ 以仓库根为 include 根
+    target_include_directories(emsd PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(emsd PRIVATE dl pthread)
 endif()
 
