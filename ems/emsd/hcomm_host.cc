@@ -1,0 +1,204 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * KV offload prototype is licensed under Mulan PSL v2.
+ * emsd HCOMM host 侧建链实现（dlsym libhcomm，noDevice 基线）。
+ */
+
+#include "hcomm_host.h"
+
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+#define EMSD_DLSYM(var, name)                                                                                \
+    do {                                                                                                     \
+        (var) = reinterpret_cast<decltype(var)>(dlsym(dlHandle_, (name)));                                    \
+        if ((var) == nullptr) {                                                                              \
+            printf("[emsd][ERROR] dlsym %s failed, lib=%s, err=%s\n", (name), libPath_.c_str(), dlerror());   \
+            return -1;                                                                                       \
+        }                                                                                                    \
+    } while (0)
+
+int EmsdDynApi::Load(const std::string &libPath)
+{
+    void *h = dlopen(libPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (h == nullptr) {
+        printf("[emsd][ERROR] dlopen %s failed: %s\n", libPath.c_str(), dlerror());
+        return -1;
+    }
+    auto load = [h](auto &fn, const char *name) -> int {
+        fn = reinterpret_cast<decltype(fn)>(dlsym(h, name));
+        if (fn == nullptr) {
+            printf("[emsd][ERROR] dlsym %s failed: %s\n", name, dlerror());
+            return -1;
+        }
+        return 0;
+    };
+    if (load(HcommEndpointCreate, "HcommEndpointCreate") != 0 || load(HcommEndpointDestroy, "HcommEndpointDestroy") != 0 ||
+        load(HcommMemReg, "HcommMemReg") != 0 || load(HcommMemUnreg, "HcommMemUnreg") != 0 ||
+        load(HcommMemExport, "HcommMemExport") != 0 || load(HcommMemImport, "HcommMemImport") != 0 ||
+        load(HcommMemUnimport, "HcommMemUnimport") != 0 || load(HcommChannelCreate, "HcommChannelCreate") != 0 ||
+        load(HcommChannelGetStatus, "HcommChannelGetStatus") != 0 || load(HcommChannelDestroy, "HcommChannelDestroy") != 0) {
+        dlclose(h);
+        return -1;
+    }
+    return 0;
+}
+
+int EmsdHcomm::Init(const std::string &hcommLib, const std::string &localIp)
+{
+    libPath_ = hcommLib;
+    if (api_.Load(hcommLib) != 0) {
+        return -1;
+    }
+    dlHandle_ = nullptr;  // 句柄由 Load 内部持有（原型不重复关闭）
+
+    if (EndpointDescInit(&localDesc_, 1) != 0) {
+        printf("[emsd][ERROR] EndpointDescInit failed\n");
+        return -1;
+    }
+    localDesc_.protocol = COMM_PROTOCOL_UBC_CTP;  // = COMM_PROTOCOL_UB_CTP（跨节点 UBC，阶段一）
+    localDesc_.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+    localDesc_.commAddr.addr.s_addr = inet_addr(localIp.c_str());
+    localDesc_.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    localDesc_.loc.host.id = 0;  // 普通 host 通信 Id（noDevice 基线默认 0，联调按部署调整）
+
+    HcommResult ret = api_.HcommEndpointCreate(&localDesc_, &endpoint_);
+    if (ret != 0 || endpoint_ == nullptr) {
+        printf("[emsd][ERROR] HcommEndpointCreate ret=%d, localIp=%s\n", ret, localIp.c_str());
+        return -1;
+    }
+    printf("[emsd] EndpointCreate ok, handle=%p ip=%s\n", endpoint_, localIp.c_str());
+    return 0;
+}
+
+void EmsdHcomm::Close()
+{
+    for (uint32_t i = 0; i < KV_MAX_SEG_NUM; i++) {
+        if (segs_[i].used) {
+            (void)SegRelease(i, true);
+        }
+    }
+    if (endpoint_ != nullptr) {
+        (void)api_.HcommEndpointDestroy(endpoint_);
+        endpoint_ = nullptr;
+    }
+}
+
+int EmsdHcomm::SegRegister(uint32_t segIndex, uint32_t poolId, void *base, uint64_t size, uint16_t hcommListenPort,
+                           const std::string &channelTag)
+{
+    if (segIndex >= KV_MAX_SEG_NUM || base == nullptr || size == 0) {
+        return KV_ERR_PARAM;
+    }
+    EmsdSeg &seg = segs_[segIndex];
+    if (seg.used) {
+        return KV_ERR_STATE;
+    }
+    char memTag[64];
+    (void)snprintf(memTag, sizeof(memTag), "kv_seg_%u_%u", poolId, segIndex);
+    CommMem commMem{};
+    commMem.type = COMM_MEM_TYPE_HOST;
+    commMem.addr = base;
+    commMem.size = size;
+    HcommResult ret = api_.HcommMemReg(endpoint_, memTag, &commMem, &seg.memHandle);
+    if (ret != 0 || seg.memHandle == nullptr) {
+        printf("[emsd][ERROR] MemReg failed, poolId=%u segIndex=%u ret=%d size=%llu\n", poolId, segIndex, ret,
+               (unsigned long long)size);
+        return KV_ERR_HCOMM;
+    }
+    void *desc = nullptr;
+    uint32_t descLen = 0;
+    ret = api_.HcommMemExport(endpoint_, seg.memHandle, &desc, &descLen);
+    if (ret != 0 || desc == nullptr || descLen == 0 || descLen > KV_MAX_MEM_DESC) {
+        printf("[emsd][ERROR] MemExport failed, poolId=%u segIndex=%u ret=%d descLen=%u\n", poolId, segIndex, ret,
+               descLen);
+        return KV_ERR_HCOMM;
+    }
+    seg.memDesc.assign(static_cast<uint8_t *>(desc), static_cast<uint8_t *>(desc) + descLen);
+    seg.used = true;
+    seg.poolId = poolId;
+    seg.base = base;
+    seg.size = size;
+    seg.hcommListenPort = hcommListenPort;
+    seg.channelTag = channelTag;
+    printf("[emsd] SegRegister ok, poolId=%u segIndex=%u base=%p size=%llu memDescLen=%u\n", poolId, segIndex, base,
+           (unsigned long long)size, descLen);
+    return KV_OK;
+}
+
+int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t peerDescLen,
+                          const uint8_t *peerMemDesc, uint32_t peerMemDescLen, uint32_t readyTimeoutSec)
+{
+    if (segIndex >= KV_MAX_SEG_NUM || !segs_[segIndex].used) {
+        return KV_ERR_NOT_FOUND;
+    }
+    EmsdSeg &seg = segs_[segIndex];
+    if (seg.linked) {
+        return KV_ERR_STATE;
+    }
+    if (peerDescLen != sizeof(EndpointDesc)) {
+        return KV_ERR_PROTO;
+    }
+    // 导入对端（框架/NPU 侧）内存描述：本端 host 大块对框架可见，框架侧内存对本端可见
+    // （数据面单边直驱仅要求对端可写本段，import 为交换协议完整性保留）
+    CommMem remoteMem{};
+    HcommResult ret = api_.HcommMemImport(endpoint_, peerMemDesc, peerMemDescLen, &remoteMem);
+    if (ret != 0) {
+        printf("[emsd][ERROR] MemImport failed, poolId=%u segIndex=%u ret=%d\n", seg.poolId, segIndex, ret);
+        return KV_ERR_HCOMM;
+    }
+    HcommChannelDesc chDesc;
+    if (HcommChannelDescInit(&chDesc, 1) != 0) {
+        return KV_ERR_HCOMM;
+    }
+    chDesc.remoteEndpoint = *reinterpret_cast<const EndpointDesc *>(peerDesc);
+    chDesc.notifyNum = 1;
+    chDesc.exchangeAllMems = true;  // 每段单内存
+    chDesc.role = HCOMM_SOCKET_ROLE_SERVER;
+    chDesc.port = seg.hcommListenPort;
+    chDesc.qos = 0;
+    chDesc.channelName = const_cast<char *>(seg.channelTag.c_str());
+    ret = api_.HcommChannelCreate(endpoint_, COMM_ENGINE_AIV, &chDesc, 1, &seg.channel);
+    if (ret != 0 || seg.channel == 0) {
+        printf("[emsd][ERROR] ChannelCreate(AIV,server) failed, poolId=%u segIndex=%u port=%u ret=%d\n", seg.poolId,
+               segIndex, seg.hcommListenPort, ret);
+        return KV_ERR_HCOMM;
+    }
+    // 创建即返回：server 侧 READY 依赖框架侧 client 通道建链完成后由 hcomm 内部交换推进，
+    // 此处阻塞轮询会与 client 侧建链互等（client 需先收到本响应才会发起 ChannelCreate）。
+    // READY 以框架侧 client 通道 GetStatus 为准。readyTimeoutSec 保留给联调期诊断开关。
+    seg.linked = true;
+    printf("[emsd] LinkServer created, poolId=%u segIndex=%u channel=0x%llx\n", seg.poolId, segIndex,
+           (unsigned long long)seg.channel);
+    return KV_OK;
+}
+
+int EmsdHcomm::SegRelease(uint32_t segIndex, bool destroyChannel)
+{
+    if (segIndex >= KV_MAX_SEG_NUM || !segs_[segIndex].used) {
+        return KV_ERR_NOT_FOUND;
+    }
+    EmsdSeg &seg = segs_[segIndex];
+    if (destroyChannel && seg.linked && seg.channel != 0) {
+        (void)api_.HcommChannelDestroy(&seg.channel, 1);
+    }
+    if (seg.memHandle != nullptr) {
+        (void)api_.HcommMemUnreg(endpoint_, seg.memHandle);
+    }
+    printf("[emsd] SegRelease, poolId=%u segIndex=%u\n", seg.poolId, segIndex);
+    seg = EmsdSeg{};
+    return KV_OK;
+}
+
+const EmsdSeg *EmsdHcomm::GetSeg(uint32_t segIndex) const
+{
+    if (segIndex >= KV_MAX_SEG_NUM || !segs_[segIndex].used) {
+        return nullptr;
+    }
+    return &segs_[segIndex];
+}
