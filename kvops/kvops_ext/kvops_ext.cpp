@@ -1,10 +1,13 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * KV offload prototype is licensed under Mulan PSL v2.
- * kvops_ext：AIV 批量算子 launch 封装（fatbin 显式加载链，PoC 方案 B）。
- *   aclrtSetDevice -> aclrtBinaryLoadFromFile(LAZY_LOAD) -> aclrtBinaryGetFunction(原名)
- *   -> aclrtLaunchKernelWithHostArgs（SCHEM_MODE=1 + TIMEOUT_US + ENGINE_TYPE=AIV）
+ * kvops_ext：AIV 算子 launch 封装（fatbin 显式加载链，PoC 方案 B）。
+ *   内核：kvc_gather_rows（稠密导入）/ kvc_scatter_rows_alllayer（全层导出）
+ *         hisp_sieve_update（SIEVE miss 识别，哈希-only）/ hisp_sieve_ht_init（哈希表构建）
  * launch 均不在内部同步/读 device 内存（图捕获安全）；status 槽由调用方管理。
+ * sieve 派生公式与 sglang-0730 hisparse_lru_host.cpp 严格一致：
+ *   htSize = 2 的幂 ≥ 2×(padded+topK)（装载因子 ≤0.5）
+ *   reqsPerCore 对齐 64/gcd(topK,64)（每 block 输出段 64B cache line 对齐）
  */
 
 #include <pybind11/pybind11.h>
@@ -29,6 +32,7 @@ constexpr int32_t LAUNCH_ATTR_ENGINE_TYPE = 3;
 constexpr int32_t LAUNCH_ATTR_TIMEOUT_US = 8;
 constexpr int32_t BINARY_LOAD_OPT_LAZY_LOAD = 1;
 constexpr int32_t ENGINE_TYPE_AIV = 1;
+constexpr int64_t UB_BUDGET_BYTES = 176 * 1024;  // 192KB/核留余量
 
 union BinOptVal {
     uint32_t isLazyLoad;
@@ -74,8 +78,9 @@ void *rtLib = nullptr;
 void *g_binary = nullptr;
 void *g_fnGather = nullptr;
 void *g_fnScatterAll = nullptr;
-void *g_fnScatterRows = nullptr;
-void *g_overflowBuf = nullptr;  // 8B overflow 尾槽 device buffer
+void *g_fnSieveUpdate = nullptr;
+void *g_fnSieveHtInit = nullptr;
+void *g_overflowBuf = nullptr;
 bool g_inited = false;
 
 template <typename T>
@@ -88,28 +93,16 @@ T Sym(const char *name)
     return fn;
 }
 
-int LoadFatbin(const std::string &path)
+int64_t Gcd(int64_t a, int64_t b)
 {
-    BinOpt opt{};
-    opt.type = BINARY_LOAD_OPT_LAZY_LOAD;
-    opt.value.isLazyLoad = 1;
-    BinOpts opts{&opt, 1};
-    int32_t ret = rt.aclrtBinaryLoadFromFile(path.c_str(), &opts, &g_binary);
-    if (ret != 0 || g_binary == nullptr) {
-        throw std::runtime_error("BinaryLoadFromFile ret=" + std::to_string(ret) + " path=" + path);
+    while (b != 0) {
+        int64_t t = a % b;
+        a = b;
+        b = t;
     }
-    const char *names[3] = {"kvc_gather_rows", "kvc_scatter_rows_alllayer", "kvc_scatter_rows"};
-    void **fns[3] = {&g_fnGather, &g_fnScatterAll, &g_fnScatterRows};
-    for (int i = 0; i < 3; i++) {
-        ret = rt.aclrtBinaryGetFunction(g_binary, names[i], fns[i]);
-        if (ret != 0 || *fns[i] == nullptr) {
-            throw std::runtime_error(std::string("GetFunction ") + names[i] + " ret=" + std::to_string(ret));
-        }
-    }
-    return 0;
+    return a;
 }
 
-// 通用 launch：args 结构体 + 8B overflow 尾槽
 void LaunchCommon(void *fn, const void *argsStruct, size_t argsSize, uint32_t blockDim, uint64_t stream)
 {
     uint8_t buf[160];
@@ -170,11 +163,27 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
         throw std::runtime_error("alloc overflow buf failed");
     }
     (void)rt.aclrtMemset(g_overflowBuf, 8, 0, 8);
-    LoadFatbin(fatbinPath);
+
+    BinOpt opt{};
+    opt.type = BINARY_LOAD_OPT_LAZY_LOAD;
+    opt.value.isLazyLoad = 1;
+    BinOpts opts{&opt, 1};
+    int32_t ret = rt.aclrtBinaryLoadFromFile(fatbinPath.c_str(), &opts, &g_binary);
+    if (ret != 0 || g_binary == nullptr) {
+        throw std::runtime_error("BinaryLoadFromFile ret=" + std::to_string(ret) + " path=" + fatbinPath);
+    }
+    const char *names[4] = {"kvc_gather_rows", "kvc_scatter_rows_alllayer", "hisp_sieve_update",
+                            "hisp_sieve_ht_init"};
+    void **fns[4] = {&g_fnGather, &g_fnScatterAll, &g_fnSieveUpdate, &g_fnSieveHtInit};
+    for (int i = 0; i < 4; i++) {
+        ret = rt.aclrtBinaryGetFunction(g_binary, names[i], fns[i]);
+        if (ret != 0 || *fns[i] == nullptr) {
+            throw std::runtime_error(std::string("GetFunction ") + names[i] + " ret=" + std::to_string(ret));
+        }
+    }
     g_inited = true;
 }
 
-// 分配 status 槽（64B/槽），返回 GM 地址
 uint64_t kv_alloc_status(int count)
 {
     EnsureInited();
@@ -186,54 +195,61 @@ uint64_t kv_alloc_status(int count)
     return reinterpret_cast<uint64_t>(buf);
 }
 
-// 轮询某槽：等 (doneSeq==1)，返回 errCode（低 32 位）；GIL 释放
 int64_t kv_poll_status(uint64_t statusAddr, int64_t timeoutUs)
 {
     EnsureInited();
-    {
-        py::gil_scoped_release release;
-        const uint64_t deadline = static_cast<uint64_t>(timeoutUs < 0 ? INT64_MAX : timeoutUs);
-        uint64_t waited = 0;
-        while (true) {
-            uint64_t val = 0;
-            if (rt.aclrtMemcpy(&val, 8, reinterpret_cast<const void *>(statusAddr), 8, 3 /*D2O*/) != 0) {
-                return -0x1000;  // memcpy 失败
-            }
-            if ((val >> 32) == 1) {
-                return static_cast<int64_t>(val & 0xFFFFFFFF);
-            }
-            if (waited >= deadline) {
-                return -0x2000;  // 超时
-            }
-            usleep(100);
-            waited += 100;
+    py::gil_scoped_release release;
+    const uint64_t deadline = static_cast<uint64_t>(timeoutUs < 0 ? INT64_MAX : timeoutUs);
+    uint64_t waited = 0;
+    while (true) {
+        uint64_t val = 0;
+        if (rt.aclrtMemcpy(&val, 8, reinterpret_cast<const void *>(statusAddr), 8, 3 /*D2O*/) != 0) {
+            return -0x1000;  // memcpy 失败
         }
+        if ((val >> 32) == 1) {
+            return static_cast<int64_t>(val & 0xFFFFFFFF);
+        }
+        if (waited >= deadline) {
+            return -0x2000;  // 超时
+        }
+        usleep(100);
+        waited += 100;
     }
 }
 
-void kv_import_seg(uint64_t channel, uint64_t segBase, int layerId, uint32_t perLayerSegRows, uint32_t rowBytes,
-                   uint64_t indicesHost, uint64_t indicesDst, uint64_t numRealAddr, uint64_t dstLayerBase,
-                   uint32_t maxBatch, uint32_t stripeRows, uint32_t nodeNum, uint32_t myNode, uint64_t status,
-                   uint64_t stream, uint32_t blockDim)
+// ── 批量导入（稠密）：N 段循环由 Python 侧逐段调用 ──
+void kv_import_seg(uint64_t channel, uint64_t segBase, uint32_t layerOffsetRows, uint32_t perLayerSegRows,
+                   uint32_t rowBytes, uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t reqHostBase,
+                   uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal, uint64_t hotRowBase,
+                   uint32_t topK, uint32_t maxNumReqs, uint32_t stripeRows, uint32_t nodeNum, uint32_t myNode,
+                   uint64_t status, uint64_t stream, uint32_t blockDim)
 {
     EnsureInited();
+    if (blockDim > 8) {
+        throw std::runtime_error("import blockDim must be <= 8 (status slot layout)");
+    }
     KvcGatherArgs args{};
     args.channel = channel;
     args.segBase = segBase;
-    args.indicesHost = indicesHost;
-    args.indicesDst = indicesDst;
-    args.numRealAddr = numRealAddr;
-    args.dstLayerBase = dstLayerBase;
+    args.topkIndices = topkIndices;
+    args.reqPoolIndices = reqPoolIndices;
+    args.reqHostBase = reqHostBase;
+    args.topKDeviceSlots = topKDeviceSlots;
+    args.isMiss = isMiss;
+    args.numReal = numReal;
+    args.hotRowBase = hotRowBase;
     args.status = status;
-    args.layerOffsetRows = static_cast<uint32_t>(layerId) * perLayerSegRows;
+    args.layerOffsetRows = layerOffsetRows;
     args.perLayerSegRows = perLayerSegRows;
     args.rowBytes = rowBytes;
     args.stripeRows = stripeRows;
     args.nodeNum = nodeNum;
     args.myNode = myNode;
-    args.maxBatch = maxBatch;
-    // 状态槽清零（launch 前）；图模式下由 capture 记录，replay 前由框架清理
-    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), 8, 0, 8);
+    args.topK = topK;
+    args.maxNumReqs = maxNumReqs;
+    const uint32_t totalPos = maxNumReqs * topK;
+    args.positionsPerCore = (totalPos + blockDim - 1) / blockDim;  // 对齐由 Python 侧校验（64 元素）
+    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 8, 0, blockDim * 8);
     LaunchCommon(g_fnGather, &args, sizeof(args), blockDim, stream);
 }
 
@@ -261,29 +277,84 @@ void kv_export_seg_alllayer(uint64_t channel, uint64_t segBase, uint32_t perLaye
     LaunchCommon(g_fnScatterAll, &args, sizeof(args), blockDim, stream);
 }
 
-void kv_export_rows(uint64_t channel, uint64_t segBase, int layerId, uint32_t perLayerSegRows, uint32_t rowBytes,
-                    uint64_t indicesHost, uint64_t indicesDst, uint64_t numRealAddr, uint64_t srcLayerBase,
-                    uint32_t maxBatch, uint32_t stripeRows, uint32_t nodeNum, uint32_t myNode, uint64_t status,
-                    uint64_t stream, uint32_t blockDim)
+// ── SIEVE 更新（哈希-only；htSize/reqsPerCore 由本侧派生，公式与 sglang-0730 一致） ──
+void kv_sieve_update(uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t seqLens, uint64_t prefillLens,
+                     uint64_t deviceBufferTokens, uint64_t deviceBufferVisited, uint64_t deviceBufferHt,
+                     uint64_t sieveHand, uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal,
+                     uint32_t topK, uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t visitedStrideB,
+                     uint32_t maxNumReqs, uint32_t poolSize, uint64_t stream, uint32_t blockDim)
 {
     EnsureInited();
-    KvcGatherArgs args{};
-    args.channel = channel;
-    args.segBase = segBase;
-    args.indicesHost = indicesHost;
-    args.indicesDst = indicesDst;
-    args.numRealAddr = numRealAddr;
-    args.dstLayerBase = srcLayerBase;  // 单层导出复用同结构：此字段为 HBM 源层基址
-    args.status = status;
-    args.layerOffsetRows = static_cast<uint32_t>(layerId) * perLayerSegRows;
-    args.perLayerSegRows = perLayerSegRows;
-    args.rowBytes = rowBytes;
-    args.stripeRows = stripeRows;
-    args.nodeNum = nodeNum;
-    args.myNode = myNode;
-    args.maxBatch = maxBatch;
-    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), 8, 0, 8);
-    LaunchCommon(g_fnScatterRows, &args, sizeof(args), blockDim, stream);
+    if (paddedBufferSize % 16 != 0) {
+        throw std::runtime_error("sieve_update: padded_buffer_size must be a multiple of 16 (64-byte rows)");
+    }
+    if (paddedBufferSize > 65534) {
+        throw std::runtime_error("sieve_update: padded_buffer_size must be <= 65534 (uint16 hash slots)");
+    }
+    if (visitedStrideB % 64 != 0 || visitedStrideB < (paddedBufferSize + 7) / 8) {
+        throw std::runtime_error("sieve_update: visited bitmap stride must be 64B aligned and cover padded");
+    }
+    int64_t htSize = 1024;
+    while (htSize < 2 * (static_cast<int64_t>(paddedBufferSize) + topK)) {
+        htSize <<= 1;
+    }
+    // UB 预算：tokens 行 + visited 位图行 + 哈希表
+    int64_t ubBytes = paddedBufferSize * 4 + visitedStrideB + htSize * 2;
+    if (ubBytes > UB_BUDGET_BYTES) {
+        throw std::runtime_error("sieve_update: UB usage " + std::to_string(ubBytes) +
+                                 " bytes exceeds the 176KB budget");
+    }
+    int64_t rpcAlign = 64 / Gcd(topK, 64);
+    int64_t reqsPerCore = (maxNumReqs + blockDim - 1) / blockDim;
+    reqsPerCore = (reqsPerCore + rpcAlign - 1) / rpcAlign * rpcAlign;
+    if (reqsPerCore < 1) {
+        reqsPerCore = 1;
+    }
+
+    HispSieveUpdateArgs args{};
+    args.topkIndices = topkIndices;
+    args.reqPoolIndices = reqPoolIndices;
+    args.seqLens = seqLens;
+    args.prefillLens = prefillLens;
+    args.deviceBufferTokens = deviceBufferTokens;
+    args.deviceBufferVisited = deviceBufferVisited;
+    args.deviceBufferHt = deviceBufferHt;
+    args.sieveHand = sieveHand;
+    args.topKDeviceSlots = topKDeviceSlots;
+    args.isMiss = isMiss;
+    args.numReal = numReal;
+    args.status = 0;
+    args.topK = topK;
+    args.deviceBufferSize = deviceBufferSize;
+    args.paddedBufferSize = paddedBufferSize;
+    args.visitedStrideB = visitedStrideB;
+    args.maxNumReqs = maxNumReqs;
+    args.reqsPerCore = static_cast<uint32_t>(reqsPerCore);
+    args.htSize = static_cast<uint32_t>(htSize);
+    args.poolSize = poolSize;
+    LaunchCommon(g_fnSieveUpdate, &args, sizeof(args), blockDim, stream);
+}
+
+// ── SIEVE 哈希表构建（blockDim = layerNum × numReqs；htSize 传入须为 2 的幂 ≥2×(padded+topK)） ──
+void kv_sieve_ht_init(uint64_t deviceBufferTokens, uint64_t deviceBufferHt, uint64_t prefillLens,
+                      uint32_t reqStart, uint32_t numReqs, uint32_t layerNum, uint32_t poolSize,
+                      uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t htSize, uint64_t stream,
+                      uint32_t blockDim)
+{
+    EnsureInited();
+    HispSieveHtInitArgs args{};
+    args.deviceBufferTokens = deviceBufferTokens;
+    args.deviceBufferHt = deviceBufferHt;
+    args.prefillLens = prefillLens;
+    args.status = 0;
+    args.reqStart = reqStart;
+    args.numReqs = numReqs;
+    args.layerNum = layerNum;
+    args.poolSize = poolSize;
+    args.deviceBufferSize = deviceBufferSize;
+    args.paddedBufferSize = paddedBufferSize;
+    args.htSize = htSize;
+    LaunchCommon(g_fnSieveHtInit, &args, sizeof(args), blockDim, stream);
 }
 
 void kv_close()
@@ -302,13 +373,13 @@ void kv_close()
 PYBIND11_MODULE(_kvops, m)
 {
     m.doc() = "kvops AIV launch ext (fatbin explicit loading chain)";
-    m.def("init", &kv_init, py::arg("device_id"), py::arg("fatbin_path"),
-          py::arg("rt_lib") = "libascendcl.so");
+    m.def("init", &kv_init, py::arg("device_id"), py::arg("fatbin_path"), py::arg("rt_lib") = "libascendcl.so");
     m.def("alloc_status", &kv_alloc_status, py::arg("count"));
     m.def("poll_status", &kv_poll_status, py::arg("status_addr"), py::arg("timeout_us") = -1);
-    m.def("import_seg", &kv_import_seg, py::arg("channel"), py::arg("seg_base"), py::arg("layer_id"),
-          py::arg("per_layer_seg_rows"), py::arg("row_bytes"), py::arg("indices_host"), py::arg("indices_dst"),
-          py::arg("num_real_addr"), py::arg("dst_layer_base"), py::arg("max_batch"), py::arg("stripe_rows"),
+    m.def("import_seg", &kv_import_seg, py::arg("channel"), py::arg("seg_base"), py::arg("layer_offset_rows"),
+          py::arg("per_layer_seg_rows"), py::arg("row_bytes"), py::arg("topk_indices"), py::arg("req_pool_indices"),
+          py::arg("req_host_base"), py::arg("topk_device_slots"), py::arg("is_miss"), py::arg("num_real"),
+          py::arg("hot_row_base"), py::arg("top_k"), py::arg("max_num_reqs"), py::arg("stripe_rows"),
           py::arg("node_num"), py::arg("my_node"), py::arg("status"), py::arg("stream") = 0,
           py::arg("block_dim") = 1);
     m.def("export_seg_alllayer", &kv_export_seg_alllayer, py::arg("channel"), py::arg("seg_base"),
@@ -316,10 +387,15 @@ PYBIND11_MODULE(_kvops, m)
           py::arg("layer_num"), py::arg("src_layer0_base"), py::arg("src_layer_stride"), py::arg("stripe_rows"),
           py::arg("node_num"), py::arg("my_node"), py::arg("status"), py::arg("stream") = 0,
           py::arg("block_dim") = 1);
-    m.def("export_rows", &kv_export_rows, py::arg("channel"), py::arg("seg_base"), py::arg("layer_id"),
-          py::arg("per_layer_seg_rows"), py::arg("row_bytes"), py::arg("indices_host"), py::arg("indices_dst"),
-          py::arg("num_real_addr"), py::arg("src_layer_base"), py::arg("max_batch"), py::arg("stripe_rows"),
-          py::arg("node_num"), py::arg("my_node"), py::arg("status"), py::arg("stream") = 0,
-          py::arg("block_dim") = 1);
+    m.def("sieve_update", &kv_sieve_update, py::arg("topk_indices"), py::arg("req_pool_indices"),
+          py::arg("seq_lens"), py::arg("prefill_lens"), py::arg("device_buffer_tokens"),
+          py::arg("device_buffer_visited"), py::arg("device_buffer_ht"), py::arg("sieve_hand"),
+          py::arg("topk_device_slots"), py::arg("is_miss"), py::arg("num_real"), py::arg("top_k"),
+          py::arg("device_buffer_size"), py::arg("padded_buffer_size"), py::arg("visited_stride_b"),
+          py::arg("max_num_reqs"), py::arg("pool_size"), py::arg("stream") = 0, py::arg("block_dim") = 8);
+    m.def("sieve_ht_init", &kv_sieve_ht_init, py::arg("device_buffer_tokens"), py::arg("device_buffer_ht"),
+          py::arg("prefill_lens"), py::arg("req_start"), py::arg("num_reqs"), py::arg("layer_num"),
+          py::arg("pool_size"), py::arg("device_buffer_size"), py::arg("padded_buffer_size"),
+          py::arg("ht_size"), py::arg("stream") = 0, py::arg("block_dim") = 0);
     m.def("close", &kv_close);
 }

@@ -1,8 +1,8 @@
 # XDS KV Cache AIV 直驱卸载 软件设计方案
 
-版本：V1.0
+版本：V1.1
 作者：
-日期：2026-11-05
+日期：2026-11-06
 评审人：SUNJIE
 
 变更记录：
@@ -10,6 +10,7 @@
 | 版本 | 日期 | 修改人 | 修改内容 |
 | --- | --- | --- | --- |
 | V1.0 | 2026-11-05 |  | 首次定稿：单仓三组件（ems/kvops/xds）、多资源节点、分配均衡打散到各节点、基于 HCOMM 的 AIV 直驱批量算子、图捕获两级验证 |
+| V1.1 | 2026-11-06 |  | 见附录 A：miss 识别 device 化（SIEVE 哈希-only 移植）；导入算子稠密化；xds 三文件重组；构建/运行拆分 |
 
 ## 1. 概述
 
@@ -515,3 +516,59 @@ launch 链（PoC 方案 B，已验证）：`aclrtBinaryLoadFromFile(fatbin, {LAZ
 | M4（预留） | UB_RTP(UBG) 跨模式切换验证（建链参数切换 + 回归 V0-V4） | 切换后矩阵复测通过 | 1 周（视 UBG 环境就绪） |
 
 里程碑依赖：V0 中的跨模式 socket 预案与 V1 图捕获为两个最高风险前置项，安排在 M1/M2 最前段执行以尽早暴露。
+
+## 附录 A：V1.1 修订（miss 识别 device 化与工程重组）
+
+### A.1 miss 识别 device 化（SIEVE 算子，移植自 sglang-0730）
+
+原 V1.0 中 miss 判定为框架侧 CPU 扫描（Python 集合/位图）。V1.1 移植 sglang-0730 hisparse 的 SIEVE 内核，按以下裁剪落地为本仓算子：
+
+| 项 | 决策 |
+| --- | --- |
+| 算法 | SIEVE（FIFO 环形 + visited 位 + hand 指针，摊还 O(1)）；LRU 变体不移植 |
+| 哈希模式 | 仅保留开放寻址哈希（Knuth 乘法散列 + 线性探测 + backward-shift 删除，无 tombstone）；直接索引位图模式去除——ht 容量与上下文长度解耦（2 的幂 >= 2x(padded+topK)，装载因子 <=0.5） |
+| visited 存储 | 位图化（uint8 packed bit，/8 HBM 与 UB 占用）；访问经读-改-写单字节 |
+| 正确性约束族（照搬） | padded%16==0、padded<=65534（uint16 槽号）、visited 位图行 64B 对齐、hand 行距 16xint32（64B cache line，防跨 block 标量 store 互踩）、reqsPerCore 对齐 64/gcd(topK,64)、UB 预算 <=176KB/核 |
+| 输出契约 | 稠密 top_k_device_slots/is_miss [maxNumReqs, topK]，全行重写 + (-1) 哨兵（调用方免修正趟，图 replay padding 行安全） |
+| 新内核 | hisp_sieve_update（逐层切片状态更新）、hisp_sieve_ht_init（admission 恒等布局建表） |
+
+### A.2 批量导入算子稠密化（kvc_gather_rows v2）
+
+导入算子输入由压缩行列表（indices_host/indices_dst）改为直接消费 sieve 稠密输出：
+
+扫描 [numReal x topK)：isMiss==1 且 (row/S)%N == myNode 才搬运；
+src 行号 = reqHostBase[bid] + tokenPos（行分配连续性契约，免 req_to_host_pool 大表）；
+dst 行号 = hotRowBase + slot（热缓冲槽固定偏移契约，免 req_to_device_buffer 大表）；
+多 block 按 positions 分片（每 block 独立 Hcomm 实例/WQE 流水，status 按 block 分片 <=8）。
+
+压缩版 kvc_scatter_rows（单层索引导出）删除；全层区间导出 kvc_scatter_rows_alllayer 不变。
+
+### A.3 xds 组件重组（三分文件）
+
+xds/
+- xds_decode.py    主程序入口（参数化：--req-num/--miss-ratio/--topk/...；--oracle CPU 对拍；--run-dir 日志）
+- xds_offload.py   XdsOffloadCoordinator：SIEVE 状态张量（按层持久）/admission/每步 sieve_update
+- xds_ems_pool.py  EmsPool（替换 mempoolhost.py）：init/alloc_rows/free_rows/batch_read(稠密)/batch_write_alllayers
+
+SIEVE 状态张量（HBM 预算优先；pool=请求槽位，按层 [L, pool, ...]）：
+
+| 张量 | 形状/dtype | 优化点 |
+| --- | --- | --- |
+| device_buffer_tokens | [L,pool,padded] int32 | 保留（ht_erase 反查必需；ctx>64k 不可压位宽） |
+| device_buffer_visited | [L,pool,ceil(padded/8) 上取 64B] uint8 位图 | /8（原 uint8/槽） |
+| device_buffer_ht | [L,pool,2^k>=2(padded+topK)] uint16 | 哈希-only（与 ctx 长度解耦） |
+| sieve_hand | [L,pool,16] int32 | 保留 64B 行距（正确性约束） |
+| req_host_base | [maxNumReqs] int64 | 压缩（替代 req_to_host_pool [reqs,ctx]，200MB 级降到 KB 级） |
+
+### A.4 构建/运行拆分
+
+- 构建统一入口 build.sh [emsd|kernel|ext|all]（资源节点仅需 emsd；NPU 机 ext+kernel）。
+- 运行即两个现成入口：资源节点 emsd（master/worker）；计算节点 python -m xds.xds_decode。
+- README 对齐 memfabric 14 号示例结构（快速开始/参数表/验收标准/排障表）；xds_decode 支持 --run-dir（默认 ./log，每次截断重写）。
+
+### A.5 验证矩阵增补
+
+| 编号 | 内容 |
+| --- | --- |
+| V2' | 稠密导入对拍：--oracle 模式 CPU sieve 模型逐层校验 slots/is_miss（second_chance/ht_churn/重复 token 用例已入单测） |
+| V6 | SIEVE 内核规模场景（参考 test_hisparse_lru_npu.py：reqs 1..256 x topK x blockDim 扫描）留 M2 图捕获一并回归 |

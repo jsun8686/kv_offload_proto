@@ -1,0 +1,165 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+ * KV offload prototype is licensed under Mulan PSL v2.
+ * hisp_sieve_update：SIEVE miss 识别/淘汰更新（哈希-only，移植自 sglang-0730 hisparse_sieve_update）。
+ *
+ * 算法：命中置 visited 位；miss 时 hand 前扫清 visited 位并淘汰首个未访问槽（摊还 O(1)）。
+ * 状态（按池行，逐层切片传入）：tokens[pool,padded] int32 / visited[pool,visStrideB] 位图 /
+ * ht[pool,htSize] uint16（开放寻址）/ hand[pool,16] int32。
+ * 输出契约：全量重写 [0,maxNumReqs) 的 slots/is_miss 行（-1 哨兵），调用方免修正趟（图安全）。
+ */
+
+#include "hisp_kernel_common.h"
+#include "kvc_args.h"
+#include "kvc_common.h"
+
+extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
+{
+    const __gm__ HispSieveUpdateArgs *args = reinterpret_cast<const __gm__ HispSieveUpdateArgs *>(argsBuf);
+    __gm__ int32_t *numRealPtr = reinterpret_cast<__gm__ int32_t *>(args->numReal);
+    int32_t numReal = numRealPtr[0];
+    if (numReal > static_cast<int32_t>(args->maxNumReqs)) {
+        numReal = args->maxNumReqs;  // 防御：GM 标量可能过期
+    }
+
+    __gm__ int64_t *reqPoolPtr = reinterpret_cast<__gm__ int64_t *>(args->reqPoolIndices);
+    __gm__ int32_t *seqLenPtr = reinterpret_cast<__gm__ int32_t *>(args->seqLens);
+    __gm__ int32_t *prefillPtr = reinterpret_cast<__gm__ int32_t *>(args->prefillLens);
+    __gm__ int32_t *topkPtr = reinterpret_cast<__gm__ int32_t *>(args->topkIndices);
+    __gm__ int32_t *tokensPtr = reinterpret_cast<__gm__ int32_t *>(args->deviceBufferTokens);
+    __gm__ uint8_t *visPtr = reinterpret_cast<__gm__ uint8_t *>(args->deviceBufferVisited);
+    __gm__ uint16_t *htPtr = reinterpret_cast<__gm__ uint16_t *>(args->deviceBufferHt);
+    __gm__ int32_t *handPtr = reinterpret_cast<__gm__ int32_t *>(args->sieveHand);
+    __gm__ int32_t *outSlotsPtr = reinterpret_cast<__gm__ int32_t *>(args->topKDeviceSlots);
+    __gm__ int8_t *isMissPtr = reinterpret_cast<__gm__ int8_t *>(args->isMiss);
+
+    const int32_t blockIdx = GetBlockIdx();
+    int32_t startReq = blockIdx * static_cast<int32_t>(args->reqsPerCore);
+    int32_t endReq = startReq + static_cast<int32_t>(args->reqsPerCore);
+    if (endReq > static_cast<int32_t>(args->maxNumReqs)) {
+        endReq = args->maxNumReqs;
+    }
+
+    TPipe pipe;
+    TBuf<TPosition::VECCALC> tokBuf;
+    TBuf<TPosition::VECCALC> visBuf;
+    TBuf<TPosition::VECCALC> htBuf;
+    pipe.InitBuffer(tokBuf, args->paddedBufferSize * sizeof(int32_t));
+    pipe.InitBuffer(visBuf, args->visitedStrideB);
+    pipe.InitBuffer(htBuf, args->htSize * sizeof(uint16_t));
+    LocalTensor<int32_t> tokLocal = tokBuf.Get<int32_t>();
+    LocalTensor<uint8_t> visLocal = visBuf.Get<uint8_t>();
+    LocalTensor<uint16_t> htLocal = htBuf.Get<uint16_t>();
+
+    const int32_t htMask = static_cast<int32_t>(args->htSize) - 1;
+
+    for (int32_t bid = startReq; bid < endReq; ++bid) {
+        __gm__ int32_t *reqOutSlots = outSlotsPtr + static_cast<int64_t>(bid) * args->topK;
+        __gm__ int8_t *reqIsMiss = isMissPtr + static_cast<int64_t>(bid) * args->topK;
+
+        // padding 行（图 replay）：只写哑输出，不读未定义内容
+        if (bid >= numReal) {
+            for (int32_t k = 0; k < static_cast<int32_t>(args->topK); ++k) {
+                reqOutSlots[k] = -1;
+                reqIsMiss[k] = 0;
+            }
+            continue;
+        }
+
+        const int64_t reqIdx = reqPoolPtr[bid];
+        // 防御：越界池行写哑输出，不进行 GM 越界寻址
+        if (reqIdx < 0 || reqIdx >= static_cast<int64_t>(args->poolSize)) {
+            for (int32_t k = 0; k < static_cast<int32_t>(args->topK); ++k) {
+                reqOutSlots[k] = -1;
+                reqIsMiss[k] = 0;
+            }
+            continue;
+        }
+
+        const int32_t seqLen = seqLenPtr[bid];
+        const int32_t prefill = prefillPtr[reqIdx];
+        __gm__ int32_t *reqTopk = topkPtr + static_cast<int64_t>(bid) * args->topK;
+        __gm__ int32_t *reqTokens = tokensPtr + reqIdx * args->paddedBufferSize;
+        __gm__ uint8_t *reqVis = visPtr + reqIdx * args->visitedStrideB;
+        __gm__ uint16_t *reqHt = htPtr + reqIdx * args->htSize;
+
+        GlobalTensor<int32_t> tokGm;
+        GlobalTensor<uint8_t> visGm;
+        GlobalTensor<uint16_t> htGm;
+        tokGm.SetGlobalBuffer(reqTokens);
+        visGm.SetGlobalBuffer(reqVis);
+        htGm.SetGlobalBuffer(reqHt);
+        DataCopy(tokLocal, tokGm, args->paddedBufferSize);
+        DataCopy(visLocal, visGm, args->visitedStrideB);
+        DataCopy(htLocal, htGm, args->htSize);
+        PipeBarrier<PIPE_ALL>();
+
+        int32_t hand = handPtr[reqIdx * hisp::kHandStride];
+        if (hand < 0 || hand >= static_cast<int32_t>(args->deviceBufferSize)) {
+            hand = 0;  // 防御：脏 hand 钳回有效区间
+        }
+
+        bool htDirty = false;  // 仅命中不改表 → 跳过 tokens/ht 写回
+
+        for (int32_t k = 0; k < static_cast<int32_t>(args->topK); ++k) {
+            const int32_t tokenPos = reqTopk[k];
+
+            if (tokenPos < 0 || tokenPos >= seqLen) {
+                reqOutSlots[k] = -1;
+                reqIsMiss[k] = 0;
+                continue;
+            }
+            if (tokenPos >= prefill) {
+                // decode 增量 token：扩展槽，永不淘汰、永不 miss
+                reqOutSlots[k] = args->paddedBufferSize + (tokenPos - prefill);
+                reqIsMiss[k] = 0;
+                continue;
+            }
+
+            const int32_t hitSlot = hisp::ht_find(htLocal, tokLocal, tokenPos, htMask);
+            if (hitSlot >= 0) {
+                reqOutSlots[k] = hitSlot;
+                reqIsMiss[k] = 0;
+                hisp::vis_set(visLocal, hitSlot);
+                continue;
+            }
+
+            // SIEVE 淘汰：hand 前扫清 visited 位，淘汰首个未访问槽
+            int32_t h = hand;
+            while (hisp::vis_get(visLocal, h) != 0) {
+                hisp::vis_clear(visLocal, h);
+                ++h;
+                if (h == static_cast<int32_t>(args->deviceBufferSize)) {
+                    h = 0;
+                }
+            }
+
+            const int32_t oldToken = tokLocal.GetValue(h);
+            if (oldToken >= 0) {
+                hisp::ub_ht_erase_bs(htLocal, tokLocal, oldToken, htMask);
+            }
+            hisp::ht_insert(htLocal, tokLocal, tokenPos, h, htMask);
+            htDirty = true;
+
+            reqOutSlots[k] = h;
+            reqIsMiss[k] = 1;
+            tokLocal.SetValue(h, tokenPos);
+            hisp::vis_set(visLocal, h);
+            hand = h + 1;
+            if (hand == static_cast<int32_t>(args->deviceBufferSize)) {
+                hand = 0;
+            }
+        }
+
+        handPtr[reqIdx * hisp::kHandStride] = hand;
+
+        PipeBarrier<PIPE_ALL>();
+        DataCopy(visGm, visLocal, args->visitedStrideB);
+        if (htDirty) {
+            DataCopy(tokGm, tokLocal, args->paddedBufferSize);
+            DataCopy(htGm, htLocal, args->htSize);
+        }
+        PipeBarrier<PIPE_ALL>();
+    }
+    KvcKernelEpilogue();
+}

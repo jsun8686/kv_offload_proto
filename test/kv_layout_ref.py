@@ -1,10 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
-# 行归属映射（层维度均衡）：与 common/kv_layout.h 语义严格一致（单测对拍锚点）。
-#
-#   node(row)     = (row / S) % N          # 层无关：任意层的行均匀散到 N 段
-#   seg_row(row)  = (row / S) / N          # 段内层内行号（紧凑无空洞）
-#   addr(l, row)  = seg_base + (l * per_layer_seg_rows + seg_row(row)) * row_bytes
+# 行归属映射参考实现（对拍锚点）：与 common/kv_layout.h、内核 KvcNodeOf/KvcSegRowOf 语义一致。
+# 运行时主链路不使用本模块（地址计算全在 AIV 内核内完成）；仅测试引用。
 
 
 def per_layer_seg_rows(layer_rows: int, node_num: int) -> int:

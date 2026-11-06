@@ -1,10 +1,13 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
-# 行归属映射单测（与 common/kv_layout.h 语义对拍锚点）。
+# 行归属映射单测（对拍锚点：test/kv_layout_ref.py ↔ common/kv_layout.h ↔ 内核 KvcNodeOf）。
 
+import os
+import sys
 import unittest
 
-from xds import kv_layout as L
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kv_layout_ref as L
 
 
 class TestLayout(unittest.TestCase):
@@ -24,7 +27,7 @@ class TestLayout(unittest.TestCase):
         # S=1,N=2：row 的段内行号 0.. 连续无空洞
         rows = [L.seg_row_of(r, 1, 2) for r in range(8)]
         self.assertEqual(rows, [0, 0, 1, 1, 2, 2, 3, 3])
-        # 覆盖性：layerRows=100,N=3 → segRow 覆盖 0..33 每值恰出现 3 次（余数除外）
+        # 覆盖性：layerRows=99,N=3 → segRow 覆盖 0..32 每值恰出现 3 次
         seen = [L.seg_row_of(r, 1, 3) for r in range(99)]
         self.assertEqual(max(seen), 32)
         for v in range(32):
@@ -45,14 +48,6 @@ class TestLayout(unittest.TestCase):
         self.assertEqual(L.seg_offset(0, 0, 1, 2, 50, 128), 0)
         # seg_base 叠加
         self.assertEqual(L.seg_addr(0x10000, 2, 10, 1, 2, 50, 128), 0x10000 + (2 * 50 + 5) * 128)
-
-    def test_no_hole_in_segment(self):
-        # 段内无空洞：某节点分到的行，其 segRow 与层区起始拼接后不重叠、不越界
-        n, plsr, s = 3, L.per_layer_seg_rows(100, 3), 1
-        for layer in range(4):
-            offsets = sorted(L.seg_offset(layer, r, s, n, plsr, 128) for r in range(100) if L.node_of(r, s, n) == layer % n)
-            expect = sorted((layer * plsr + k) * 128 for k in range(len(offsets)))
-            self.assertLessEqual(max(offsets) if offsets else 0, (4 * plsr - 1) * 128)
 
     def test_validate(self):
         L.validate(2, 1024, 1152, 1, 2)

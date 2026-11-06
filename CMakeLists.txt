@@ -63,7 +63,8 @@ if(_TARGET STREQUAL "kernel" OR _TARGET STREQUAL "all")
     ascendc_fatbin_library(kvc_kernel
         ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/kvc_gather_rows.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/kvc_scatter_rows_alllayer.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/kvc_scatter_rows.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/hisp_sieve_update.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/hisp_sieve_ht_init.cpp
     )
     if(COMMAND ascendc_include_directories)
         ascendc_include_directories(kvc_kernel PRIVATE
