@@ -76,7 +76,7 @@ int main(int argc, char **argv)
         cfg.hcommLib = env;
     }
     cfg.isMaster = (role == "master");
-    cfg.poolSizeBytes = static_cast<uint32_t>(poolGb) << 30;
+    cfg.poolSizeBytes = static_cast<uint64_t>(poolGb) << 30;
     if (cfg.localIp.empty()) {
         printf("[emsd][ERROR] --ip is required\n");
         Usage(argv[0]);
@@ -125,9 +125,9 @@ int main(int argc, char **argv)
         cfg.members.push_back(self);  // worker 自身段表仅一条
     }
 
-    printf("[emsd] starting, role=%s ip=%s port=%u poolSizeBytes=%u hcommLib=%s\n",
-           cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort, cfg.poolSizeBytes,
-           cfg.hcommLib.c_str());
+    printf("[emsd] starting, role=%s ip=%s port=%u poolSizeBytes=%llu hcommLib=%s\n",
+           cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort,
+           (unsigned long long)cfg.poolSizeBytes, cfg.hcommLib.c_str());
     EmsdCtrlServer server(cfg);
     return server.Run();
 }

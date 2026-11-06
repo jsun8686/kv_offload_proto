@@ -332,8 +332,8 @@ int EmsdCtrlServer::OnSegAllocImpl(const KvSegAllocReq &req, KvSegAllocResp &res
         return resp.status;
     }
     if (req.segSizeBytes > cfg_.poolSizeBytes) {
-        printf("[emsd][ERROR] seg size exceeds node capacity, segIndex=%u size=%llu capacity=%u\n", req.segIndex,
-               (unsigned long long)req.segSizeBytes, cfg_.poolSizeBytes);
+        printf("[emsd][ERROR] seg size exceeds node capacity, segIndex=%u size=%llu capacity=%llu\n", req.segIndex,
+               (unsigned long long)req.segSizeBytes, (unsigned long long)cfg_.poolSizeBytes);
         resp.status = KV_ERR_NO_RESOURCE;
         return resp.status;
     }

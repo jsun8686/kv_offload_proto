@@ -29,7 +29,7 @@ struct EmsdConfig {
     std::string localIp;              // 本节点对外 IP（endpoint + TCP）
     uint16_t listenPort = 27000;      // 本 emsd 控制 TCP 监听端口
     std::string hcommLib = "libhcomm.so";
-    uint32_t poolSizeBytes = 8ULL << 30;  // 本节点可提供的池容量上限
+    uint64_t poolSizeBytes = 8ULL << 30;  // 本节点可提供的池容量上限（u64：支持 >4GB 池）
     uint32_t readyTimeoutSec = 60;
     std::vector<EmsdMember> members;  // 静态成员表（master 有效，含自身）
 };
