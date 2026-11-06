@@ -7,6 +7,7 @@
  * 状态（按池行，逐层切片传入）：tokens[pool,padded] int32 / visited[pool,visStrideB] 位图 /
  * ht[pool,htSize] uint16（开放寻址）/ hand[pool,16] int32。
  * 输出契约：全量重写 [0,maxNumReqs) 的 slots/is_miss 行（-1 哨兵），调用方免修正趟（图安全）。
+ * 注意：args 字段集中读入本地标量（引用形参 API 要求左值；兼省重复 GM 加载）。
  */
 
 #include "hisp_kernel_common.h"
@@ -16,10 +17,20 @@
 extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
 {
     const __gm__ HispSieveUpdateArgs *args = reinterpret_cast<const __gm__ HispSieveUpdateArgs *>(argsBuf);
+    // GM 解引用集中读入本地标量
+    const int32_t topK = args->topK;
+    const int32_t dbs = args->deviceBufferSize;
+    const int32_t padded = args->paddedBufferSize;
+    const int32_t visStrideB = args->visitedStrideB;
+    const int32_t maxNumReqs = args->maxNumReqs;
+    const int32_t reqsPerCore = args->reqsPerCore;
+    const int32_t htSize = args->htSize;
+    const int32_t poolSize = args->poolSize;
+
     __gm__ int32_t *numRealPtr = reinterpret_cast<__gm__ int32_t *>(args->numReal);
     int32_t numReal = numRealPtr[0];
-    if (numReal > static_cast<int32_t>(args->maxNumReqs)) {
-        numReal = args->maxNumReqs;  // 防御：GM 标量可能过期
+    if (numReal > maxNumReqs) {
+        numReal = maxNumReqs;  // 防御：GM 标量可能过期
     }
 
     __gm__ int64_t *reqPoolPtr = reinterpret_cast<__gm__ int64_t *>(args->reqPoolIndices);
@@ -34,32 +45,32 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
     __gm__ int8_t *isMissPtr = reinterpret_cast<__gm__ int8_t *>(args->isMiss);
 
     const int32_t blockIdx = GetBlockIdx();
-    int32_t startReq = blockIdx * static_cast<int32_t>(args->reqsPerCore);
-    int32_t endReq = startReq + static_cast<int32_t>(args->reqsPerCore);
-    if (endReq > static_cast<int32_t>(args->maxNumReqs)) {
-        endReq = args->maxNumReqs;
+    int32_t startReq = blockIdx * reqsPerCore;
+    int32_t endReq = startReq + reqsPerCore;
+    if (endReq > maxNumReqs) {
+        endReq = maxNumReqs;
     }
 
     TPipe pipe;
     TBuf<TPosition::VECCALC> tokBuf;
     TBuf<TPosition::VECCALC> visBuf;
     TBuf<TPosition::VECCALC> htBuf;
-    pipe.InitBuffer(tokBuf, args->paddedBufferSize * sizeof(int32_t));
-    pipe.InitBuffer(visBuf, args->visitedStrideB);
-    pipe.InitBuffer(htBuf, args->htSize * sizeof(uint16_t));
+    pipe.InitBuffer(tokBuf, padded * sizeof(int32_t));
+    pipe.InitBuffer(visBuf, visStrideB);
+    pipe.InitBuffer(htBuf, htSize * sizeof(uint16_t));
     LocalTensor<int32_t> tokLocal = tokBuf.Get<int32_t>();
     LocalTensor<uint8_t> visLocal = visBuf.Get<uint8_t>();
     LocalTensor<uint16_t> htLocal = htBuf.Get<uint16_t>();
 
-    const int32_t htMask = static_cast<int32_t>(args->htSize) - 1;
+    const int32_t htMask = htSize - 1;
 
     for (int32_t bid = startReq; bid < endReq; ++bid) {
-        __gm__ int32_t *reqOutSlots = outSlotsPtr + static_cast<int64_t>(bid) * args->topK;
-        __gm__ int8_t *reqIsMiss = isMissPtr + static_cast<int64_t>(bid) * args->topK;
+        __gm__ int32_t *reqOutSlots = outSlotsPtr + static_cast<int64_t>(bid) * topK;
+        __gm__ int8_t *reqIsMiss = isMissPtr + static_cast<int64_t>(bid) * topK;
 
         // padding 行（图 replay）：只写哑输出，不读未定义内容
         if (bid >= numReal) {
-            for (int32_t k = 0; k < static_cast<int32_t>(args->topK); ++k) {
+            for (int32_t k = 0; k < topK; ++k) {
                 reqOutSlots[k] = -1;
                 reqIsMiss[k] = 0;
             }
@@ -68,8 +79,8 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
 
         const int64_t reqIdx = reqPoolPtr[bid];
         // 防御：越界池行写哑输出，不进行 GM 越界寻址
-        if (reqIdx < 0 || reqIdx >= static_cast<int64_t>(args->poolSize)) {
-            for (int32_t k = 0; k < static_cast<int32_t>(args->topK); ++k) {
+        if (reqIdx < 0 || reqIdx >= poolSize) {
+            for (int32_t k = 0; k < topK; ++k) {
                 reqOutSlots[k] = -1;
                 reqIsMiss[k] = 0;
             }
@@ -78,10 +89,10 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
 
         const int32_t seqLen = seqLenPtr[bid];
         const int32_t prefill = prefillPtr[reqIdx];
-        __gm__ int32_t *reqTopk = topkPtr + static_cast<int64_t>(bid) * args->topK;
-        __gm__ int32_t *reqTokens = tokensPtr + reqIdx * args->paddedBufferSize;
-        __gm__ uint8_t *reqVis = visPtr + reqIdx * args->visitedStrideB;
-        __gm__ uint16_t *reqHt = htPtr + reqIdx * args->htSize;
+        __gm__ int32_t *reqTopk = topkPtr + static_cast<int64_t>(bid) * topK;
+        __gm__ int32_t *reqTokens = tokensPtr + reqIdx * padded;
+        __gm__ uint8_t *reqVis = visPtr + reqIdx * visStrideB;
+        __gm__ uint16_t *reqHt = htPtr + reqIdx * htSize;
 
         GlobalTensor<int32_t> tokGm;
         GlobalTensor<uint8_t> visGm;
@@ -89,19 +100,19 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
         tokGm.SetGlobalBuffer(reqTokens);
         visGm.SetGlobalBuffer(reqVis);
         htGm.SetGlobalBuffer(reqHt);
-        DataCopy(tokLocal, tokGm, args->paddedBufferSize);
-        DataCopy(visLocal, visGm, args->visitedStrideB);
-        DataCopy(htLocal, htGm, args->htSize);
+        DataCopy(tokLocal, tokGm, padded);
+        DataCopy(visLocal, visGm, visStrideB);
+        DataCopy(htLocal, htGm, htSize);
         PipeBarrier<PIPE_ALL>();
 
         int32_t hand = handPtr[reqIdx * hisp::kHandStride];
-        if (hand < 0 || hand >= static_cast<int32_t>(args->deviceBufferSize)) {
+        if (hand < 0 || hand >= dbs) {
             hand = 0;  // 防御：脏 hand 钳回有效区间
         }
 
         bool htDirty = false;  // 仅命中不改表 → 跳过 tokens/ht 写回
 
-        for (int32_t k = 0; k < static_cast<int32_t>(args->topK); ++k) {
+        for (int32_t k = 0; k < topK; ++k) {
             const int32_t tokenPos = reqTopk[k];
 
             if (tokenPos < 0 || tokenPos >= seqLen) {
@@ -111,7 +122,7 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
             }
             if (tokenPos >= prefill) {
                 // decode 增量 token：扩展槽，永不淘汰、永不 miss
-                reqOutSlots[k] = args->paddedBufferSize + (tokenPos - prefill);
+                reqOutSlots[k] = padded + (tokenPos - prefill);
                 reqIsMiss[k] = 0;
                 continue;
             }
@@ -129,7 +140,7 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
             while (hisp::vis_get(visLocal, h) != 0) {
                 hisp::vis_clear(visLocal, h);
                 ++h;
-                if (h == static_cast<int32_t>(args->deviceBufferSize)) {
+                if (h == dbs) {
                     h = 0;
                 }
             }
@@ -146,7 +157,7 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
             tokLocal.SetValue(h, tokenPos);
             hisp::vis_set(visLocal, h);
             hand = h + 1;
-            if (hand == static_cast<int32_t>(args->deviceBufferSize)) {
+            if (hand == dbs) {
                 hand = 0;
             }
         }
@@ -154,10 +165,10 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
         handPtr[reqIdx * hisp::kHandStride] = hand;
 
         PipeBarrier<PIPE_ALL>();
-        DataCopy(visGm, visLocal, args->visitedStrideB);
+        DataCopy(visGm, visLocal, visStrideB);
         if (htDirty) {
-            DataCopy(tokGm, tokLocal, args->paddedBufferSize);
-            DataCopy(htGm, htLocal, args->htSize);
+            DataCopy(tokGm, tokLocal, padded);
+            DataCopy(htGm, htLocal, htSize);
         }
         PipeBarrier<PIPE_ALL>();
     }
