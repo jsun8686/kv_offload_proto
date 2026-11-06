@@ -139,13 +139,8 @@ def main() -> int:
     hbm = torch.zeros((args.layers, args.layer_rows, row_bytes // 4), dtype=torch.int32, device=dev)
 
     master_ip, master_port = args.ems_master.rsplit(":", 1)
-    from ems_client import EmsClient
     from xds.xds_ems_pool import EmsPool
     from xds.xds_offload import XdsOffloadCoordinator
-
-    ems = EmsClient(master_ip, int(master_port))
-    ems.connect()
-    ems.ping()
 
     fatbin = args.fatbin
     if not fatbin:
@@ -157,7 +152,7 @@ def main() -> int:
             log("[xds][ERROR] fatbin not found, pass --fatbin explicitly")
             return 1
 
-    pool = EmsPool(ems, args.device, args.eid, args.layers, args.layer_rows, row_bytes,
+    pool = EmsPool(master_ip, int(master_port), args.device, args.eid, args.layers, args.layer_rows, row_bytes,
                    stripe_rows=args.stripe_rows)
     pool.create_pool(hbm.data_ptr(), hbm.numel() * 4, fatbin)
     log("[xds] pool ready: nodes={} perLayerSegRows={} channels={} fatbin={}".format(
@@ -289,7 +284,6 @@ def main() -> int:
 
     assert allocator.used_rows() == 0 or True  # 原型：进程退出前不强制回收
     pool.destroy()
-    ems.close()
     log("[xds] all done, log: {}".format(log.path))
     return 0
 

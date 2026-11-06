@@ -9,6 +9,10 @@
 from typing import List, Optional
 
 try:
+    from ems_client import EmsClient
+except ImportError:  # 本地离线单测（未安装扩展包，NPU 机 pip -e 安装后可用）
+    EmsClient = None
+try:
     import kvops_ext._kvops as _kvops
 except ImportError:  # 本地离线单测（无 NPU 环境）
     _kvops = None
@@ -103,13 +107,19 @@ class RowAllocator:
 
 
 class EmsPool:
-    """EMS 远端内存池 + 批量读写算子门面（设计文档 §4.2.4 接口语义）。"""
+    """EMS 远端内存池 + 批量读写算子门面（设计文档 §4.2.4 接口语义）。
 
-    def __init__(self, ems, device_id: int, eid_hex: str, layer_num: int, layer_rows: int, row_bytes: int,
-                 stripe_rows: int = 1, acl_lib: str = "libascendcl.so", hcomm_lib: str = "libhcomm.so"):
+    对 XDS 的唯一接口面：master 地址传入即可（EmsClient 为内部实现，外部不感知）。
+    """
+
+    def __init__(self, master_ip: str, master_port: int, device_id: int, eid_hex: str, layer_num: int,
+                 layer_rows: int, row_bytes: int, stripe_rows: int = 1, acl_lib: str = "libascendcl.so",
+                 hcomm_lib: str = "libhcomm.so", timeout_sec: float = 120.0):
         if layer_num < 1 or layer_rows < 1 or row_bytes <= 0 or row_bytes % 128 != 0:
             raise ValueError("invalid pool dims: L={} rows={} rowBytes={}".format(layer_num, layer_rows, row_bytes))
-        self.ems = ems
+        if EmsClient is None:
+            raise RuntimeError("ems_client package not installed (NPU host only)")
+        self._ems = EmsClient(master_ip, master_port, timeout_sec)
         self.device_id = device_id
         self.eid_hex = eid_hex
         self.layer_num = layer_num
@@ -132,10 +142,12 @@ class EmsPool:
         """EMS 建池（master 打散）→ NPU 侧注册 HBM 池 → 逐段 LINK_EXCHANGE + AIV 通道 → kvops.init。"""
         if _cli is None or _kvops is None:
             raise RuntimeError("kvops_ext / ems_client native ext not installed (NPU host only)")
+        self._ems.connect()
+        self._ems.ping()  # 建池前连通性自检（失败含 master 地址，便于定位）
         if ems_size_bytes is None:
             ems_size_bytes = self.layer_num * self.layer_rows * self.row_bytes
-        self.pool = self.ems.pool_create(ems_size_bytes, self.layer_num, self.layer_rows, self.row_bytes,
-                                         self.stripe_rows)
+        self.pool = self._ems.pool_create(ems_size_bytes, self.layer_num, self.layer_rows, self.row_bytes,
+                                          self.stripe_rows)
         self.node_num = self.pool.node_num
         self.per_layer_seg_rows = (self.layer_rows + self.node_num - 1) // self.node_num
 
@@ -146,7 +158,7 @@ class EmsPool:
 
         self.channels = []
         for seg in self.pool.segments:
-            status = self.ems.link_exchange(seg, local_desc, mem_desc)
+            status = self._ems.link_exchange(seg, local_desc, mem_desc)
             if status != 0:
                 raise RuntimeError("link_exchange failed on node {} {}: status={}".format(
                     seg.node_id, seg.ctrl_ip, status))
@@ -175,8 +187,9 @@ class EmsPool:
         if _kvops is not None:
             _kvops.close()
         if self.pool is not None:
-            self.ems.pool_destroy(self.pool.pool_id)
+            self._ems.pool_destroy(self.pool.pool_id)
             self.pool = None
+        self._ems.close()
 
     def make_allocator(self) -> RowAllocator:
         return RowAllocator(self.layer_rows)
