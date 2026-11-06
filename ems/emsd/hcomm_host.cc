@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 #define EMSD_DLSYM(var, name)                                                                                \
@@ -31,7 +32,8 @@ int EmsdDynApi::Load(const std::string &libPath)
         return -1;
     }
     auto load = [h](auto &fn, const char *name) -> int {
-        fn = reinterpret_cast<decltype(fn)>(dlsym(h, name));
+        using FnT = std::remove_reference_t<decltype(fn)>;  // 剥引用：decltype(fn) 为函数指针引用，直接 cast 非法
+        fn = reinterpret_cast<FnT>(dlsym(h, name));
         if (fn == nullptr) {
             printf("[emsd][ERROR] dlsym %s failed: %s\n", name, dlerror());
             return -1;
