@@ -149,7 +149,8 @@ def main() -> int:
 
     fatbin = args.fatbin
     if not fatbin:
-        cand = [os.path.join(os.path.dirname(__file__), "..", "build", "kernel", "kvc_kernel", "kvc_kernel.o"),
+        cand = ["/usr/local/fatbin/kvc_kernel/kvc_kernel.o",  # cmake install 前缀产物（build.sh kernel 默认）
+                os.path.join(os.path.dirname(__file__), "..", "build", "kernel", "kvc_kernel", "kvc_kernel.o"),
                 os.path.join(os.path.dirname(__file__), "..", "build", "kernel", "kvc_kernel.o")]
         fatbin = next((c for c in cand if os.path.exists(c)), "")
         if not fatbin:
