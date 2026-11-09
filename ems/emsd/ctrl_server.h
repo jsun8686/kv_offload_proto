@@ -1,15 +1,18 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * KV offload prototype is licensed under Mulan PSL v2.
- * emsd 控制服务：阻塞式 TCP（原型单连接串行）。master 处理 POOL_CREATE/DESTROY/PING 并向
- * worker 下发 SEG_ALLOC；worker 处理 SEG_ALLOC/SEG_FREE/PING；两种角色都处理 LINK_EXCHANGE
- * （框架侧与本节点建立 AIV server 通道）。
+ * emsd 控制服务：阻塞式 TCP，每连接一个线程（accept 循环不再被长连接阻塞——框架侧
+ * pool_create 的连接会一直保持到 session 结束，期间 LINK_EXCHANGE 等新连接必须可被服务）；
+ * 命令处理经 connMutex_ 全局串行（pool_/hcomm_/nextPoolId_ 共享状态无锁风险）。
+ * master 处理 POOL_CREATE/DESTROY/PING 并向 worker 下发 SEG_ALLOC；worker 处理
+ * SEG_ALLOC/SEG_FREE/PING；两种角色都处理 LINK_EXCHANGE（框架侧与本节点建立 AIV server 通道）。
  */
 
 #ifndef EMSD_CTRL_SERVER_H
 #define EMSD_CTRL_SERVER_H
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -51,13 +54,14 @@ private:
     int OnSegAlloc(const KvSegAllocReq &req, int fd);
     int OnSegAllocImpl(const KvSegAllocReq &req, KvSegAllocResp &resp);  // master 本地/worker 共用
     int OnSegFree(uint32_t poolId, uint32_t segIndex, int fd);
-    int OnLinkExchange(int fd);
+    int OnLinkExchange(const std::vector<uint8_t> &payload, int fd);
     int SendResp(int fd, uint16_t cmd, const void *payload, uint32_t payloadLen);
     int WorkerSegAlloc(const EmsdMember &m, const KvSegAllocReq &req, KvSegAllocResp &resp);
 
     EmsdConfig cfg_;
     EmsdHcomm hcomm_;
     EmsdPoolMgr pool_;
+    std::mutex connMutex_;  // 命令处理全局串行（多连接并发下保护共享状态）
     uint32_t nextPoolId_ = 1;
     bool hcommInited_ = false;
 };

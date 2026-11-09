@@ -12,11 +12,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -139,8 +141,10 @@ int EmsdCtrlServer::Run()
         if (cfd < 0) {
             continue;
         }
-        (void)HandleConn(cfd);
-        close(cfd);
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(cfg_.readyTimeoutSec);
+        (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        std::thread(&EmsdCtrlServer::HandleConn, this, cfd).detach();
     }
 }
 
@@ -150,9 +154,10 @@ int EmsdCtrlServer::HandleConn(int fd)
         KvMsgHeader hdr{};
         std::vector<uint8_t> payload;
         if (RecvMsg(fd, hdr, payload) != 0) {
-            return 0;  // 对端关闭/协议错，断连即可
+            return 0;  // 对端关闭/协议错/读超时，断连即可
         }
         int ret = 0;
+        std::lock_guard<std::mutex> lk(connMutex_);
         switch (hdr.cmd) {
             case KV_CMD_PING: {
                 KvGenericResp resp{KV_OK, 0};
@@ -194,7 +199,7 @@ int EmsdCtrlServer::HandleConn(int fd)
                                 reinterpret_cast<const KvPoolDestroyReq *>(payload.data())->reserved, fd);
                 break;
             case KV_CMD_LINK_EXCHANGE:
-                ret = OnLinkExchange(fd);
+                ret = OnLinkExchange(payload, fd);
                 break;
             default:
                 KvGenericResp resp{KV_ERR_PROTO, 0};
@@ -372,12 +377,11 @@ int EmsdCtrlServer::OnSegFree(uint32_t poolId, uint32_t segIndex, int fd)
     return SendResp(fd, KV_CMD_SEG_FREE, &resp, sizeof(resp));
 }
 
-int EmsdCtrlServer::OnLinkExchange(int fd)
+int EmsdCtrlServer::OnLinkExchange(const std::vector<uint8_t> &payload, int fd)
 {
-    // 帧格式：Header + KvLinkFrame（对端 EndpointDesc + memDesc）
-    KvMsgHeader hdr{};
-    std::vector<uint8_t> payload;
-    if (RecvMsg(fd, hdr, payload) != 0 || payload.size() != sizeof(KvLinkFrame)) {
+    // 帧格式：KvLinkFrame 作为 LINK_EXCHANGE 命令的 payload（HandleConn 已统一读取，
+    // 与 client 侧 send_msg(CMD_LINK_EXCHANGE, encode_link_frame(...)) 组帧对齐）
+    if (payload.size() != sizeof(KvLinkFrame)) {
         KvGenericResp resp{KV_ERR_PROTO, 0};
         return SendResp(fd, KV_CMD_LINK_EXCHANGE, &resp, sizeof(resp));
     }

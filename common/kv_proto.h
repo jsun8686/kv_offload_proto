@@ -117,7 +117,8 @@ struct KvSegAllocResp {
     uint8_t memDesc[KV_MAX_MEM_DESC];
 };
 
-// LINK_EXCHANGE 帧（client 与目标节点各发一帧，长度前缀二进制）
+// LINK_EXCHANGE 帧：作为 KV_CMD_LINK_EXCHANGE 消息的 payload 一次发送
+// （报文 = Header + KvLinkFrame，与 client 侧 send_msg 组帧严格一致，非独立二次报文）
 // EndpointDesc ABI ≤ 60B 内容 + 类型域；128B 覆盖未来扩展
 struct KvLinkFrame {
     uint32_t descLen;
