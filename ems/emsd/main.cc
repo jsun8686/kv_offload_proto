@@ -23,9 +23,12 @@ namespace {
 void Usage(const char *bin)
 {
     printf("usage: %s --role master|worker --ip <localIp> --port <ctrlPort>\n"
-           "  [--device N] [--rootinfo <path>] [--acl-lib <path>] [--hcomm-lib <path>] [--pool-size-gb N]\n"
+           "  [--loc device|host] [--device N] [--host-addr <ipv6>] [--rootinfo <path>]\n"
+           "  [--acl-lib <path>] [--hcomm-lib <path>] [--pool-size-gb N]\n"
            "  master: --members ip1:port1:hcommPort1[,ip2:port2:hcommPort2...]\n"
-           "  EID: 自动按 rootinfo（默认 /etc/hccl_rootinfo.json）匹配 device_id==phyId 的 EID\n"
+           "  loc device（默认，当前包）: EID 自动按 rootinfo 匹配 device_id==phyId（卡到卡）\n"
+           "  loc host（待跨模式包）: --host-addr 必填（ipourma host IPv6，V6 即 EID 载体）\n"
+           "  两种模式段内存均恒 host DRAM + COMM_MEM_TYPE_HOST（MemFabric 生产实证组合）\n"
            "env: KV_EMSD_HCOMM_LIB 覆盖 libhcomm 路径\n",
            bin);
 }
@@ -47,6 +50,7 @@ int main(int argc, char **argv)
     EmsdConfig cfg;
     std::string role = "worker";
     std::string members;
+    std::string loc = "device";
     int poolGb = 8;
     int deviceId = 0;
 
@@ -63,8 +67,12 @@ int main(int argc, char **argv)
             members = next();
         } else if (k == "--pool-size-gb") {
             poolGb = atoi(next().c_str());
+        } else if (k == "--loc") {
+            loc = next();
         } else if (k == "--device") {
             deviceId = atoi(next().c_str());
+        } else if (k == "--host-addr") {
+            cfg.hostAddr = next();
         } else if (k == "--rootinfo") {
             cfg.rootinfoPath = next();
         } else if (k == "--acl-lib") {
@@ -76,7 +84,7 @@ int main(int argc, char **argv)
             return 1;
         }
     }
-    if (role != "master" && role != "worker") {
+    if ((role != "master" && role != "worker") || (loc != "device" && loc != "host")) {
         Usage(argv[0]);
         return 1;
     }
@@ -86,6 +94,7 @@ int main(int argc, char **argv)
     cfg.isMaster = (role == "master");
     cfg.poolSizeBytes = static_cast<uint64_t>(poolGb) << 30;
     cfg.deviceId = static_cast<int32_t>(deviceId);
+    cfg.hostLoc = (loc == "host");
     if (cfg.localIp.empty()) {
         printf("[emsd][ERROR] --ip is required\n");
         Usage(argv[0]);
@@ -134,11 +143,11 @@ int main(int argc, char **argv)
         cfg.members.push_back(self);  // worker 自身段表仅一条
     }
 
-    printf("[emsd] starting, role=%s ip=%s port=%u device=%d rootinfo=%s poolSizeBytes=%llu aclLib=%s "
-           "hcommLib=%s\n",
-           cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort, cfg.deviceId,
-           cfg.rootinfoPath.c_str(), (unsigned long long)cfg.poolSizeBytes, cfg.aclLib.c_str(),
-           cfg.hcommLib.c_str());
+    printf("[emsd] starting, role=%s ip=%s port=%u loc=%s device=%d hostAddr=%s rootinfo=%s poolSizeBytes=%llu "
+           "aclLib=%s hcommLib=%s\n",
+           cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort, cfg.hostLoc ? "host" : "device",
+           cfg.deviceId, cfg.hostAddr.empty() ? "-" : cfg.hostAddr.c_str(), cfg.rootinfoPath.c_str(),
+           (unsigned long long)cfg.poolSizeBytes, cfg.aclLib.c_str(), cfg.hcommLib.c_str());
     EmsdCtrlServer server(cfg);
     return server.Run();
 }

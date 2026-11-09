@@ -30,14 +30,16 @@ miss 识别为 device 侧 SIEVE 算子（移植自 sglang-0730，哈希-only + v
 ./build.sh emsd                                            # 资源节点（无 CANN 依赖）
 ./build.sh ext && ./build.sh kernel                        # NPU 机（先 source CANN set_env.sh）
 
-# 1) 资源节点 A（master；members=静态成员表 ip:ctrlPort；EID 全自动：rootinfo 按 --device 的
-#    phyId 匹配；--device：CANN 组件 libhcomm 的 host endpoint 需进程挂 NPU runtime 上下文，
-#    无卡节点换 noDevice 构建后可免）
-./build/emsd/emsd --role master --ip <A_ip> --port 27000 --device 0 \
+# 1) 资源节点 A（master；members=静态成员表 ip:ctrlPort）
+#    双 loc 模式：--loc device（默认，当前 CANN 包）= 卡到卡：EID 自动按 --device 的 phyId
+#    匹配 rootinfo（PoC 同构）；--loc host（待跨模式/noDevice 包）= --host-addr <ipv6> 手填
+#    （ipourma host 地址，noDevice 仓 rank_graph 标准填法）。两种模式段内存均恒 host DRAM
+#    + COMM_MEM_TYPE_HOST（MemFabric device_urma 生产实证组合）
+./build/emsd/emsd --role master --ip <A_ip> --port 27000 --device 4 --loc device \
     --members <A_ip>:27000,<B_ip>:27001 --pool-size-gb 8
 
 # 2) 资源节点 B（worker）
-./build/emsd/emsd --role worker --ip <B_ip> --port 27001 --device 0 --pool-size-gb 8
+./build/emsd/emsd --role worker --ip <B_ip> --port 27001 --device 5 --loc device --pool-size-gb 8
 
 # 3) NPU 机跑 decode 驱动（EID 全自动：device→phyId→rootinfo 匹配；默认 direct 模式）
 python -m xds.xds_decode --ems-master <A_ip>:27000 --device 0 \
@@ -90,8 +92,9 @@ python -m xds.xds_decode ... --oracle
 
 | 症状 | 处置 |
 |---|---|
-| `HcommEndpointCreate ret=15`，plog 报 `hrtGetDevice failed, deviceLogicId[65535]` | emsd 进程缺 NPU 上下文：加 `--device N`（CANN 组件 libhcomm 的 host endpoint 依赖 SetDevice；无卡资源节点需换 noDevice 基线构建的 libhcomm） |
-| `HcommEndpointCreate ret=11`，plog 报 `rs_urma_get_device_by_eid failed / errno:19` | endpoint 地址未匹配到 UB 设备（EID 空间）：两端均已按 PoC 链路自动填 EID（device→phyId→rootinfo）；检查 rootinfo 可读且含 `--device` 对应 `device_id` 的 EID addr，必要时 `--rootinfo <path>` 指定正确文件 |
+| `HcommEndpointCreate ret=15`，plog 报 `hrtGetDevice failed, deviceLogicId[65535]` | device 模式进程缺 NPU 上下文：加 `--device N`；host 模式（跨模式包）无此依赖 |
+| `HcommEndpointCreate ret=11`，plog 报 `rs_urma_get_device_by_eid failed / errno:19` | endpoint 地址未匹配到 UB 设备：device 模式检查 rootinfo 含 `--device` 对应 `device_id` 的 EID addr（`--rootinfo` 指定正确文件）；host 模式检查 `--host-addr` 为本机 ipourma 上真实存在的 IPv6 地址 |
+| MemReg 失败（`[emsd][ERROR] MemReg failed, addr=... ret=...`） | 检查段地址/容量（日志已带 addr/size/ret）；CANN 包下 device endpoint + HOST 内存注册为 MemFabric 生产实证组合，若仍失败回传 plog |
 | link_exchange/channel not ready | 跨模式 socket（HDC↔PEER）异步 connect 问题：预案在 `ems_client/hcomm_cli_ext.cpp: cli_link_channel` 同步化适配（参照 hcomm_no_device 提交 9b2cb0c9d 模式） |
 | sieve_update 报 UB budget | 降低 `--device-buffer-size`（UB=tokens 行+位图+哈希表 ≤176KB/核） |
 | sieve_update 报 padded ≤65534 | uint16 槽号上限：`--device-buffer-size` ≤ 65534-16 |

@@ -26,10 +26,12 @@ struct EmsdMember {
 
 struct EmsdConfig {
     bool isMaster = false;
-    std::string localIp;              // 本节点对外 IP（控制 TCP/成员表用；endpoint 走 EID）
+    std::string localIp;              // 本节点对外 IP（控制 TCP/成员表用；endpoint 地址走 EID/IPv6）
     uint16_t listenPort = 27000;      // 本 emsd 控制 TCP 监听端口
-    int32_t deviceId = 0;             // NPU 设备号（CANN 组件 libhcomm host endpoint 需 SetDevice 上下文）
-    std::string rootinfoPath = "/etc/hccl_rootinfo.json";  // EID 按 device_id==phyId 自动匹配
+    int32_t deviceId = 0;             // NPU 设备号（device 模式：endpoint 需 SetDevice 上下文）
+    std::string rootinfoPath = "/etc/hccl_rootinfo.json";  // device 模式：EID 按 device_id==phyId 匹配
+    bool hostLoc = false;             // loc 模式：false=device（当前包，卡到卡）；true=host（待跨模式包）
+    std::string hostAddr;             // host 模式：endpoint IPv6（ipourma host 地址，app 手填）
     std::string aclLib = "libascendcl.so";
     std::string hcommLib = "libhcomm.so";
     uint64_t poolSizeBytes = 8ULL << 30;  // 本节点可提供的池容量上限（u64：支持 >4GB 池）

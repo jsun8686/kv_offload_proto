@@ -6,6 +6,7 @@
 
 #include "hcomm_host.h"
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -51,47 +52,56 @@ int EmsdDynApi::Load(const std::string &libPath)
 }
 
 int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int32_t deviceId,
-                    const std::string &rootinfoPath)
+                    const std::string &rootinfoPath, bool hostLoc, const std::string &hostAddr)
 {
     libPath_ = hcommLib;
-
-    // 先挂 NPU runtime 上下文（顺序关键：host endpoint 初始化经 hrtGetDevice 查当前 device）
-    aclLib_ = aclLib;
-    aclLibHandle_ = dlopen(aclLib.c_str(), RTLD_NOW | RTLD_GLOBAL);
-    if (aclLibHandle_ == nullptr) {
-        printf("[emsd][ERROR] dlopen %s failed: %s\n", aclLib.c_str(), dlerror());
-        return -1;
-    }
-    auto aclrtSetDevice = reinterpret_cast<int32_t (*)(int32_t)>(dlsym(aclLibHandle_, "aclrtSetDevice"));
-    if (aclrtSetDevice == nullptr) {
-        printf("[emsd][ERROR] dlsym aclrtSetDevice failed, lib=%s, err=%s\n", aclLib.c_str(), dlerror());
-        return -1;
-    }
-    int32_t retDev = aclrtSetDevice(deviceId);
-    if (retDev != 0) {
-        printf("[emsd][ERROR] aclrtSetDevice failed, deviceId=%d ret=%d\n", deviceId, retDev);
-        return -1;
-    }
-    printf("[emsd] aclrtSetDevice ok, deviceId=%d\n", deviceId);
-
-    // device → phyId → EID（对齐 PoC：rootinfo 按 device_id==phyId 匹配）
-    auto aclrtGetPhyDevIdByLogicDevId =
-        reinterpret_cast<int32_t (*)(int32_t, int32_t *)>(dlsym(aclLibHandle_, "aclrtGetPhyDevIdByLogicDevId"));
-    if (aclrtGetPhyDevIdByLogicDevId == nullptr) {
-        printf("[emsd][ERROR] dlsym aclrtGetPhyDevIdByLogicDevId failed, err=%s\n", dlerror());
-        return -1;
-    }
-    int32_t phyId = -1;
-    if (aclrtGetPhyDevIdByLogicDevId(deviceId, &phyId) != 0 || phyId < 0) {
-        printf("[emsd][ERROR] aclrtGetPhyDevIdByLogicDevId failed, deviceId=%d phyId=%d\n", deviceId, phyId);
-        return -1;
-    }
     std::array<uint8_t, EMS_EID_LEN> eid{};
-    if (EmsGetEid(rootinfoPath, static_cast<uint32_t>(phyId), eid) != 0) {
-        printf("[emsd][ERROR] EmsGetEid failed, phyId=%d rootinfo=%s\n", phyId, rootinfoPath.c_str());
-        return -1;
+    int32_t phyId = -1;
+
+    if (hostLoc) {
+        // host 模式（跨模式/noDevice 构建包环境）：不依赖 NPU runtime；
+        // 地址由使用方手填（--host-addr，ipourma 的 host IPv6，V6 即 EID 载体）
+        if (hostAddr.empty()) {
+            printf("[emsd][ERROR] --loc host requires --host-addr <ipv6>\n");
+            return -1;
+        }
+    } else {
+        // device 模式（当前 CANN 包可用）：挂 NPU runtime 上下文（host endpoint 初始化经
+        // hrtGetDevice 查当前 device，顺序关键）→ phyId → rootinfo 匹配 EID
+        aclLib_ = aclLib;
+        aclLibHandle_ = dlopen(aclLib.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (aclLibHandle_ == nullptr) {
+            printf("[emsd][ERROR] dlopen %s failed: %s\n", aclLib.c_str(), dlerror());
+            return -1;
+        }
+        auto aclrtSetDevice = reinterpret_cast<int32_t (*)(int32_t)>(dlsym(aclLibHandle_, "aclrtSetDevice"));
+        if (aclrtSetDevice == nullptr) {
+            printf("[emsd][ERROR] dlsym aclrtSetDevice failed, lib=%s, err=%s\n", aclLib.c_str(), dlerror());
+            return -1;
+        }
+        int32_t retDev = aclrtSetDevice(deviceId);
+        if (retDev != 0) {
+            printf("[emsd][ERROR] aclrtSetDevice failed, deviceId=%d ret=%d\n", deviceId, retDev);
+            return -1;
+        }
+        printf("[emsd] aclrtSetDevice ok, deviceId=%d\n", deviceId);
+
+        auto aclrtGetPhyDevIdByLogicDevId =
+            reinterpret_cast<int32_t (*)(int32_t, int32_t *)>(dlsym(aclLibHandle_, "aclrtGetPhyDevIdByLogicDevId"));
+        if (aclrtGetPhyDevIdByLogicDevId == nullptr) {
+            printf("[emsd][ERROR] dlsym aclrtGetPhyDevIdByLogicDevId failed, err=%s\n", dlerror());
+            return -1;
+        }
+        if (aclrtGetPhyDevIdByLogicDevId(deviceId, &phyId) != 0 || phyId < 0) {
+            printf("[emsd][ERROR] aclrtGetPhyDevIdByLogicDevId failed, deviceId=%d phyId=%d\n", deviceId, phyId);
+            return -1;
+        }
+        if (EmsGetEid(rootinfoPath, static_cast<uint32_t>(phyId), eid) != 0) {
+            printf("[emsd][ERROR] EmsGetEid failed, phyId=%d rootinfo=%s\n", phyId, rootinfoPath.c_str());
+            return -1;
+        }
+        printf("[emsd] EID resolved, deviceId=%d phyId=%d eid=%s\n", deviceId, phyId, EmsEidToString(eid).c_str());
     }
-    printf("[emsd] EID resolved, deviceId=%d phyId=%d eid=%s\n", deviceId, phyId, EmsEidToString(eid).c_str());
 
     if (api_.Load(hcommLib) != 0) {
         return -1;
@@ -103,17 +113,33 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
         return -1;
     }
     localDesc_.protocol = COMM_PROTOCOL_UBC_CTP;  // = COMM_PROTOCOL_UB_CTP（跨节点 UBC，阶段一）
-    localDesc_.commAddr.type = COMM_ADDR_TYPE_EID;
-    memcpy(localDesc_.commAddr.eid, eid.data(), EMS_EID_LEN);  // 16B 有效（PoC 同款填法）
-    localDesc_.loc.locType = ENDPOINT_LOC_TYPE_HOST;
-    localDesc_.loc.host.id = 0;  // 普通 host 通信 Id（联调按部署调整）
+    if (hostLoc) {
+        // HOST 形态：commAddr=IP_V6（noDevice 仓 rank_graph 标准填法）；loc.host.id——
+        // 不写 loc.device.*（union 会覆盖 host.id，MemFabric 同款注释）
+        localDesc_.commAddr.type = COMM_ADDR_TYPE_IP_V6;
+        if (inet_pton(AF_INET6, hostAddr.c_str(), &localDesc_.commAddr.addr6) != 1) {
+            printf("[emsd][ERROR] invalid --host-addr ipv6: %s\n", hostAddr.c_str());
+            return -1;
+        }
+        localDesc_.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+        localDesc_.loc.host.id = 0;
+    } else {
+        // DEVICE 形态：commAddr=EID + device 四元组（devPhyId=phyId，PoC 卡到卡同款）
+        localDesc_.commAddr.type = COMM_ADDR_TYPE_EID;
+        memcpy(localDesc_.commAddr.eid, eid.data(), EMS_EID_LEN);  // 16B 有效（PoC 同款填法）
+        localDesc_.loc.locType = ENDPOINT_LOC_TYPE_DEVICE;
+        localDesc_.loc.device.devPhyId = static_cast<uint32_t>(phyId);
+        // superDevId/serverIdx/superPodIdx 留 0：路由以 EID 为准（联调校准）
+    }
 
     HcommResult ret = api_.HcommEndpointCreate(&localDesc_, &endpoint_);
     if (ret != 0 || endpoint_ == nullptr) {
-        printf("[emsd][ERROR] HcommEndpointCreate ret=%d, eid=%s\n", ret, EmsEidToString(eid).c_str());
+        printf("[emsd][ERROR] HcommEndpointCreate ret=%d, loc=%s addr=%s\n", ret, hostLoc ? "host" : "device",
+               hostLoc ? hostAddr.c_str() : EmsEidToString(eid).c_str());
         return -1;
     }
-    printf("[emsd] EndpointCreate ok, handle=%p eid=%s\n", endpoint_, EmsEidToString(eid).c_str());
+    printf("[emsd] EndpointCreate ok, loc=%s handle=%p addr=%s\n", hostLoc ? "host" : "device", endpoint_,
+           hostLoc ? hostAddr.c_str() : EmsEidToString(eid).c_str());
     return 0;
 }
 
@@ -143,13 +169,15 @@ int EmsdHcomm::SegRegister(uint32_t segIndex, uint32_t poolId, void *base, uint6
     char memTag[64];
     (void)snprintf(memTag, sizeof(memTag), "kv_seg_%u_%u", poolId, segIndex);
     CommMem commMem{};
+    // 恒 HOST：段内存恒 host DRAM（mmap）；device/host 两种 locType 下均如此——
+    // MemFabric device_urma 生产实证组合（ToHcommMem 默认 HOST，HVA 直注册有回退先例）
     commMem.type = COMM_MEM_TYPE_HOST;
     commMem.addr = base;
     commMem.size = size;
     HcommResult ret = api_.HcommMemReg(endpoint_, memTag, &commMem, &seg.memHandle);
     if (ret != 0 || seg.memHandle == nullptr) {
-        printf("[emsd][ERROR] MemReg failed, poolId=%u segIndex=%u ret=%d size=%llu\n", poolId, segIndex, ret,
-               (unsigned long long)size);
+        printf("[emsd][ERROR] MemReg failed, poolId=%u segIndex=%u addr=%p size=%llu ret=%d\n", poolId, segIndex,
+               base, (unsigned long long)size, ret);
         return KV_ERR_HCOMM;
     }
     void *desc = nullptr;

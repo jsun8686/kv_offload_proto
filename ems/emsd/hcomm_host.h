@@ -48,12 +48,16 @@ struct EmsdSeg {
 
 class EmsdHcomm {
 public:
-    // 初始化链（对齐 aiv_urma_poc，EID 全自动）：
-    //   dlopen libascendcl(RTLD_GLOBAL) → aclrtSetDevice(deviceId)（host endpoint 依赖进程 device 上下文）
-    //   → aclrtGetPhyDevIdByLogicDevId 取 phyId → rootinfo 按 device_id==phyId 自动匹配 EID
-    //   → dlopen libhcomm → EndpointCreate(HOST, UB_CTP, COMM_ADDR_TYPE_EID)
+    // 初始化链（双模式）：
+    //   device（默认，当前 CANN 包可用）：dlopen libascendcl(RTLD_GLOBAL) → aclrtSetDevice(deviceId)
+    //     → aclrtGetPhyDevIdByLogicDevId 取 phyId → rootinfo 按 device_id==phyId 匹配 EID
+    //     → EndpointCreate(DEVICE, UB_CTP, COMM_ADDR_TYPE_EID)——PoC 卡到卡同构
+    //   host（待跨模式/noDevice 构建包）：commAddr = IP_V6(hostAddr)（app 手填，noDevice 仓
+    //     rank_graph 标准填法，V6 即 EID 载体）→ EndpointCreate(HOST, UB_CTP, IP_V6)
+    // 两种模式段内存均恒 host DRAM（mmap）+ COMM_MEM_TYPE_HOST 注册——MemFabric 生产实证组合
+    //   （device_urma ToHcommMem 默认 HOST；HVA 无 DVA 回退注册有先例）
     int Init(const std::string &hcommLib, const std::string &aclLib, int32_t deviceId,
-             const std::string &rootinfoPath);
+             const std::string &rootinfoPath, bool hostLoc, const std::string &hostAddr);
     void Close();
 
     // 大块注册+导出（base 由 pool_mgr 分配）；memDesc 供 LINK_EXCHANGE 前经 master 转给框架侧
