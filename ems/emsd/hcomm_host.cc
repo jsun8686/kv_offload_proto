@@ -51,9 +51,30 @@ int EmsdDynApi::Load(const std::string &libPath)
     return 0;
 }
 
-int EmsdHcomm::Init(const std::string &hcommLib, const std::string &localIp)
+int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, const std::string &localIp,
+                    int32_t deviceId)
 {
     libPath_ = hcommLib;
+
+    // 先挂 NPU runtime 上下文（顺序关键：host endpoint 初始化经 hrtGetDevice 查当前 device）
+    aclLib_ = aclLib;
+    aclLibHandle_ = dlopen(aclLib.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (aclLibHandle_ == nullptr) {
+        printf("[emsd][ERROR] dlopen %s failed: %s\n", aclLib.c_str(), dlerror());
+        return -1;
+    }
+    auto aclrtSetDevice = reinterpret_cast<int32_t (*)(int32_t)>(dlsym(aclLibHandle_, "aclrtSetDevice"));
+    if (aclrtSetDevice == nullptr) {
+        printf("[emsd][ERROR] dlsym aclrtSetDevice failed, lib=%s, err=%s\n", aclLib.c_str(), dlerror());
+        return -1;
+    }
+    int32_t retDev = aclrtSetDevice(deviceId);
+    if (retDev != 0) {
+        printf("[emsd][ERROR] aclrtSetDevice failed, deviceId=%d ret=%d\n", deviceId, retDev);
+        return -1;
+    }
+    printf("[emsd] aclrtSetDevice ok, deviceId=%d\n", deviceId);
+
     if (api_.Load(hcommLib) != 0) {
         return -1;
     }

@@ -23,8 +23,8 @@ namespace {
 void Usage(const char *bin)
 {
     printf("usage: %s --role master|worker --ip <localIp> --port <ctrlPort>\n"
-           "  master: --members ip1:port1:hcommPort1[,ip2:port2:hcommPort2...] [--pool-size-gb N]\n"
-           "  worker: [--pool-size-gb N] [--hcomm-lib <path>]\n"
+           "  [--device N] [--acl-lib <path>] [--hcomm-lib <path>] [--pool-size-gb N]\n"
+           "  master: --members ip1:port1:hcommPort1[,ip2:port2:hcommPort2...]\n"
            "env: KV_EMSD_HCOMM_LIB 覆盖 libhcomm 路径\n",
            bin);
 }
@@ -47,6 +47,7 @@ int main(int argc, char **argv)
     std::string role = "worker";
     std::string members;
     int poolGb = 8;
+    int deviceId = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string k = argv[i];
@@ -61,6 +62,10 @@ int main(int argc, char **argv)
             members = next();
         } else if (k == "--pool-size-gb") {
             poolGb = atoi(next().c_str());
+        } else if (k == "--device") {
+            deviceId = atoi(next().c_str());
+        } else if (k == "--acl-lib") {
+            cfg.aclLib = next();
         } else if (k == "--hcomm-lib") {
             cfg.hcommLib = next();
         } else {
@@ -77,6 +82,7 @@ int main(int argc, char **argv)
     }
     cfg.isMaster = (role == "master");
     cfg.poolSizeBytes = static_cast<uint64_t>(poolGb) << 30;
+    cfg.deviceId = static_cast<int32_t>(deviceId);
     if (cfg.localIp.empty()) {
         printf("[emsd][ERROR] --ip is required\n");
         Usage(argv[0]);
@@ -125,9 +131,9 @@ int main(int argc, char **argv)
         cfg.members.push_back(self);  // worker 自身段表仅一条
     }
 
-    printf("[emsd] starting, role=%s ip=%s port=%u poolSizeBytes=%llu hcommLib=%s\n",
-           cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort,
-           (unsigned long long)cfg.poolSizeBytes, cfg.hcommLib.c_str());
+    printf("[emsd] starting, role=%s ip=%s port=%u device=%d poolSizeBytes=%llu aclLib=%s hcommLib=%s\n",
+           cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort, cfg.deviceId,
+           (unsigned long long)cfg.poolSizeBytes, cfg.aclLib.c_str(), cfg.hcommLib.c_str());
     EmsdCtrlServer server(cfg);
     return server.Run();
 }

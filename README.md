@@ -30,12 +30,13 @@ miss 识别为 device 侧 SIEVE 算子（移植自 sglang-0730，哈希-only + v
 ./build.sh emsd                                            # 资源节点（无 CANN 依赖）
 ./build.sh ext && ./build.sh kernel                        # NPU 机（先 source CANN set_env.sh）
 
-# 1) 资源节点 A（master；members=静态成员表 ip:ctrlPort）
-./build/emsd/emsd --role master --ip <A_ip> --port 27000 \
+# 1) 资源节点 A（master；members=静态成员表 ip:ctrlPort；--device：CANN 组件 libhcomm
+#    的 host endpoint 需进程挂 NPU runtime 上下文，无卡节点换 noDevice 构建后可免）
+./build/emsd/emsd --role master --ip <A_ip> --port 27000 --device 0 \
     --members <A_ip>:27000,<B_ip>:27001 --pool-size-gb 8
 
 # 2) 资源节点 B（worker）
-./build/emsd/emsd --role worker --ip <B_ip> --port 27001 --pool-size-gb 8
+./build/emsd/emsd --role worker --ip <B_ip> --port 27001 --device 0 --pool-size-gb 8
 
 # 3) NPU 机跑 decode 驱动（EID 获取参照 aiv_urma_poc；默认 direct 模式）
 python -m xds.xds_decode --ems-master <A_ip>:27000 --device 0 --eid <72hex> \
@@ -88,6 +89,7 @@ python -m xds.xds_decode ... --oracle
 
 | 症状 | 处置 |
 |---|---|
+| `HcommEndpointCreate ret=15`，plog 报 `hrtGetDevice failed, deviceLogicId[65535]` | emsd 进程缺 NPU 上下文：加 `--device N`（CANN 组件 libhcomm 的 host endpoint 依赖 SetDevice；无卡资源节点需换 noDevice 基线构建的 libhcomm） |
 | link_exchange/channel not ready | 跨模式 socket（HDC↔PEER）异步 connect 问题：预案在 `ems_client/hcomm_cli_ext.cpp: cli_link_channel` 同步化适配（参照 hcomm_no_device 提交 9b2cb0c9d 模式） |
 | sieve_update 报 UB budget | 降低 `--device-buffer-size`（UB=tokens 行+位图+哈希表 ≤176KB/核） |
 | sieve_update 报 padded ≤65534 | uint16 槽号上限：`--device-buffer-size` ≤ 65534-16 |

@@ -46,8 +46,10 @@ struct EmsdSeg {
 
 class EmsdHcomm {
 public:
-    // dlopen libhcomm + EndpointCreate(HOST, UB_CTP, IPv4)
-    int Init(const std::string &hcommLib, const std::string &localIp);
+    // dlopen libascendcl（RTLD_GLOBAL）→ aclrtSetDevice(deviceId)（CANN 组件 libhcomm 的 host
+    // endpoint 依赖进程 device 上下文：hrtGetDevice 于未 SetDevice 进程返回 65535 → Init 失败）
+    // → dlopen libhcomm → EndpointCreate(HOST, UB_CTP, IPv4)
+    int Init(const std::string &hcommLib, const std::string &aclLib, const std::string &localIp, int32_t deviceId);
     void Close();
 
     // 大块注册+导出（base 由 pool_mgr 分配）；memDesc 供 LINK_EXCHANGE 前经 master 转给框架侧
@@ -65,7 +67,9 @@ public:
 private:
     EmsdDynApi api_{};
     void *dlHandle_ = nullptr;
+    void *aclLibHandle_ = nullptr;
     std::string libPath_;
+    std::string aclLib_;
     EndpointHandle endpoint_ = nullptr;
     EndpointDesc localDesc_{};
     EmsdSeg segs_[KV_MAX_SEG_NUM]{};

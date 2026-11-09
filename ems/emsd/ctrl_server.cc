@@ -124,7 +124,7 @@ int EmsdCtrlServer::SendResp(int fd, uint16_t cmd, const void *payload, uint32_t
 
 int EmsdCtrlServer::Run()
 {
-    if (hcomm_.Init(cfg_.hcommLib, cfg_.localIp) != 0) {
+    if (hcomm_.Init(cfg_.hcommLib, cfg_.aclLib, cfg_.localIp, cfg_.deviceId) != 0) {
         return -1;
     }
     hcommInited_ = true;

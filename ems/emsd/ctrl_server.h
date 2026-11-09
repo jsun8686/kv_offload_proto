@@ -28,6 +28,8 @@ struct EmsdConfig {
     bool isMaster = false;
     std::string localIp;              // 本节点对外 IP（endpoint + TCP）
     uint16_t listenPort = 27000;      // 本 emsd 控制 TCP 监听端口
+    int32_t deviceId = 0;             // NPU 设备号（CANN 组件 libhcomm host endpoint 需 SetDevice 上下文）
+    std::string aclLib = "libascendcl.so";
     std::string hcommLib = "libhcomm.so";
     uint64_t poolSizeBytes = 8ULL << 30;  // 本节点可提供的池容量上限（u64：支持 >4GB 池）
     uint32_t readyTimeoutSec = 60;
