@@ -55,6 +55,8 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
                     const std::string &rootinfoPath, bool hostLoc, const std::string &hostAddr)
 {
     libPath_ = hcommLib;
+    hostLoc_ = hostLoc;
+    deviceId_ = deviceId;
     std::array<uint8_t, EMS_EID_LEN> eid{};
     int32_t phyId = -1;
 
@@ -84,6 +86,8 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
             printf("[emsd][ERROR] aclrtSetDevice failed, deviceId=%d ret=%d\n", deviceId, retDev);
             return -1;
         }
+        // 供 BindDeviceCtx 在工作线程重绑（设备上下文线程私有）
+        aclrtSetDeviceFn_ = aclrtSetDevice;
         printf("[emsd] aclrtSetDevice ok, deviceId=%d\n", deviceId);
 
         auto aclrtGetPhyDevIdByLogicDevId =
@@ -245,6 +249,18 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     printf("[emsd] LinkServer created, poolId=%u segIndex=%u channel=0x%llx\n", seg.poolId, segIndex,
            (unsigned long long)seg.channel);
     return KV_OK;
+}
+
+int EmsdHcomm::BindDeviceCtx()
+{
+    if (hostLoc_) {
+        return 0;  // host 模式不依赖 NPU runtime 上下文
+    }
+    if (aclrtSetDeviceFn_ == nullptr || aclrtSetDeviceFn_(deviceId_) != 0) {
+        printf("[emsd][ERROR] BindDeviceCtx failed, deviceId=%d\n", deviceId_);
+        return -1;
+    }
+    return 0;
 }
 
 int EmsdHcomm::SegRelease(uint32_t segIndex, bool destroyChannel)

@@ -158,6 +158,32 @@ int EmsdCtrlServer::HandleConn(int fd)
         }
         int ret = 0;
         std::lock_guard<std::mutex> lk(connMutex_);
+        // 设备上下文线程私有：Init 的 aclrtSetDevice 只绑定了主线程，每连接一个线程后
+        // 须在工作线程重绑，否则 hcomm 调用（MemReg/MemExport/ChannelCreate）报 KV_ERR_HCOMM
+        if (hcomm_.BindDeviceCtx() != 0) {
+            switch (hdr.cmd) {
+                case KV_CMD_POOL_CREATE: {
+                    KvPoolCreateRespHead head{KV_ERR_HCOMM, 0, 0, 0};
+                    ret = SendResp(fd, hdr.cmd, &head, sizeof(head));
+                    break;
+                }
+                case KV_CMD_SEG_ALLOC: {
+                    KvSegAllocResp resp{};
+                    resp.status = KV_ERR_HCOMM;
+                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
+                    break;
+                }
+                default: {
+                    KvGenericResp resp{KV_ERR_HCOMM, 0};
+                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
+                    break;
+                }
+            }
+            if (ret != 0) {
+                return ret;
+            }
+            continue;
+        }
         switch (hdr.cmd) {
             case KV_CMD_PING: {
                 KvGenericResp resp{KV_OK, 0};

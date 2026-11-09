@@ -68,6 +68,11 @@ public:
                    uint32_t peerMemDescLen, uint32_t readyTimeoutSec);
     int SegRelease(uint32_t segIndex, bool destroyChannel);
 
+    // 设备上下文线程私有：aclrtSetDevice 仅在 Init 所在线程生效，每连接一个线程后
+    // 工作线程须在建链/MemReg/ChannelCreate 等 hcomm 调用前重绑（host 模式为 no-op）。
+    // 未重绑的典型症状：pool_create 返回 KV_ERR_HCOMM（HcommMemReg/MemExport 失败）。
+    int BindDeviceCtx();
+
     const EmsdSeg *GetSeg(uint32_t segIndex) const;
     const EndpointDesc &LocalDesc() const { return localDesc_; }
     EmsdDynApi &Api() { return api_; }
@@ -81,6 +86,10 @@ private:
     EndpointHandle endpoint_ = nullptr;
     EndpointDesc localDesc_{};
     EmsdSeg segs_[KV_MAX_SEG_NUM]{};
+    // device 模式上下文重绑状态（BindDeviceCtx 用）
+    int32_t (*aclrtSetDeviceFn_)(int32_t) = nullptr;
+    int32_t deviceId_ = -1;
+    bool hostLoc_ = true;
 };
 
 #endif  // EMSD_HCOMM_HOST_H
