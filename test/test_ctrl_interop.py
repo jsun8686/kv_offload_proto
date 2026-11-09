@@ -98,11 +98,12 @@ class MockEmsd(threading.Thread):
             seg = kp.SegmentInfo(node_id=0, seg_base=0x7F0000000000, seg_size=1 << 20,
                                  ctrl_ip="127.0.0.1", ctrl_port=self.port,
                                  hcomm_listen_port=60001, channel_tag="kv_pool_1",
-                                 mem_desc=b"\xCD" * 128)
+                                 mem_desc=b"\xCD" * 128, ep_desc=b"\xEE" * 160)  # epDesc = sizeof(EndpointDesc)
             head = struct.pack(kp.POOL_CREATE_RESP_HEAD_FMT, kp.KV_OK, 1, 1, 0)
             body = struct.pack(kp.SEG_INFO_FMT, seg.node_id, 0, seg.seg_base, seg.seg_size,
                                seg.ctrl_ip.encode(), seg.ctrl_port, seg.hcomm_listen_port,
-                               seg.channel_tag.encode(), len(seg.mem_desc), 0, seg.mem_desc)
+                               seg.channel_tag.encode(), len(seg.mem_desc), 0, seg.mem_desc,
+                               len(seg.ep_desc), 0, seg.ep_desc)
             send(kp.CMD_POOL_CREATE, head + body)
             return True
         if cmd == kp.CMD_LINK_EXCHANGE:
@@ -132,6 +133,9 @@ class TestCtrlInterop(unittest.TestCase):
             pool = cli.pool_create(1 << 20, layer_num=2, layer_rows=128, row_bytes=1152)
             self.assertEqual(pool.node_num, 1)
             self.assertEqual(pool.segments[0].ctrl_port, mock.port)
+            # 回归锚点：client 必须拿到 server 侧 endpoint 描述（AIV remoteEndpoint），
+            # 缺失时旧代码会退回传本端 local_desc 导致 client 向自己建链、channel 永不 READY
+            self.assertEqual(pool.segments[0].ep_desc, b"\xEE" * 160)
             status = cli.link_exchange(pool.segments[0], endpoint_desc=bytes(72), mem_desc=b"\xAB" * 100)
             self.assertEqual(status, kp.KV_OK)
             cli.pool_destroy(pool.pool_id)

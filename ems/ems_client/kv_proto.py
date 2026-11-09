@@ -33,25 +33,28 @@ MAX_SEG_NUM = 8
 HDR_FMT = "<IHHIHH"
 HDR_SIZE = struct.calcsize(HDR_FMT)  # 16
 
+# EP_DESC_BUF 必须 ≥ sizeof(EndpointDesc)=160（common/hcomm/hcomm_res_defs.h，与 C 侧 KV_EP_DESC_BUF 严格对齐）；
+# 128 时 struct 128s 会静默截断 desc 内容（descLen 字段却仍写真实长度），服务端 descLen 校验直接拒绝。
+# 该缓冲同时用于 KvSegInfoRec/KvSegAllocResp 尾部的 epDesc 字段（AIV client remoteEndpoint 用）
+EP_DESC_BUF = 160
+
 # POOL_CREATE req: sizeBytes u64, layerNum u32, layerRows u32, rowBytes u32, stripeRows u32, reserved u32
 POOL_CREATE_REQ_FMT = "<QIIIII"
 # resp head: status i32, poolId u32, nodeNum u32, reserved u32
 POOL_CREATE_RESP_HEAD_FMT = "<iIII"
 # 段记录: nodeId u32, reserved u32, segBase u64, segSize u64, ctrlIp char[64], ctrlPort u16,
-#         hcommListenPort u16, channelTag char[64], memDescLen u32, reserved2 u32, memDesc u8[4096]
-SEG_INFO_FMT = "<IIQQ64sHH64sII{}s".format(MAX_MEM_DESC)
+#         hcommListenPort u16, channelTag char[64], memDescLen u32, reserved2 u32, memDesc u8[4096],
+#         epDescLen u32, reserved3 u32, epDesc u8[160]（该节点 endpoint 描述，AIV client remoteEndpoint 用）
+SEG_INFO_FMT = "<IIQQ64sHH64sII{}sII{}s".format(MAX_MEM_DESC, EP_DESC_BUF)
 SEG_INFO_SIZE = struct.calcsize(SEG_INFO_FMT)
 
 POOL_DESTROY_REQ_FMT = "<II"
 GENERIC_RESP_FMT = "<iI"
 # SEG_ALLOC req: poolId u32, segIndex u32, segSize u64, hcommListenPort u16, reserved u16, ctrlIp[64], tag[64]
 SEG_ALLOC_REQ_FMT = "<IIQHH64s64s"
-SEG_ALLOC_RESP_FMT = "<iiQII{}s".format(MAX_MEM_DESC)
+SEG_ALLOC_RESP_FMT = "<iiQII{}sII{}s".format(MAX_MEM_DESC, EP_DESC_BUF)
 
 # LINK 帧: descLen u32, desc[160], memDescLen u32, memDesc[4096]
-# EP_DESC_BUF 必须 ≥ sizeof(EndpointDesc)=160（common/hcomm/hcomm_res_defs.h，与 C 侧 KV_EP_DESC_BUF 严格对齐）；
-# 128 时 struct 128s 会静默截断 desc 内容（descLen 字段却仍写真实长度），服务端 descLen 校验直接拒绝
-EP_DESC_BUF = 160
 LINK_FRAME_FMT = "<I{}sI{}s".format(EP_DESC_BUF, MAX_MEM_DESC)
 LINK_FRAME_SIZE = struct.calcsize(LINK_FRAME_FMT)
 
@@ -66,6 +69,7 @@ class SegmentInfo:
     hcomm_listen_port: int = 0
     channel_tag: str = ""
     mem_desc: bytes = b""
+    ep_desc: bytes = b""  # 该节点 endpoint 描述（= sizeof(EndpointDesc) 字节，AIV client 建链 remoteEndpoint）
 
 
 @dataclass
@@ -112,9 +116,8 @@ def decode_pool_create_resp(payload: bytes) -> tuple:
     pool = PoolInfo(pool_id=pool_id, node_num=node_num)
     off = struct.calcsize(POOL_CREATE_RESP_HEAD_FMT)
     for _ in range(node_num):
-        (node_id, _r, seg_base, seg_size, ctrl_ip, ctrl_port, hcomm_port, tag, desc_len, _r2, desc) = struct.unpack_from(
-            SEG_INFO_FMT, payload, off
-        )
+        (node_id, _r, seg_base, seg_size, ctrl_ip, ctrl_port, hcomm_port, tag, desc_len, _r2, desc,
+         ep_len, _r3, ep_desc) = struct.unpack_from(SEG_INFO_FMT, payload, off)
         pool.segments.append(
             SegmentInfo(
                 node_id=node_id,
@@ -125,6 +128,7 @@ def decode_pool_create_resp(payload: bytes) -> tuple:
                 hcomm_listen_port=hcomm_port,
                 channel_tag=tag.split(b"\x00")[0].decode("utf-8", "replace"),
                 mem_desc=desc[:desc_len],
+                ep_desc=ep_desc[:ep_len],
             )
         )
         off += SEG_INFO_SIZE

@@ -27,12 +27,12 @@ class TestProto(unittest.TestCase):
         self.assertEqual(kp.HDR_SIZE, 16)
         self.assertEqual(struct.calcsize(kp.POOL_CREATE_REQ_FMT), 28)  # u64 + 5*u32，pack(1) 无 padding
         self.assertEqual(struct.calcsize(kp.POOL_CREATE_RESP_HEAD_FMT), 16)
-        # SEG_INFO: 4+4+8+8+64+2+2+64+4+4+4096 = 4260
-        self.assertEqual(kp.SEG_INFO_SIZE, 4260)
+        # SEG_INFO: 4+4+8+8+64+2+2+64+4+4+4096 + (4+4+160) = 4428（尾部 epDesc 字段）
+        self.assertEqual(kp.SEG_INFO_SIZE, 4428)
         self.assertEqual(struct.calcsize(kp.GENERIC_RESP_FMT), 8)
         self.assertEqual(struct.calcsize(kp.SEG_ALLOC_REQ_FMT), 148)
-        # SEG_ALLOC_RESP: 4+4+8+4+4+4096 = 4120
-        self.assertEqual(struct.calcsize(kp.SEG_ALLOC_RESP_FMT), 4120)
+        # SEG_ALLOC_RESP: 4+4+8+4+4+4096 + (4+4+160) = 4288
+        self.assertEqual(struct.calcsize(kp.SEG_ALLOC_RESP_FMT), 4288)
         # LINK frame: 4+160+4+4096 = 4264（EP_DESC_BUF 须 ≥ sizeof(EndpointDesc)=160）
         self.assertEqual(kp.LINK_FRAME_SIZE, 4264)
         self.assertGreaterEqual(kp.EP_DESC_BUF, 160)
@@ -41,7 +41,7 @@ class TestProto(unittest.TestCase):
         seg = kp.SegmentInfo(
             node_id=1, seg_base=0x7F0000000000, seg_size=1 << 30, ctrl_ip="192.168.1.20", ctrl_port=27001,
             hcomm_listen_port=60001, channel_tag="kv_pool_1",
-            mem_desc=bytes(range(64)),
+            mem_desc=bytes(range(64)), ep_desc=bytes(160),  # epDesc = sizeof(EndpointDesc)
         )
         n = 2
         head = struct.pack(kp.POOL_CREATE_RESP_HEAD_FMT, kp.KV_OK, 1, n, 0)
@@ -50,6 +50,7 @@ class TestProto(unittest.TestCase):
             body += struct.pack(
                 kp.SEG_INFO_FMT, s.node_id, 0, s.seg_base, s.seg_size, s.ctrl_ip.encode(), s.ctrl_port,
                 s.hcomm_listen_port, s.channel_tag.encode(), len(s.mem_desc), 0, s.mem_desc,
+                len(s.ep_desc), 0, s.ep_desc,
             )
         status, pool = kp.decode_pool_create_resp(head + body)
         self.assertEqual(status, kp.KV_OK)
@@ -58,6 +59,7 @@ class TestProto(unittest.TestCase):
         self.assertEqual(pool.segments[0].seg_base, 0x7F0000000000)
         self.assertEqual(pool.segments[1].ctrl_ip, "192.168.1.10")
         self.assertEqual(pool.segments[0].mem_desc, bytes(range(64)))
+        self.assertEqual(pool.segments[0].ep_desc, bytes(160))  # epDesc 透传完整性
 
     def test_link_frame_roundtrip(self):
         desc = bytes(160)  # = sizeof(EndpointDesc)：恰好放满的边界用例（128B 时代会被静默截断）

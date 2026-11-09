@@ -277,6 +277,8 @@ int EmsdCtrlServer::OnPoolCreate(const KvPoolCreateReq &req, int fd)
             (void)snprintf(infos[0].channelTag, sizeof(infos[0].channelTag), "%s", areq.channelTag);
             infos[0].memDescLen = aresp.memDescLen;
             (void)memcpy(infos[0].memDesc, aresp.memDesc, aresp.memDescLen);
+            infos[0].epDescLen = aresp.epDescLen;
+            (void)memcpy(infos[0].epDesc, aresp.epDesc, aresp.epDescLen);
         }
     }
     // 其余段 = 各 worker
@@ -300,6 +302,8 @@ int EmsdCtrlServer::OnPoolCreate(const KvPoolCreateReq &req, int fd)
             (void)snprintf(infos[i].channelTag, sizeof(infos[i].channelTag), "%s", areq.channelTag);
             infos[i].memDescLen = aresp.memDescLen;
             (void)memcpy(infos[i].memDesc, aresp.memDesc, aresp.memDescLen);
+            infos[i].epDescLen = aresp.epDescLen;
+            (void)memcpy(infos[i].epDesc, aresp.epDesc, aresp.epDescLen);
         }
     }
     int32_t finalStatus = KV_OK;
@@ -383,6 +387,10 @@ int EmsdCtrlServer::OnSegAllocImpl(const KvSegAllocReq &req, KvSegAllocResp &res
     resp.segBase = reinterpret_cast<uint64_t>(seg->base);
     resp.memDescLen = static_cast<uint32_t>(seg->memDesc.size());
     (void)memcpy(resp.memDesc, seg->memDesc.data(), seg->memDesc.size());
+    // 本节点 endpoint 描述随段信息回传：框架侧 AIV client 建链需以此作 remoteEndpoint
+    const EndpointDesc &localDesc = hcomm_.LocalDesc();
+    resp.epDescLen = static_cast<uint32_t>(sizeof(localDesc));
+    (void)memcpy(resp.epDesc, &localDesc, sizeof(localDesc));
     return KV_OK;
 }
 

@@ -77,6 +77,9 @@ struct KvSegInfoRec {
     uint32_t memDescLen;
     uint32_t reserved2;
     uint8_t memDesc[KV_MAX_MEM_DESC];
+    uint32_t epDescLen;         // 该节点 endpoint 描述（AIV client 建链 remoteEndpoint 用）
+    uint32_t reserved3;
+    uint8_t epDesc[KV_EP_DESC_BUF];
 };
 
 // POOL_CREATE 响应（master -> client）：KvGenericResp 头 + nodeNum 个 KvSegInfoRec
@@ -118,6 +121,9 @@ struct KvSegAllocResp {
     uint32_t memDescLen;
     uint32_t reserved2;
     uint8_t memDesc[KV_MAX_MEM_DESC];
+    uint32_t epDescLen;         // 本节点 endpoint 描述（master 回填 KvSegInfoRec 用）
+    uint32_t reserved3;
+    uint8_t epDesc[KV_EP_DESC_BUF];
 };
 
 // LINK_EXCHANGE 帧：作为 KV_CMD_LINK_EXCHANGE 消息的 payload 一次发送

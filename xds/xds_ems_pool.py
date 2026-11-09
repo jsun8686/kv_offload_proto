@@ -167,7 +167,12 @@ class EmsPool:
             if remote_addr != seg.seg_base:
                 raise RuntimeError("seg base mismatch, node {}: ems={} import={}".format(
                     seg.node_id, seg.seg_base, remote_addr))
-            handle, _st = _cli.link_channel(local_desc, seg.hcomm_listen_port, seg.channel_tag, 60)
+            # remoteEndpoint 必须是该资源节点（server 侧）的 endpoint 描述——
+            # 传本端 local_desc 会让 client 向自己发起建链，channel 永远 READY 不了
+            if not seg.ep_desc:
+                raise RuntimeError("seg {} has no endpoint desc (emsd too old?): ctrl={}:{}".format(
+                    seg.node_id, seg.ctrl_ip, seg.ctrl_port))
+            handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port, seg.channel_tag, 60)
             self.channels.append(handle)
 
         _kvops.init(self.device_id, fatbin_path)
