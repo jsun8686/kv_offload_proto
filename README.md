@@ -30,16 +30,17 @@ miss 识别为 device 侧 SIEVE 算子（移植自 sglang-0730，哈希-only + v
 ./build.sh emsd                                            # 资源节点（无 CANN 依赖）
 ./build.sh ext && ./build.sh kernel                        # NPU 机（先 source CANN set_env.sh）
 
-# 1) 资源节点 A（master；members=静态成员表 ip:ctrlPort；--device：CANN 组件 libhcomm
-#    的 host endpoint 需进程挂 NPU runtime 上下文，无卡节点换 noDevice 构建后可免）
+# 1) 资源节点 A（master；members=静态成员表 ip:ctrlPort；EID 全自动：rootinfo 按 --device 的
+#    phyId 匹配；--device：CANN 组件 libhcomm 的 host endpoint 需进程挂 NPU runtime 上下文，
+#    无卡节点换 noDevice 构建后可免）
 ./build/emsd/emsd --role master --ip <A_ip> --port 27000 --device 0 \
     --members <A_ip>:27000,<B_ip>:27001 --pool-size-gb 8
 
 # 2) 资源节点 B（worker）
 ./build/emsd/emsd --role worker --ip <B_ip> --port 27001 --device 0 --pool-size-gb 8
 
-# 3) NPU 机跑 decode 驱动（EID 获取参照 aiv_urma_poc；默认 direct 模式）
-python -m xds.xds_decode --ems-master <A_ip>:27000 --device 0 --eid <72hex> \
+# 3) NPU 机跑 decode 驱动（EID 全自动：device→phyId→rootinfo 匹配；默认 direct 模式）
+python -m xds.xds_decode --ems-master <A_ip>:27000 --device 0 \
     --req-num 8 --prefill 256 --topk 64 --device-buffer-size 64 --miss-ratio 0.5 --steps 10
 
 #    带 CPU oracle 对拍（eager 专用，逐层校验 sieve slots/is_miss）
@@ -62,7 +63,7 @@ python -m xds.xds_decode ... --oracle
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--ems-master` | 必填 | master emsd ip:port |
-| `--device / --eid` | 0 / 必填 | NPU 卡号 / 本卡 EID（72 hex） |
+| `--device / --rootinfo` | 0 / /etc/hccl_rootinfo.json | NPU 卡号 / EID 自动匹配源（device→phyId→rootinfo） |
 | `--fatbin` | 自动探测 | kvc fatbin 路径 |
 | `--layers / --layer-rows` | 2 / 1024 | 层数 / 每层行数 |
 | `--kv-lora-rank / --qk-rope` | 512 / 64 | MLA 行字宽（fp16） |
@@ -90,6 +91,7 @@ python -m xds.xds_decode ... --oracle
 | 症状 | 处置 |
 |---|---|
 | `HcommEndpointCreate ret=15`，plog 报 `hrtGetDevice failed, deviceLogicId[65535]` | emsd 进程缺 NPU 上下文：加 `--device N`（CANN 组件 libhcomm 的 host endpoint 依赖 SetDevice；无卡资源节点需换 noDevice 基线构建的 libhcomm） |
+| `HcommEndpointCreate ret=11`，plog 报 `rs_urma_get_device_by_eid failed / errno:19` | endpoint 地址未匹配到 UB 设备（EID 空间）：两端均已按 PoC 链路自动填 EID（device→phyId→rootinfo）；检查 rootinfo 可读且含 `--device` 对应 `device_id` 的 EID addr，必要时 `--rootinfo <path>` 指定正确文件 |
 | link_exchange/channel not ready | 跨模式 socket（HDC↔PEER）异步 connect 问题：预案在 `ems_client/hcomm_cli_ext.cpp: cli_link_channel` 同步化适配（参照 hcomm_no_device 提交 9b2cb0c9d 模式） |
 | sieve_update 报 UB budget | 降低 `--device-buffer-size`（UB=tokens 行+位图+哈希表 ≤176KB/核） |
 | sieve_update 报 padded ≤65534 | uint16 槽号上限：`--device-buffer-size` ≤ 65534-16 |

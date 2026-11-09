@@ -112,16 +112,17 @@ class EmsPool:
     对 XDS 的唯一接口面：master 地址传入即可（EmsClient 为内部实现，外部不感知）。
     """
 
-    def __init__(self, master_ip: str, master_port: int, device_id: int, eid_hex: str, layer_num: int,
-                 layer_rows: int, row_bytes: int, stripe_rows: int = 1, acl_lib: str = "libascendcl.so",
-                 hcomm_lib: str = "libhcomm.so", timeout_sec: float = 120.0):
+    def __init__(self, master_ip: str, master_port: int, device_id: int, layer_num: int, layer_rows: int,
+                 row_bytes: int, stripe_rows: int = 1, acl_lib: str = "libascendcl.so",
+                 hcomm_lib: str = "libhcomm.so", rootinfo_path: str = "/etc/hccl_rootinfo.json",
+                 timeout_sec: float = 120.0):
         if layer_num < 1 or layer_rows < 1 or row_bytes <= 0 or row_bytes % 128 != 0:
             raise ValueError("invalid pool dims: L={} rows={} rowBytes={}".format(layer_num, layer_rows, row_bytes))
         if EmsClient is None:
             raise RuntimeError("ems_client package not installed (NPU host only)")
         self._ems = EmsClient(master_ip, master_port, timeout_sec)
         self.device_id = device_id
-        self.eid_hex = eid_hex
+        self.rootinfo_path = rootinfo_path  # EID 自动：device→phyId→rootinfo 匹配（与 emsd 同链路）
         self.layer_num = layer_num
         self.layer_rows = layer_rows
         self.row_bytes = row_bytes
@@ -151,7 +152,7 @@ class EmsPool:
         self.node_num = self.pool.node_num
         self.per_layer_seg_rows = (self.layer_rows + self.node_num - 1) // self.node_num
 
-        _cli.init(self.device_id, self.eid_hex, self.acl_lib, self.hcomm_lib)
+        _cli.init(self.device_id, self.rootinfo_path, self.acl_lib, self.hcomm_lib)
         _cli.mem_reg(hbm_pool_base, hbm_pool_size, "kv_hbm")
         local_desc = _cli.local_desc()
         mem_desc = _cli.mem_desc()

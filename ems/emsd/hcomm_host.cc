@@ -6,7 +6,6 @@
 
 #include "hcomm_host.h"
 
-#include <arpa/inet.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -51,8 +50,8 @@ int EmsdDynApi::Load(const std::string &libPath)
     return 0;
 }
 
-int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, const std::string &localIp,
-                    int32_t deviceId)
+int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int32_t deviceId,
+                    const std::string &rootinfoPath)
 {
     libPath_ = hcommLib;
 
@@ -75,6 +74,25 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, cons
     }
     printf("[emsd] aclrtSetDevice ok, deviceId=%d\n", deviceId);
 
+    // device → phyId → EID（对齐 PoC：rootinfo 按 device_id==phyId 匹配）
+    auto aclrtGetPhyDevIdByLogicDevId =
+        reinterpret_cast<int32_t (*)(int32_t, int32_t *)>(dlsym(aclLibHandle_, "aclrtGetPhyDevIdByLogicDevId"));
+    if (aclrtGetPhyDevIdByLogicDevId == nullptr) {
+        printf("[emsd][ERROR] dlsym aclrtGetPhyDevIdByLogicDevId failed, err=%s\n", dlerror());
+        return -1;
+    }
+    int32_t phyId = -1;
+    if (aclrtGetPhyDevIdByLogicDevId(deviceId, &phyId) != 0 || phyId < 0) {
+        printf("[emsd][ERROR] aclrtGetPhyDevIdByLogicDevId failed, deviceId=%d phyId=%d\n", deviceId, phyId);
+        return -1;
+    }
+    std::array<uint8_t, EMS_EID_LEN> eid{};
+    if (EmsGetEid(rootinfoPath, static_cast<uint32_t>(phyId), eid) != 0) {
+        printf("[emsd][ERROR] EmsGetEid failed, phyId=%d rootinfo=%s\n", phyId, rootinfoPath.c_str());
+        return -1;
+    }
+    printf("[emsd] EID resolved, deviceId=%d phyId=%d eid=%s\n", deviceId, phyId, EmsEidToString(eid).c_str());
+
     if (api_.Load(hcommLib) != 0) {
         return -1;
     }
@@ -85,17 +103,17 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, cons
         return -1;
     }
     localDesc_.protocol = COMM_PROTOCOL_UBC_CTP;  // = COMM_PROTOCOL_UB_CTP（跨节点 UBC，阶段一）
-    localDesc_.commAddr.type = COMM_ADDR_TYPE_IP_V4;
-    localDesc_.commAddr.addr.s_addr = inet_addr(localIp.c_str());
+    localDesc_.commAddr.type = COMM_ADDR_TYPE_EID;
+    memcpy(localDesc_.commAddr.eid, eid.data(), EMS_EID_LEN);  // 16B 有效（PoC 同款填法）
     localDesc_.loc.locType = ENDPOINT_LOC_TYPE_HOST;
-    localDesc_.loc.host.id = 0;  // 普通 host 通信 Id（noDevice 基线默认 0，联调按部署调整）
+    localDesc_.loc.host.id = 0;  // 普通 host 通信 Id（联调按部署调整）
 
     HcommResult ret = api_.HcommEndpointCreate(&localDesc_, &endpoint_);
     if (ret != 0 || endpoint_ == nullptr) {
-        printf("[emsd][ERROR] HcommEndpointCreate ret=%d, localIp=%s\n", ret, localIp.c_str());
+        printf("[emsd][ERROR] HcommEndpointCreate ret=%d, eid=%s\n", ret, EmsEidToString(eid).c_str());
         return -1;
     }
-    printf("[emsd] EndpointCreate ok, handle=%p ip=%s\n", endpoint_, localIp.c_str());
+    printf("[emsd] EndpointCreate ok, handle=%p eid=%s\n", endpoint_, EmsEidToString(eid).c_str());
     return 0;
 }
 

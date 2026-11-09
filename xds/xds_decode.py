@@ -6,7 +6,7 @@
 # （topK 采样【预留真实 lightning indexer 接口】→ sieve_update → 批量导入 → 校验）→ 统计。
 # 全程热路径无 .cpu()/.item()（--oracle 对拍模式除外，eager 专用）。
 #
-# 运行（NPU 机）：python -m xds.xds_decode --ems-master <ip:port> --eid <72hex> [options]
+# 运行（NPU 机）：python -m xds.xds_decode --ems-master <ip:port> [options]（EID 按 --device 自动匹配）
 
 import argparse
 import os
@@ -22,7 +22,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="XDS decode pipeline driver (kv offload prototype)")
     p.add_argument("--ems-master", required=True, help="master emsd ip:port")
     p.add_argument("--device", type=int, default=0)
-    p.add_argument("--eid", required=True, help="本卡 EID（72 hex 字符）")
+    p.add_argument("--rootinfo", default="/etc/hccl_rootinfo.json",
+                   help="EID 自动匹配源（device→phyId→rootinfo 的 device_id 块首个 EID addr）")
     p.add_argument("--fatbin", default="", help="kvc fatbin 路径（默认 build/kernel 安装产物路径自动探测）")
     # 模型/池形态
     p.add_argument("--layers", type=int, default=2)
@@ -152,8 +153,8 @@ def main() -> int:
             log("[xds][ERROR] fatbin not found, pass --fatbin explicitly")
             return 1
 
-    pool = EmsPool(master_ip, int(master_port), args.device, args.eid, args.layers, args.layer_rows, row_bytes,
-                   stripe_rows=args.stripe_rows)
+    pool = EmsPool(master_ip, int(master_port), args.device, args.layers, args.layer_rows, row_bytes,
+                   stripe_rows=args.stripe_rows, rootinfo_path=args.rootinfo)
     pool.create_pool(hbm.data_ptr(), hbm.numel() * 4, fatbin)
     log("[xds] pool ready: nodes={} perLayerSegRows={} channels={} fatbin={}".format(
         pool.node_num, pool.per_layer_seg_rows, len(pool.channels), fatbin))

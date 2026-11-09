@@ -11,21 +11,23 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "common/ems_eid.h"
 #include "common/hcomm/hcomm_res.h"
 
 namespace py = pybind11;
 
 namespace {
-constexpr uint32_t EID_LEN = 36;  // COMM_ADDR_EID_LEN
-
 struct DynApi {
     int32_t (*aclrtSetDevice)(int32_t);
+    int32_t (*aclrtGetPhyDevIdByLogicDevId)(int32_t, int32_t *);
     HcommResult (*HcommEndpointCreate)(const EndpointDesc *, EndpointHandle *);
     HcommResult (*HcommEndpointDestroy)(EndpointHandle);
     HcommResult (*HcommMemReg)(EndpointHandle, const char *, const CommMem *, HcommMemHandle *);
@@ -57,33 +59,13 @@ T Sym(void *h, const char *name)
     }
     return fn;
 }
-
-int HexVal(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-int ParseEid(const std::string &hex, uint8_t *eid)
-{
-    if (hex.size() < EID_LEN * 2) {
-        return -1;
-    }
-    for (uint32_t i = 0; i < EID_LEN; i++) {
-        int hi = HexVal(hex[i * 2]);
-        int lo = HexVal(hex[i * 2 + 1]);
-        if (hi < 0 || lo < 0) {
-            return -1;
-        }
-        eid[i] = static_cast<uint8_t>((hi << 4) | lo);
-    }
-    return 0;
-}
 }  // namespace
 
-void cli_init(int deviceId, const std::string &eidHex, const std::string &aclLib, const std::string &hcommLib)
+// 初始化（EID 全自动，对齐 PoC/emsd 链路）：
+//   SetDevice(deviceId) → aclrtGetPhyDevIdByLogicDevId 取 phyId
+//   → rootinfo 按 device_id==phyId 匹配 EID（16B/32hex）
+//   → EndpointCreate(DEVICE, UB_CTP, COMM_ADDR_TYPE_EID)
+void cli_init(int deviceId, const std::string &rootinfoPath, const std::string &aclLib, const std::string &hcommLib)
 {
     if (g_inited) {
         throw std::runtime_error("cli already inited");
@@ -97,6 +79,8 @@ void cli_init(int deviceId, const std::string &eidHex, const std::string &aclLib
         throw std::runtime_error(std::string("dlopen hcomm failed: ") + dlerror());
     }
     g_api.aclrtSetDevice = Sym<decltype(g_api.aclrtSetDevice)>(g_aclLib, "aclrtSetDevice");
+    g_api.aclrtGetPhyDevIdByLogicDevId =
+        Sym<decltype(g_api.aclrtGetPhyDevIdByLogicDevId)>(g_aclLib, "aclrtGetPhyDevIdByLogicDevId");
     g_api.HcommEndpointCreate = Sym<decltype(g_api.HcommEndpointCreate)>(g_hcommLib, "HcommEndpointCreate");
     g_api.HcommEndpointDestroy = Sym<decltype(g_api.HcommEndpointDestroy)>(g_hcommLib, "HcommEndpointDestroy");
     g_api.HcommMemReg = Sym<decltype(g_api.HcommMemReg)>(g_hcommLib, "HcommMemReg");
@@ -109,22 +93,31 @@ void cli_init(int deviceId, const std::string &eidHex, const std::string &aclLib
     g_api.HcommChannelDestroy = Sym<decltype(g_api.HcommChannelDestroy)>(g_hcommLib, "HcommChannelDestroy");
 
     if (g_api.aclrtSetDevice(deviceId) != 0) {
-        throw std::runtime_error("aclrtSetDevice failed");
+        throw std::runtime_error("aclrtSetDevice failed, deviceId=" + std::to_string(deviceId));
     }
+    int32_t phyId = -1;
+    if (g_api.aclrtGetPhyDevIdByLogicDevId(deviceId, &phyId) != 0 || phyId < 0) {
+        throw std::runtime_error("aclrtGetPhyDevIdByLogicDevId failed, deviceId=" + std::to_string(deviceId));
+    }
+    std::array<uint8_t, EMS_EID_LEN> eid{};
+    if (EmsGetEid(rootinfoPath, static_cast<uint32_t>(phyId), eid) != 0) {
+        throw std::runtime_error("EmsGetEid failed, phyId=" + std::to_string(phyId) + " rootinfo=" + rootinfoPath);
+    }
+    printf("[cli] EID resolved, deviceId=%d phyId=%d eid=%s\n", deviceId, phyId, EmsEidToString(eid).c_str());
+
     if (EndpointDescInit(&g_localDesc, 1) != 0) {
         throw std::runtime_error("EndpointDescInit failed");
     }
     g_localDesc.protocol = COMM_PROTOCOL_UBC_CTP;
     g_localDesc.commAddr.type = COMM_ADDR_TYPE_EID;
-    if (ParseEid(eidHex, g_localDesc.commAddr.eid) != 0) {
-        throw std::runtime_error("invalid eid hex (expect 72 hex chars)");
-    }
+    memcpy(g_localDesc.commAddr.eid, eid.data(), EMS_EID_LEN);  // 16B 有效（PoC 同款填法）
     g_localDesc.loc.locType = ENDPOINT_LOC_TYPE_DEVICE;
-    g_localDesc.loc.device.devPhyId = static_cast<uint32_t>(deviceId);
+    g_localDesc.loc.device.devPhyId = static_cast<uint32_t>(phyId);  // 用 phyId（PoC 同款：desc 填物理 ID）
     // superDevId/serverIdx/superPodIdx 留 0：noDevice 基线 DEVICE loc 的路由以 EID 为准（联调校准）
     HcommResult ret = g_api.HcommEndpointCreate(&g_localDesc, &g_endpoint);
     if (ret != 0 || g_endpoint == nullptr) {
-        throw std::runtime_error("HcommEndpointCreate ret=" + std::to_string(ret));
+        throw std::runtime_error("HcommEndpointCreate ret=" + std::to_string(ret) + " eid=" +
+                                 EmsEidToString(eid));
     }
     g_inited = true;
 }
@@ -238,8 +231,8 @@ void cli_close()
 PYBIND11_MODULE(_cli, m)
 {
     m.doc() = "ems client side hcomm binding (NPU device process)";
-    m.def("init", &cli_init, py::arg("device_id"), py::arg("eid_hex"), py::arg("acl_lib") = "libascendcl.so",
-          py::arg("hcomm_lib") = "libhcomm.so");
+    m.def("init", &cli_init, py::arg("device_id"), py::arg("rootinfo") = "/etc/hccl_rootinfo.json",
+          py::arg("acl_lib") = "libascendcl.so", py::arg("hcomm_lib") = "libhcomm.so");
     m.def("local_desc", &cli_local_desc);
     m.def("mem_reg", &cli_mem_reg, py::arg("addr"), py::arg("size"), py::arg("tag") = "kv_hbm");
     m.def("mem_desc", &cli_mem_desc);

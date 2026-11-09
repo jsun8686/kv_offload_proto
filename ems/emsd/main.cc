@@ -23,8 +23,9 @@ namespace {
 void Usage(const char *bin)
 {
     printf("usage: %s --role master|worker --ip <localIp> --port <ctrlPort>\n"
-           "  [--device N] [--acl-lib <path>] [--hcomm-lib <path>] [--pool-size-gb N]\n"
+           "  [--device N] [--rootinfo <path>] [--acl-lib <path>] [--hcomm-lib <path>] [--pool-size-gb N]\n"
            "  master: --members ip1:port1:hcommPort1[,ip2:port2:hcommPort2...]\n"
+           "  EID: 自动按 rootinfo（默认 /etc/hccl_rootinfo.json）匹配 device_id==phyId 的 EID\n"
            "env: KV_EMSD_HCOMM_LIB 覆盖 libhcomm 路径\n",
            bin);
 }
@@ -64,6 +65,8 @@ int main(int argc, char **argv)
             poolGb = atoi(next().c_str());
         } else if (k == "--device") {
             deviceId = atoi(next().c_str());
+        } else if (k == "--rootinfo") {
+            cfg.rootinfoPath = next();
         } else if (k == "--acl-lib") {
             cfg.aclLib = next();
         } else if (k == "--hcomm-lib") {
@@ -131,9 +134,11 @@ int main(int argc, char **argv)
         cfg.members.push_back(self);  // worker 自身段表仅一条
     }
 
-    printf("[emsd] starting, role=%s ip=%s port=%u device=%d poolSizeBytes=%llu aclLib=%s hcommLib=%s\n",
+    printf("[emsd] starting, role=%s ip=%s port=%u device=%d rootinfo=%s poolSizeBytes=%llu aclLib=%s "
+           "hcommLib=%s\n",
            cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort, cfg.deviceId,
-           (unsigned long long)cfg.poolSizeBytes, cfg.aclLib.c_str(), cfg.hcommLib.c_str());
+           cfg.rootinfoPath.c_str(), (unsigned long long)cfg.poolSizeBytes, cfg.aclLib.c_str(),
+           cfg.hcommLib.c_str());
     EmsdCtrlServer server(cfg);
     return server.Run();
 }

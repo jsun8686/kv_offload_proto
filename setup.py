@@ -20,7 +20,8 @@ setup(
     ext_modules=[
         Pybind11Extension(
             "ems_client._cli",
-            sources=[os.path.join("ems", "ems_client", "hcomm_cli_ext.cpp")],
+            sources=[os.path.join("ems", "ems_client", "hcomm_cli_ext.cpp"),
+                     os.path.join("common", "ems_eid.cc")],
             # include 形如 "common/hcomm/hcomm_res.h"（带前缀）→ 以仓库根为 include 根
             include_dirs=[ROOT],
             cxx_std=17,
