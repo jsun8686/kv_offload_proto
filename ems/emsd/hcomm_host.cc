@@ -15,6 +15,10 @@
 #include <type_traits>
 #include <vector>
 
+// LINK_EXCHANGE 帧内 desc 缓冲与 EndpointDesc ABI 的锚定：hcomm 头文件升级导致
+// sizeof(EndpointDesc) 变化时此处编译失败，避免再次线上才发现 KV_EP_DESC_BUF 不够用
+static_assert(sizeof(EndpointDesc) <= KV_EP_DESC_BUF, "KV_EP_DESC_BUF too small for EndpointDesc ABI");
+
 #define EMSD_DLSYM(var, name)                                                                                \
     do {                                                                                                     \
         (var) = reinterpret_cast<decltype(var)>(dlsym(dlHandle_, (name)));                                    \

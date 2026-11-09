@@ -33,8 +33,9 @@ class TestProto(unittest.TestCase):
         self.assertEqual(struct.calcsize(kp.SEG_ALLOC_REQ_FMT), 148)
         # SEG_ALLOC_RESP: 4+4+8+4+4+4096 = 4120
         self.assertEqual(struct.calcsize(kp.SEG_ALLOC_RESP_FMT), 4120)
-        # LINK frame: 4+128+4+4096 = 4232
-        self.assertEqual(kp.LINK_FRAME_SIZE, 4232)
+        # LINK frame: 4+160+4+4096 = 4264（EP_DESC_BUF 须 ≥ sizeof(EndpointDesc)=160）
+        self.assertEqual(kp.LINK_FRAME_SIZE, 4264)
+        self.assertGreaterEqual(kp.EP_DESC_BUF, 160)
 
     def test_pool_create_resp_roundtrip(self):
         seg = kp.SegmentInfo(
@@ -59,13 +60,17 @@ class TestProto(unittest.TestCase):
         self.assertEqual(pool.segments[0].mem_desc, bytes(range(64)))
 
     def test_link_frame_roundtrip(self):
-        desc = bytes(72)
+        desc = bytes(160)  # = sizeof(EndpointDesc)：恰好放满的边界用例（128B 时代会被静默截断）
         md = b"\xAB" * 100
         frame = kp.encode_link_frame(desc, md)
         dlen, d, mlen, m = struct.unpack(kp.LINK_FRAME_FMT, frame)
         self.assertEqual((dlen, mlen), (len(desc), len(md)))
         self.assertEqual(d[:dlen], desc)
         self.assertEqual(m[:mlen], md)
+
+    def test_link_frame_desc_overflow_rejected(self):
+        with self.assertRaises(ValueError):
+            kp.encode_link_frame(bytes(161), b"\x00" * 16)  # 超长显式报错，禁止静默截断
 
     def test_pool_destroy(self):
         payload = kp.encode_pool_destroy_req(7)

@@ -39,7 +39,10 @@ enum KvStatus : int32_t {
 constexpr uint32_t KV_MAX_MEM_DESC = 4096;
 constexpr uint32_t KV_CHANNEL_HANDLE_SIZE = 256;  // ChannelEntity ABI（opaque，透传 AIV 内核）
 constexpr uint32_t KV_MAX_SEG_NUM = 8;
-constexpr size_t KV_EP_DESC_BUF = 128;            // 与 KvLinkFrame.endpointDesc 一致
+// EndpointDesc 实测 sizeof=160（CommProtocol 4 + CommAddr 40 + EndpointLoc 64 + raws 52，
+// 见 hcomm_res_defs.h；hcomm_host.cc 有 static_assert 锚定），128 装不下会导致
+// LINK_EXCHANGE 被 KV_ERR_PROTO 拒绝（descLen > KV_EP_DESC_BUF）且 Python 侧 128s 静默截断
+constexpr size_t KV_EP_DESC_BUF = 160;            // 与 KvLinkFrame.endpointDesc 一致，≥ sizeof(EndpointDesc)
 
 #pragma pack(push, 1)
 struct KvMsgHeader {
@@ -119,10 +122,10 @@ struct KvSegAllocResp {
 
 // LINK_EXCHANGE 帧：作为 KV_CMD_LINK_EXCHANGE 消息的 payload 一次发送
 // （报文 = Header + KvLinkFrame，与 client 侧 send_msg 组帧严格一致，非独立二次报文）
-// EndpointDesc ABI ≤ 60B 内容 + 类型域；128B 覆盖未来扩展
+// EndpointDesc ABI：当前版本 sizeof=160（KV_EP_DESC_BUF 锚定，hcomm_host.cc static_assert）
 struct KvLinkFrame {
     uint32_t descLen;
-    uint8_t endpointDesc[128];
+    uint8_t endpointDesc[KV_EP_DESC_BUF];
     uint32_t memDescLen;
     uint8_t memDesc[KV_MAX_MEM_DESC];
 };

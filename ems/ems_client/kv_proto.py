@@ -48,8 +48,10 @@ GENERIC_RESP_FMT = "<iI"
 SEG_ALLOC_REQ_FMT = "<IIQHH64s64s"
 SEG_ALLOC_RESP_FMT = "<iiQII{}s".format(MAX_MEM_DESC)
 
-# LINK 帧: descLen u32, desc[128], memDescLen u32, memDesc[4096]
-EP_DESC_BUF = 128
+# LINK 帧: descLen u32, desc[160], memDescLen u32, memDesc[4096]
+# EP_DESC_BUF 必须 ≥ sizeof(EndpointDesc)=160（common/hcomm/hcomm_res_defs.h，与 C 侧 KV_EP_DESC_BUF 严格对齐）；
+# 128 时 struct 128s 会静默截断 desc 内容（descLen 字段却仍写真实长度），服务端 descLen 校验直接拒绝
+EP_DESC_BUF = 160
 LINK_FRAME_FMT = "<I{}sI{}s".format(EP_DESC_BUF, MAX_MEM_DESC)
 LINK_FRAME_SIZE = struct.calcsize(LINK_FRAME_FMT)
 
@@ -130,6 +132,11 @@ def decode_pool_create_resp(payload: bytes) -> tuple:
 
 
 def encode_link_frame(endpoint_desc: bytes, mem_desc: bytes) -> bytes:
+    # struct 's' 对超长 bytes 静默截断——显式拒绝，避免线上出现 descLen 与内容不一致的半帧
+    if len(endpoint_desc) > EP_DESC_BUF:
+        raise ValueError("endpoint_desc too long: {} > {}".format(len(endpoint_desc), EP_DESC_BUF))
+    if len(mem_desc) > MAX_MEM_DESC:
+        raise ValueError("mem_desc too long: {} > {}".format(len(mem_desc), MAX_MEM_DESC))
     return struct.pack(LINK_FRAME_FMT, len(endpoint_desc), endpoint_desc, len(mem_desc), mem_desc)
 
 
