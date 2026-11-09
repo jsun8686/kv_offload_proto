@@ -136,6 +136,8 @@ int EmsdCtrlServer::Run()
     }
     printf("[emsd] ctrl server listening, role=%s ip=%s port=%u members=%zu\n", cfg_.isMaster ? "master" : "worker",
            cfg_.localIp.c_str(), cfg_.listenPort, cfg_.members.size());
+    // 命令处理专用线程：所有 hcomm/HCCP 调用仅在此线程执行（其上下文为线程私有）
+    std::thread(&EmsdCtrlServer::DispatchLoop, this).detach();
     while (true) {
         int cfd = accept(lfd, nullptr, nullptr);
         if (cfd < 0) {
@@ -156,86 +158,113 @@ int EmsdCtrlServer::HandleConn(int fd)
         if (RecvMsg(fd, hdr, payload) != 0) {
             return 0;  // 对端关闭/协议错/读超时，断连即可
         }
-        int ret = 0;
-        std::lock_guard<std::mutex> lk(connMutex_);
-        // 设备上下文线程私有：Init 的 aclrtSetDevice 只绑定了主线程，每连接一个线程后
-        // 须在工作线程重绑，否则 hcomm 调用（MemReg/MemExport/ChannelCreate）报 KV_ERR_HCOMM
-        if (hcomm_.BindDeviceCtx() != 0) {
-            switch (hdr.cmd) {
-                case KV_CMD_POOL_CREATE: {
-                    KvPoolCreateRespHead head{KV_ERR_HCOMM, 0, 0, 0};
-                    ret = SendResp(fd, hdr.cmd, &head, sizeof(head));
-                    break;
-                }
-                case KV_CMD_SEG_ALLOC: {
-                    KvSegAllocResp resp{};
-                    resp.status = KV_ERR_HCOMM;
-                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
-                    break;
-                }
-                default: {
-                    KvGenericResp resp{KV_ERR_HCOMM, 0};
-                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
-                    break;
-                }
-            }
-            if (ret != 0) {
-                return ret;
-            }
-            continue;
-        }
-        switch (hdr.cmd) {
-            case KV_CMD_PING: {
-                KvGenericResp resp{KV_OK, 0};
-                ret = SendResp(fd, KV_CMD_PONG, &resp, sizeof(resp));
-                break;
-            }
-            case KV_CMD_POOL_CREATE:
-                if (!cfg_.isMaster || payload.size() != sizeof(KvPoolCreateReq)) {
-                    KvGenericResp resp{cfg_.isMaster ? KV_ERR_PROTO : KV_ERR_STATE, 0};
-                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
-                    break;
-                }
-                ret = OnPoolCreate(*reinterpret_cast<const KvPoolCreateReq *>(payload.data()), fd);
-                break;
-            case KV_CMD_POOL_DESTROY:
-                if (!cfg_.isMaster || payload.size() != sizeof(KvPoolDestroyReq)) {
-                    KvGenericResp resp{KV_ERR_PROTO, 0};
-                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
-                    break;
-                }
-                ret = OnPoolDestroy(reinterpret_cast<const KvPoolDestroyReq *>(payload.data())->poolId, fd);
-                break;
-            case KV_CMD_SEG_ALLOC:
-                if (payload.size() != sizeof(KvSegAllocReq)) {
-                    KvSegAllocResp resp{};
-                    resp.status = KV_ERR_PROTO;
-                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
-                    break;
-                }
-                ret = OnSegAlloc(*reinterpret_cast<const KvSegAllocReq *>(payload.data()), fd);
-                break;
-            case KV_CMD_SEG_FREE:
-                if (payload.size() != sizeof(KvPoolDestroyReq)) {
-                    KvGenericResp resp{KV_ERR_PROTO, 0};
-                    ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
-                    break;
-                }
-                ret = OnSegFree(reinterpret_cast<const KvPoolDestroyReq *>(payload.data())->poolId,
-                                reinterpret_cast<const KvPoolDestroyReq *>(payload.data())->reserved, fd);
-                break;
-            case KV_CMD_LINK_EXCHANGE:
-                ret = OnLinkExchange(payload, fd);
-                break;
-            default:
-                KvGenericResp resp{KV_ERR_PROTO, 0};
-                ret = SendResp(fd, hdr.cmd, &resp, sizeof(resp));
-                break;
-        }
+        // 命令处理投放到专用线程：HCCP 上下文（RaInit/RaCtxInit/设备上下文）线程私有，
+        // 在连接工作线程上直接调用 hcomm 会出现"建链日志在、握手不推进"的半失效
+        int ret = Dispatch(hdr.cmd, payload, fd);
         if (ret != 0) {
             return ret;
         }
     }
+}
+
+int EmsdCtrlServer::Dispatch(uint16_t cmd, const std::vector<uint8_t> &payload, int fd)
+{
+    std::packaged_task<int()> task([this, fd, cmd, payload] { return HandleCmd(cmd, payload, fd); });
+    std::future<int> fut = task.get_future();
+    {
+        std::lock_guard<std::mutex> lk(qMutex_);
+        taskQ_.push(std::move(task));
+    }
+    qCv_.notify_one();
+    return fut.get();
+}
+
+void EmsdCtrlServer::DispatchLoop()
+{
+    // 专用线程同样需要设备上下文（aclrtSetDevice 线程私有）
+    (void)hcomm_.BindDeviceCtx();
+    for (;;) {
+        std::packaged_task<int()> task;
+        {
+            std::unique_lock<std::mutex> lk(qMutex_);
+            qCv_.wait(lk, [&] { return !taskQ_.empty(); });
+            task = std::move(taskQ_.front());
+            taskQ_.pop();
+        }
+        task();
+    }
+}
+
+int EmsdCtrlServer::HandleCmd(uint16_t cmd, const std::vector<uint8_t> &payload, int fd)
+{
+    int ret = 0;
+    // 设备上下文线程私有：专用线程首次进入时绑定（Init 的 aclrtSetDevice 只绑了主线程）
+    if (hcomm_.BindDeviceCtx() != 0) {
+        switch (cmd) {
+            case KV_CMD_POOL_CREATE: {
+                KvPoolCreateRespHead head{KV_ERR_HCOMM, 0, 0, 0};
+                return SendResp(fd, cmd, &head, sizeof(head));
+            }
+            case KV_CMD_SEG_ALLOC: {
+                KvSegAllocResp resp{};
+                resp.status = KV_ERR_HCOMM;
+                return SendResp(fd, cmd, &resp, sizeof(resp));
+            }
+            default: {
+                KvGenericResp resp{KV_ERR_HCOMM, 0};
+                return SendResp(fd, cmd, &resp, sizeof(resp));
+            }
+        }
+    }
+    switch (cmd) {
+        case KV_CMD_PING: {
+            KvGenericResp resp{KV_OK, 0};
+            ret = SendResp(fd, KV_CMD_PONG, &resp, sizeof(resp));
+            break;
+        }
+        case KV_CMD_POOL_CREATE:
+            if (!cfg_.isMaster || payload.size() != sizeof(KvPoolCreateReq)) {
+                KvGenericResp resp{cfg_.isMaster ? KV_ERR_PROTO : KV_ERR_STATE, 0};
+                ret = SendResp(fd, cmd, &resp, sizeof(resp));
+                break;
+            }
+            ret = OnPoolCreate(*reinterpret_cast<const KvPoolCreateReq *>(payload.data()), fd);
+            break;
+        case KV_CMD_POOL_DESTROY:
+            if (!cfg_.isMaster || payload.size() != sizeof(KvPoolDestroyReq)) {
+                KvGenericResp resp{KV_ERR_PROTO, 0};
+                ret = SendResp(fd, cmd, &resp, sizeof(resp));
+                break;
+            }
+            ret = OnPoolDestroy(reinterpret_cast<const KvPoolDestroyReq *>(payload.data())->poolId, fd);
+            break;
+        case KV_CMD_SEG_ALLOC:
+            if (payload.size() != sizeof(KvSegAllocReq)) {
+                KvSegAllocResp resp{};
+                resp.status = KV_ERR_PROTO;
+                ret = SendResp(fd, cmd, &resp, sizeof(resp));
+                break;
+            }
+            ret = OnSegAlloc(*reinterpret_cast<const KvSegAllocReq *>(payload.data()), fd);
+            break;
+        case KV_CMD_SEG_FREE:
+            if (payload.size() != sizeof(KvPoolDestroyReq)) {
+                KvGenericResp resp{KV_ERR_PROTO, 0};
+                ret = SendResp(fd, cmd, &resp, sizeof(resp));
+                break;
+            }
+            ret = OnSegFree(reinterpret_cast<const KvPoolDestroyReq *>(payload.data())->poolId,
+                            reinterpret_cast<const KvPoolDestroyReq *>(payload.data())->reserved, fd);
+            break;
+        case KV_CMD_LINK_EXCHANGE:
+            ret = OnLinkExchange(payload, fd);
+            break;
+        default:
+            KvGenericResp resp{KV_ERR_PROTO, 0};
+            ret = SendResp(fd, cmd, &resp, sizeof(resp));
+            break;
+    }
+    return ret;
 }
 
 int EmsdCtrlServer::OnPoolCreate(const KvPoolCreateReq &req, int fd)

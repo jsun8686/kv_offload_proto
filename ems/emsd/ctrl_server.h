@@ -3,7 +3,10 @@
  * KV offload prototype is licensed under Mulan PSL v2.
  * emsd 控制服务：阻塞式 TCP，每连接一个线程（accept 循环不再被长连接阻塞——框架侧
  * pool_create 的连接会一直保持到 session 结束，期间 LINK_EXCHANGE 等新连接必须可被服务）；
- * 命令处理经 connMutex_ 全局串行（pool_/hcomm_/nextPoolId_ 共享状态无锁风险）。
+ * 但所有命令处理收拢到单一专用线程（DispatchLoop）执行——libhcomm/HCCP 的上下文
+ * （RaInit/RaCtxInit/设备上下文）是线程私有的，工作线程上直接调用会出现"socket 建链
+ * 发出了但异步握手无法推进"的半失效（联调实证：ListenStart/ConnectAsync 日志在从未
+ * RaInit 的连接线程上打出，channel 60s 不 READY）。
  * master 处理 POOL_CREATE/DESTROY/PING 并向 worker 下发 SEG_ALLOC；worker 处理
  * SEG_ALLOC/SEG_FREE/PING；两种角色都处理 LINK_EXCHANGE（框架侧与本节点建立 AIV server 通道）。
  */
@@ -11,8 +14,12 @@
 #ifndef EMSD_CTRL_SERVER_H
 #define EMSD_CTRL_SERVER_H
 
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <vector>
 
@@ -49,6 +56,9 @@ public:
 
 private:
     int HandleConn(int fd);
+    int HandleCmd(uint16_t cmd, const std::vector<uint8_t> &payload, int fd);
+    int Dispatch(uint16_t cmd, const std::vector<uint8_t> &payload, int fd);  // 投放到专用线程并等待
+    void DispatchLoop();                                                      // 专用线程：所有 hcomm 调用在此执行
     int OnPoolCreate(const KvPoolCreateReq &req, int fd);
     int OnPoolDestroy(uint32_t poolId, int fd);
     int OnSegAlloc(const KvSegAllocReq &req, int fd);
@@ -61,7 +71,10 @@ private:
     EmsdConfig cfg_;
     EmsdHcomm hcomm_;
     EmsdPoolMgr pool_;
-    std::mutex connMutex_;  // 命令处理全局串行（多连接并发下保护共享状态）
+    // 命令处理专用线程队列（单消费者天然串行；hcomm/HCCP 仅在该线程上被调用）
+    std::mutex qMutex_;
+    std::condition_variable qCv_;
+    std::queue<std::packaged_task<int()>> taskQ_;
     uint32_t nextPoolId_ = 1;
     bool hcommInited_ = false;
 };
