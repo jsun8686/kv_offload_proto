@@ -120,7 +120,10 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(uint64_t channel, uint64_t
         queued++;
     }
 
-    ret = hcomm.Commit(args->channel);
+    // Commit 挪到与 WQE 相同的 MTE3 管道：默认 commitPipe=PIPE_S 与 reqPipe=PIPE_MTE3 分管道，
+    // 多 block 并发时 Commit 可能先于部分 WQE 到达 channel，迟至 WQE 无人通知而静默滞留
+    // （Drain 只等已提交任务，空等即过——联调实证 blockDim=8 时 18 WQE 丢 14）。
+    ret = hcomm.template Commit<PIPE_MTE3>(args->channel);
     if (ret != 0) {
         KvcStatusFinish(w, 0x300 + static_cast<uint64_t>(ret));
         KvcKernelEpilogue();

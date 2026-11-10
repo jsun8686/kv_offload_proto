@@ -81,7 +81,8 @@ extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(uint64_t channel
     }
     KvcStatusSet(w, 0, KVC_STAGE_QUEUE_OK);
 
-    ret = hcomm.Commit(args->channel);
+    // Commit 与 WQE 同管道（PIPE_MTE3）保序——机理见 kvc_gather_rows.cpp 同位置注释
+    ret = hcomm.template Commit<PIPE_MTE3>(args->channel);
     if (ret != 0) {
         KvcStatusFinish(w, 0x300 + static_cast<uint64_t>(ret));
         KvcKernelEpilogue();
