@@ -24,7 +24,7 @@ struct KvcGatherArgs {
     uint64_t isMiss;           // int8  [maxNumReqs, topK]（sieve 输出，device）
     uint64_t numReal;          // int32 标量张量（图 padding 早退）
     uint64_t hotRowBase;       // HBM 热缓冲区起始物理行号（本层）
-    uint64_t status;           // GM 状态槽（blockDim 分片：status + blockIdx*8，≤8 block）
+    uint64_t status;           // GM 状态槽（blockDim 分片：status + blockIdx*64，每槽独占 64B 整页）
     uint32_t layerOffsetRows;  // layerId * perLayerSegRows
     uint32_t perLayerSegRows;
     uint32_t rowBytes;

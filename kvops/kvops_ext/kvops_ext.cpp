@@ -224,6 +224,17 @@ int64_t kv_poll_status(uint64_t statusAddr, int64_t timeoutUs)
     }
 }
 
+// 读回状态槽当前值（超时诊断用：阶段码 0xE2/0xE3/0xE4 定位内核卡在哪一步）
+uint64_t kv_peek_status(uint64_t statusAddr)
+{
+    EnsureInited();
+    uint64_t v = 0;
+    if (rt.aclrtMemcpy(&v, 8, reinterpret_cast<const void *>(statusAddr), 8, 3 /*D2O*/) != 0) {
+        return 0xFFFFFFFFFFFFFFFFULL;
+    }
+    return v;
+}
+
 // ── 批量导入（稠密）：N 段循环由 Python 侧逐段调用 ──
 void kv_import_seg(uint64_t channel, uint64_t segBase, uint32_t layerOffsetRows, uint32_t perLayerSegRows,
                    uint32_t rowBytes, uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t reqHostBase,
@@ -256,7 +267,7 @@ void kv_import_seg(uint64_t channel, uint64_t segBase, uint32_t layerOffsetRows,
     args.maxNumReqs = maxNumReqs;
     const uint32_t totalPos = maxNumReqs * topK;
     args.positionsPerCore = (totalPos + blockDim - 1) / blockDim;  // 对齐由 Python 侧校验（64 元素）
-    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 8, 0, blockDim * 8);
+    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 64, 0, blockDim * 64);  // 每 block 独占 64B 槽
     LaunchCommon(g_fnGather, &args, sizeof(args), blockDim, stream);
 }
 
@@ -280,7 +291,7 @@ void kv_export_seg_alllayer(uint64_t channel, uint64_t segBase, uint32_t perLaye
     args.stripeRows = stripeRows;
     args.nodeNum = nodeNum;
     args.myNode = myNode;
-    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), 8, 0, 8);
+    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 64, 0, blockDim * 64);  // 每 block 独占 64B 槽
     LaunchCommon(g_fnScatterAll, &args, sizeof(args), blockDim, stream);
 }
 
@@ -383,6 +394,7 @@ PYBIND11_MODULE(_kvops, m)
     m.def("init", &kv_init, py::arg("device_id"), py::arg("fatbin_path"), py::arg("rt_lib") = "libascendcl.so");
     m.def("alloc_status", &kv_alloc_status, py::arg("count"));
     m.def("poll_status", &kv_poll_status, py::arg("status_addr"), py::arg("timeout_us") = -1);
+    m.def("peek_status", &kv_peek_status, py::arg("status_addr"));
     m.def("import_seg", &kv_import_seg, py::arg("channel"), py::arg("seg_base"), py::arg("layer_offset_rows"),
           py::arg("per_layer_seg_rows"), py::arg("row_bytes"), py::arg("topk_indices"), py::arg("req_pool_indices"),
           py::arg("req_host_base"), py::arg("topk_device_slots"), py::arg("is_miss"), py::arg("num_real"),

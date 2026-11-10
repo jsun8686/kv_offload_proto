@@ -179,9 +179,12 @@ class EmsPool:
         self._status_count = 8 * self.node_num
         self._status_base = _kvops.alloc_status(self._status_count)
 
-    def next_status(self) -> int:
+    def next_status(self, slots: int = 1) -> int:
+        # 每 block 独占 64B 槽（与内核 KvcStatusInit 的 blockIdx*64 步进一致）。
+        # blockDim>1 时调用方必须一次性预留 blockDim 个槽，不能跨 op 复用，
+        # 否则本 op 的 64B 整页刷写会覆盖上一 op 仍待轮询的槽。
         addr = self._status_base + self._status_cursor * 64
-        self._status_cursor = (self._status_cursor + 1) % self._status_count
+        self._status_cursor = (self._status_cursor + slots) % self._status_count
         return addr
 
     def destroy(self) -> None:
@@ -206,7 +209,7 @@ class EmsPool:
                    block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
-        status = self.next_status()
+        status = self.next_status(block_dim)
         layer_offset = layer_id * self.per_layer_seg_rows
         for s in range(self.node_num):
             seg = self.pool.segments[s]
@@ -221,7 +224,7 @@ class EmsPool:
                               block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
-        status = self.next_status()
+        status = self.next_status(block_dim)
         for s in range(self.node_num):
             seg = self.pool.segments[s]
             _kvops.export_seg_alllayer(self.channels[s], seg.seg_base, self.per_layer_seg_rows, self.row_bytes,
@@ -235,15 +238,22 @@ class EmsPool:
             raise RuntimeError("kvops ext missing")
         for s in range(self.node_num):
             for b in range(block_dim):
-                rc = _kvops.poll_status(status + s * 64 + b * 8, timeout_us)
+                slot = status + (s * block_dim + b) * 64
+                rc = _kvops.poll_status(slot, timeout_us)
                 if rc != 0:
                     # 负哨兵为 poll 自身失败（与内核 errCode 分开报，避免误读为内核错误）
                     if rc == -0x1000:
                         raise RuntimeError(
                             "kv op poll memcpy failed on node {} block {}".format(s, b))
                     if rc == -0x2000:
+                        # 超时兜底诊断：读回整个 64B 槽定位内核卡在哪一步。
+                        # word0 = 阶段码（0=未初始化 / 0xE2=INIT_OK / 0xE3=QUEUE_OK /
+                        # 0xE4=COMMIT_OK）或终态字；(word0>>32)==1 即其实已完成、
+                        # 是轮询侧没看到；word1 = gather 的搬运行数诊断。
+                        words = [_kvops.peek_status(slot + i * 8) for i in range(4)]
                         raise RuntimeError(
-                            "kv op poll timeout on node {} block {} (kernel doneSeq not set in {:.0f}s)".format(
-                                s, b, timeout_us / 1e6))
+                            "kv op poll timeout on node {} block {} (kernel doneSeq not set in {:.0f}s, "
+                            "slot=[0x{:016x} 0x{:016x} 0x{:016x} 0x{:016x}])".format(
+                                s, b, timeout_us / 1e6, words[0], words[1], words[2], words[3]))
                     raise RuntimeError("kv op failed on node {} block {}: errCode=0x{:x}".format(
                         s, b, rc & 0xFFFFFFFF))

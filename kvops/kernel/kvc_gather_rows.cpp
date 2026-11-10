@@ -50,7 +50,10 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(uint64_t channel, uint64_t
         numReal = args->maxNumReqs;  // 防御
     }
     KvcStatusWriter w;
-    KvcStatusInit(w, args->status + static_cast<uint64_t>(blockIdx) * 8);
+    // 每 block 独占 64B 槽：KvcStatusFlush 按整页 64B 刷出（DataCopy 最小 32B），
+    // 若按 8B 步进分片，任一 block 的阶段刷写会覆盖其他 block 的 doneSeq——
+    // 实测症状：blockDim=8 时随机某个 block "doneSeq not set" 超时且无设备报错
+    KvcStatusInit(w, args->status + static_cast<uint64_t>(blockIdx) * 64);
 
     const int32_t totalPos = numReal * static_cast<int32_t>(args->topK);
     const int32_t startPos = blockIdx * static_cast<int32_t>(args->positionsPerCore);

@@ -42,7 +42,8 @@ extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(uint64_t channel
         return;
     }
     KvcStatusWriter w;
-    KvcStatusInit(w, args->status);
+    // 与 gather 同契约：每 block 独占 64B 状态槽（整页 64B 刷出不跨槽），当前 blockDim=1
+    KvcStatusInit(w, args->status + static_cast<uint64_t>(GetBlockIdx()) * 64);
 
     TBuf<TPosition::VECOUT> wsBuf;
     w.pipe.InitBuffer(wsBuf, KVC_HCOMM_WS_SIZE);

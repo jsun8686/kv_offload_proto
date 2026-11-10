@@ -15,7 +15,8 @@ using namespace AscendC;
 
 constexpr uint32_t KVC_HCOMM_WS_SIZE = 512;  // HCOMM_URMA_TMP_BUF_SIZE
 
-// status 槽协议（GM，ub(0) 单槽 8B = statusAddr + blockIdx*8）：
+// status 槽协议（GM，ub(0) 单槽 8B = statusAddr + blockIdx*64，每 block 独占 64B——
+// flush 按整页 64B 刷出，8B 步进分片会互相覆盖 doneSeq）：
 //   非终态：低 32 位=阶段码（E2/E3/E4），高 32 位=0（host poll 继续等待）；
 //   终态：  (doneSeq=1 << 32) | errCode —— host 判 (val>>32)==1 后取低 32 位。
 //   ub(1) 起为诊断区（如 queued 计数），poll 不读；整页 64B 经 UB+DataCopy(MTE3) 写回。
