@@ -242,8 +242,10 @@ def main() -> int:
             for r in range(args.req_num):
                 exp_slots, exp_miss = oracle.update(r, batch[r], args.prefill)
                 if not np.array_equal(gpu_miss[r], np.array(exp_miss, dtype=np.int8)):
-                    log("[xds][ERROR] oracle is_miss mismatch step={} req={}\n gpu={}\n exp={}".format(
-                        step, r, gpu_miss[r].tolist(), exp_miss))
+                    # 同时打印 slots 便于定位：全 -1=padding 早退（numReal 读到 0）；
+                    # ≥padded=扩展槽（prefill 读到 0）；0..padded-1 混杂=哈希表状态问题
+                    log("[xds][ERROR] oracle is_miss mismatch step={} req={}\n gpu={}\n exp={}\n gpu_slots={}".format(
+                        step, r, gpu_miss[r].tolist(), exp_miss, gpu_slots[r].tolist()))
                     return 1
                 norm = lambda s: -1 if s < 0 else (  # noqa: E731
                     (coord.padded_buffer_size + (-s - 2)) if s <= -2 else s)

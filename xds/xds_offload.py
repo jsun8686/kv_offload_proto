@@ -17,6 +17,15 @@ except ImportError:
     _kvops = None
 
 
+def _npu_stream() -> int:
+    """torch 当前流句柄（与 xds_ems_pool._npu_stream 同契约）：
+    kvops 内核 launch 到 torch 流上，与 torch 写入/回读同流有序。"""
+    try:
+        return int(torch.npu.current_stream().npu_stream)
+    except (AttributeError, RuntimeError):  # 离线单测：无 torch_npu
+        return 0
+
+
 class XdsOffloadCoordinator:
     def __init__(self, device: str, layer_num: int, pool_size: int, device_buffer_size: int, top_k: int,
                  max_num_reqs: int, max_context_len: int):
@@ -70,10 +79,11 @@ class XdsOffloadCoordinator:
         self.sieve_hand[:, req_pool_idx, :].zero_()
         self.prefill_lens[req_pool_idx] = prefill_len
         self.req_host_base[req_batch_idx] = host_base_row
-        # 全层哈希表构建（blockDim = layerNum × 1）
+        # 全层哈希表构建（blockDim = layerNum × 1）；launch 到 torch 当前流，
+        # 与上方播种/prefill_lens 的 torch 写入同流有序
         _kvops.sieve_ht_init(self.device_buffer_tokens.data_ptr(), self.device_buffer_ht.data_ptr(),
                              self.prefill_lens.data_ptr(), req_pool_idx, 1, self.layer_num, self.pool_size,
-                             self.device_buffer_size, self.padded_buffer_size, self.ht_size, 0,
+                             self.device_buffer_size, self.padded_buffer_size, self.ht_size, _npu_stream(),
                              self.layer_num)
 
     def set_batch(self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor) -> None:
@@ -98,7 +108,7 @@ class XdsOffloadCoordinator:
                             self.sieve_hand[layer_id].data_ptr(), self.top_k_device_slots.data_ptr(),
                             self.is_miss.data_ptr(), self.num_real.data_ptr(), self.top_k,
                             self.device_buffer_size, self.padded_buffer_size, self.visited_stride_b,
-                            self.max_num_reqs, self.pool_size, 0, block_dim)
+                            self.max_num_reqs, self.pool_size, _npu_stream(), block_dim)
 
     def miss_count(self) -> torch.Tensor:
         """device 侧 miss 统计张量（padding 行 is_miss==0，无需 num_real 切片；

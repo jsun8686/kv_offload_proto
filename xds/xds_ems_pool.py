@@ -20,6 +20,34 @@ try:
     import ems_client._cli as _cli
 except ImportError:
     _cli = None
+try:
+    import torch
+except ImportError:  # 本地离线单测（无 NPU 环境）
+    torch = None
+
+
+def _npu_stream() -> int:
+    """torch 当前流句柄。kvops 内核必须 launch 在 torch 当前流上，与 torch
+    eager 写入（hbm/批上下文/topk）同流有序；传 0（acl 默认流）会读到过期值
+    （实测：sieve 全走扩展槽/padding 分支，is_miss 全 0）。对齐参考实现
+    hisparse_lru_host.cpp：get_npu_stream = c10_npu::getCurrentNPUStream().stream()。"""
+    if torch is None:
+        return 0
+    try:
+        return int(torch.npu.current_stream().npu_stream)
+    except (AttributeError, RuntimeError):  # 无 torch_npu（离线单测）
+        return 0
+
+
+def _sync_stream() -> None:
+    """等 torch 当前流排空。状态槽的 memset/轮询走 acl 同步 API，与 torch 流
+    无隐式顺序；轮询/回读内核写的结果前必须先等流排空。"""
+    if torch is None:
+        return
+    try:
+        torch.npu.current_stream().synchronize()
+    except (AttributeError, RuntimeError):
+        torch.npu.synchronize()
 
 
 def _ptr(x) -> int:
@@ -221,6 +249,8 @@ class EmsPool:
             raise RuntimeError("pool not created")
         # N 段各占 block_dim 个槽（与 wait 的 (s*block_dim+b)*64 轮询公式一致）；
         # 各段内核按 blockIdx*64 相对各自基址写状态，段间不踩槽
+        if stream == 0:
+            stream = _npu_stream()  # launch 到 torch 当前流，与 torch 写入同流有序
         status = self.next_status(self.node_num * block_dim)
         layer_offset = layer_id * self.per_layer_seg_rows
         for s in range(self.node_num):
@@ -237,6 +267,8 @@ class EmsPool:
                               block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
+        if stream == 0:
+            stream = _npu_stream()  # 同 batch_read：scatter 读 hbm（torch 张量）
         status = self.next_status(self.node_num * block_dim)
         for s in range(self.node_num):
             seg = self.pool.segments[s]
@@ -250,6 +282,8 @@ class EmsPool:
     def wait(self, status: int, timeout_us: int = 60_000_000, block_dim: int = 1) -> None:
         if _kvops is None:
             raise RuntimeError("kvops ext missing")
+        # 内核跑在 torch 当前流上；轮询走 acl 同步 API 与该流无顺序，先等流排空
+        _sync_stream()
         for s in range(self.node_num):
             for b in range(block_dim):
                 slot = status + (s * block_dim + b) * 64
