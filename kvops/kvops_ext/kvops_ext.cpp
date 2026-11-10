@@ -325,12 +325,17 @@ void kv_sieve_update(uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t seq
     if (visitedStrideB % 64 != 0 || visitedStrideB < (paddedBufferSize + 7) / 8) {
         throw std::runtime_error("sieve_update: visited bitmap stride must be 64B aligned and cover padded");
     }
+    if (topK % 8 != 0) {
+        // 输出行（slots/is_miss 各 topK 个 int32）经 MTE DataCopy 回写，字节粒度须为 32B 倍数
+        throw std::runtime_error("sieve_update: topK must be a multiple of 8 (32B MTE write-back rows)");
+    }
     int64_t htSize = 1024;
     while (htSize < 2 * (static_cast<int64_t>(paddedBufferSize) + topK)) {
         htSize <<= 1;
     }
-    // UB 预算：tokens 行 + visited 位图行 + 哈希表
-    int64_t ubBytes = paddedBufferSize * 4 + visitedStrideB + htSize * 2;
+    // UB 预算：tokens 行 + visited 位图行 + 哈希表 + 输出 staging（slots/is_miss 各 topK×4B）
+    // + hand 行（16×int32）——sieve 输出在 950 上必须走 MTE 回写（标量 store 对 host 不可见）
+    int64_t ubBytes = paddedBufferSize * 4 + visitedStrideB + htSize * 2 + topK * 4 * 2 + 16 * 4;
     if (ubBytes > UB_BUDGET_BYTES) {
         throw std::runtime_error("sieve_update: UB usage " + std::to_string(ubBytes) +
                                  " bytes exceeds the 176KB budget");

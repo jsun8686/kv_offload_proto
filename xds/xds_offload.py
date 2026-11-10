@@ -49,7 +49,8 @@ class XdsOffloadCoordinator:
         self.req_host_base = torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
         # decode 步输入/输出（静态缓冲，图捕获形态）
         self.top_k_device_slots = torch.zeros((max_num_reqs, top_k), dtype=torch.int32, device=device)
-        self.is_miss = torch.zeros((max_num_reqs, top_k), dtype=torch.int8, device=device)
+        # int32（原 int8）：sieve 内核输出走 MTE DataCopy 回写（32B 粒度），950 上标量 store 不可见
+        self.is_miss = torch.zeros((max_num_reqs, top_k), dtype=torch.int32, device=device)
         self.num_real = torch.zeros(1, dtype=torch.int32, device=device)
 
     # ── admission：请求进入 decode（prefill KV 已全层导出到远端） ────────────

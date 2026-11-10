@@ -241,7 +241,7 @@ def main() -> int:
             gpu_miss = coord.is_miss[: args.req_num].cpu().numpy()
             for r in range(args.req_num):
                 exp_slots, exp_miss = oracle.update(r, batch[r], args.prefill)
-                if not np.array_equal(gpu_miss[r], np.array(exp_miss, dtype=np.int8)):
+                if not np.array_equal(gpu_miss[r], np.array(exp_miss, dtype=np.int32)):
                     log("[xds][ERROR] oracle is_miss mismatch step={} req={}\n gpu={}\n exp={}\n slots={}\n"
                         " numReal={} prefill={} tokens[0]={} ht[0][:8]={}".format(
                             step, r, gpu_miss[r].tolist(), exp_miss, gpu_slots[r].tolist(),

@@ -81,7 +81,7 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(uint64_t channel, uint64_t
     __gm__ int64_t *reqPoolPtr = reinterpret_cast<__gm__ int64_t *>(args->reqPoolIndices);
     __gm__ int64_t *hostBasePtr = reinterpret_cast<__gm__ int64_t *>(args->reqHostBase);
     __gm__ int32_t *slotsPtr = reinterpret_cast<__gm__ int32_t *>(args->topKDeviceSlots);
-    __gm__ int8_t *isMissPtr = reinterpret_cast<__gm__ int8_t *>(args->isMiss);
+    __gm__ int32_t *isMissPtr = reinterpret_cast<__gm__ int32_t *>(args->isMiss);  // int32（sieve 输出 MTE 回写约定）
 
     uint64_t queued = 0;
     for (int32_t pos = startPos; pos < posEnd; ++pos) {

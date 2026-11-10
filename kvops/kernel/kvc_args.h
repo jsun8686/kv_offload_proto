@@ -66,7 +66,7 @@ struct HispSieveUpdateArgs {
     uint64_t deviceBufferHt;      // uint16 [poolSize, htSize]（开放寻址）
     uint64_t sieveHand;           // int32 [poolSize, 16]（只用 [0]，64B 行距）
     uint64_t topKDeviceSlots;     // int32 [maxNumReqs, topK]（输出）
-    uint64_t isMiss;              // int8 [maxNumReqs, topK]（输出）
+    uint64_t isMiss;              // int32 [maxNumReqs, topK]（输出；MTE 回写 32B 粒度，topK%8==0）
     uint64_t numReal;             // int32 标量张量
     uint64_t status;              // 保留（fire-and-forget，靠 stream 序；0=不写）
     uint32_t topK;
