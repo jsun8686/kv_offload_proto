@@ -74,7 +74,7 @@ class XdsOffloadCoordinator:
         _kvops.sieve_ht_init(self.device_buffer_tokens.data_ptr(), self.device_buffer_ht.data_ptr(),
                              self.prefill_lens.data_ptr(), req_pool_idx, 1, self.layer_num, self.pool_size,
                              self.device_buffer_size, self.padded_buffer_size, self.ht_size,
-                             torch.npu.current_stream().cuda_stream, self.layer_num)
+                             torch.npu.current_stream().npu_stream, self.layer_num)
 
     def set_batch(self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor) -> None:
         """每 decode 步前设置批上下文（eager；图模式由调用方 fill_ num_real）。"""
@@ -92,7 +92,7 @@ class XdsOffloadCoordinator:
             raise ValueError("topk_indices must be int32")
         # stream 必须传 torch_npu 当前流（对齐 sglang hisparse_lru_host.cpp get_npu_stream）：
         # stream 0 与 torch fill_/copy_（num_real/prefill_lens 等）无序，内核会读到初始零值
-        npu_stream = torch.npu.current_stream().cuda_stream
+        npu_stream = torch.npu.current_stream().npu_stream
         _kvops.sieve_update(topk_indices.data_ptr(), self._req_pool_indices.data_ptr(),
                             self._seq_lens.data_ptr(), self.prefill_lens.data_ptr(),
                             self.device_buffer_tokens[layer_id].data_ptr(),
