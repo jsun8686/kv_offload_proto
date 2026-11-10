@@ -15,9 +15,31 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 
 #include "ctrl_server.h"
+
+namespace {
+// libhcomm 内部线程抛出的异常（如 NetworkApiException）无人接住会 std::terminate→abort。
+// 兜底 handler：记日志后干净退出（退出码 70），便于外层 while/systemd 守护重启。
+void EmsdTerminateHandler()
+{
+    std::exception_ptr ep = std::current_exception();
+    printf("[emsd][ERROR] uncaught exception, terminating:");
+    try {
+        if (ep) {
+            std::rethrow_exception(ep);
+        }
+    } catch (const std::exception &e) {
+        printf(" %s\n", e.what());
+    } catch (...) {
+        printf(" unknown\n");
+    }
+    fflush(stdout);
+    _exit(70);
+}
+}  // namespace
 
 namespace {
 void Usage(const char *bin)
@@ -47,6 +69,7 @@ bool ParseHostPort(const std::string &s, std::string &ip, uint16_t &port)
 
 int main(int argc, char **argv)
 {
+    std::set_terminate(EmsdTerminateHandler);
     EmsdConfig cfg;
     std::string role = "worker";
     std::string members;

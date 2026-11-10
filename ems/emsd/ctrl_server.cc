@@ -184,7 +184,7 @@ int EmsdCtrlServer::Dispatch(uint16_t cmd, const std::vector<uint8_t> &payload, 
 
 void EmsdCtrlServer::DispatchLoop()
 {
-    // 专用线程同样需要设备上下文（aclrtSetDevice 线程私有）
+    // 专用线程（同步需要设备上下文的操作，aclrtSetDevice 线程私有）
     (void)hcomm_.BindDeviceCtx();
     for (;;) {
         std::packaged_task<int()> task;
@@ -194,6 +194,20 @@ void EmsdCtrlServer::DispatchLoop()
             task = std::move(taskQ_.front());
             taskQ_.pop();
         }
+        // libhcomm 同步路径可能抛 Hccl::NetworkApiException 等——守护进程不能被单次
+        // 数据面异常打崩（联调实证：对端非优雅退出时 MemImport/通道查询会抛）；接住记
+        // 日志，命令级失败由 task 内部返回码上报客户端。
+        try {
+            task();
+        } catch (const std::exception &e) {
+            printf("[emsd][ERROR] dispatch task exception: %s\n", e.what());
+            fflush(stdout);
+        } catch (...) {
+            printf("[emsd][ERROR] dispatch task unknown exception\n");
+            fflush(stdout);
+        }
+    }
+}
         task();
     }
 }

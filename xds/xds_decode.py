@@ -263,6 +263,25 @@ def main() -> int:
 
         # 抽查校验：首个真实 miss 行指纹（miss 位置取自 sieve 输出，非采样预期）
         hbm_sync = hbm[layer_id].cpu().numpy().view(np.uint32).reshape(-1)
+        # 全 slot 反查诊断：热缓冲每槽行首 word 反查来源 (row,layer)，与期望 token 对照，
+        # 一次暴露错位模式（整体偏移 / 个别覆盖 / 层错位）
+        w0_to_row = {}
+        for l_ in range(args.layers):
+            for r_ in range(args.layer_rows):
+                w0_to_row[row_word(r_, l_, 0)] = (r_, l_)
+        expect_map = {}
+        for r_ in range(args.req_num):
+            for k in np.nonzero(coord.is_miss[r_].cpu().numpy())[0]:
+                slot_ = int(coord.top_k_device_slots[r_, k].item())
+                if 0 <= slot_ < dbs:
+                    expect_map[slot_] = host_bases[r_] + int(batch[r_][k])
+        slot_line = []
+        for s_ in range(dbs):
+            w0 = int(hbm_sync[(hot_rows_base + s_) * (row_bytes // 4)])
+            src = w0_to_row.get(w0)
+            slot_line.append("s{}:exp={},got={}".format(
+                s_, expect_map.get(s_, "-"), (str(src[0]) + "@L" + str(src[1])) if src else hex(w0)))
+        log("[xds] hot slot map: " + "; ".join(slot_line))
         checked = 0
         for r in range(args.req_num):
             miss_pos = np.nonzero(coord.is_miss[r].cpu().numpy())[0]
