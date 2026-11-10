@@ -176,15 +176,25 @@ class EmsPool:
             self.channels.append(handle)
 
         _kvops.init(self.device_id, fatbin_path)
-        self._status_count = 8 * self.node_num
+        # 每 block 独占 64B 槽，一次批量 op 占 node_num*block_dim 个槽。
+        # 8*node_num 是旧契约（一 op 一槽）的尺寸，blockDim=8 时第二步就越界——
+        # 实测：alloc 512B，gather 从 cursor=1 占 [base+64, base+576)，
+        # 尾槽 0x...8200 落在分配外，drv 报 Invalid addr（memset 与 poll 同址失败）。
+        # 池给到 64 槽/node（4KB）余量；op 间是 wait-同步的，回绕复用安全。
+        self._status_count = 64 * self.node_num
         self._status_base = _kvops.alloc_status(self._status_count)
+        self._status_cursor = 0
 
     def next_status(self, slots: int = 1) -> int:
         # 每 block 独占 64B 槽（与内核 KvcStatusInit 的 blockIdx*64 步进一致）。
-        # blockDim>1 时调用方必须一次性预留 blockDim 个槽，不能跨 op 复用，
+        # 调用方必须一次性预留本 op 所需的全部槽（含 N 段分片），不能跨 op 复用，
         # 否则本 op 的 64B 整页刷写会覆盖上一 op 仍待轮询的槽。
+        if slots > self._status_count:
+            raise RuntimeError("status slots {} exceeds pool {}".format(slots, self._status_count))
+        if self._status_cursor + slots > self._status_count:
+            self._status_cursor = 0  # 回绕（op 间已 wait 同步，复用安全）
         addr = self._status_base + self._status_cursor * 64
-        self._status_cursor = (self._status_cursor + slots) % self._status_count
+        self._status_cursor += slots
         return addr
 
     def destroy(self) -> None:
@@ -209,14 +219,17 @@ class EmsPool:
                    block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
-        status = self.next_status(block_dim)
+        # N 段各占 block_dim 个槽（与 wait 的 (s*block_dim+b)*64 轮询公式一致）；
+        # 各段内核按 blockIdx*64 相对各自基址写状态，段间不踩槽
+        status = self.next_status(self.node_num * block_dim)
         layer_offset = layer_id * self.per_layer_seg_rows
         for s in range(self.node_num):
             seg = self.pool.segments[s]
             _kvops.import_seg(self.channels[s], seg.seg_base, layer_offset, self.per_layer_seg_rows,
                               self.row_bytes, _ptr(topk_indices), _ptr(req_pool_indices), _ptr(req_host_base),
                               _ptr(topk_device_slots), _ptr(is_miss), _ptr(num_real), _ptr(hot_row_base), top_k,
-                              max_num_reqs, self.stripe_rows, self.node_num, s, status, stream, block_dim)
+                              max_num_reqs, self.stripe_rows, self.node_num, s,
+                              status + s * block_dim * 64, stream, block_dim)
         return status
 
     # ── 批量写（prefill 全层连续区间导出）───────────────────────────────────
@@ -224,12 +237,13 @@ class EmsPool:
                               block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
-        status = self.next_status(block_dim)
+        status = self.next_status(self.node_num * block_dim)
         for s in range(self.node_num):
             seg = self.pool.segments[s]
             _kvops.export_seg_alllayer(self.channels[s], seg.seg_base, self.per_layer_seg_rows, self.row_bytes,
                                        row_lo, row_cnt, self.layer_num, _ptr(src_layer0_base), src_layer_stride,
-                                       self.stripe_rows, self.node_num, s, status, stream, block_dim)
+                                       self.stripe_rows, self.node_num, s,
+                                       status + s * block_dim * 64, stream, block_dim)
         return status
 
     # ── 完成等待：聚合 N 段状态槽 ────────────────────────────────────────────
