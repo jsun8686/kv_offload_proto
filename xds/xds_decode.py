@@ -69,23 +69,24 @@ class _CpuSieveOracle:
     每请求独立状态：tokens（槽→token）/visited（槽集合）/hand/t2s（dict token→slot）。
     """
 
-    def __init__(self, reqs_meta):
-        self.meta = reqs_meta  # [(prefill, pool_idx), ...] 按批行
+    def __init__(self, reqs_meta, layer_num):
+        self.meta = reqs_meta  # [(prefill, pool_idx), ...] 请求元数据
+        self.layer_num = layer_num
+        # 状态键 (pool_idx, layer)：sieve 状态层独立（sglang 原版每层独立 device buffer，
+        # gpu 侧 device_buffer_*[layer] 切片）——单层模型跨层复用会在 step 换层时必然分叉
         self.state = {}
-        for prefill, pool_idx in reqs_meta:
-            dbs = None  # 由 reset 传入
-            self.state[pool_idx] = None
 
     def reset(self, pool_idx, prefill, dbs):
         init_n = min(prefill, dbs)
-        tokens = {s: s for s in range(init_n)}
-        self.state[pool_idx] = {
-            "prefill": prefill, "tokens": tokens, "visited": set(), "hand": 0, "dbs": dbs,
-            "t2s": {t: s for s, t in tokens.items()},
-        }
+        for layer in range(self.layer_num):
+            tokens = {s: s for s in range(init_n)}
+            self.state[(pool_idx, layer)] = {
+                "prefill": prefill, "tokens": tokens, "visited": set(), "hand": 0, "dbs": dbs,
+                "t2s": {t: s for s, t in tokens.items()},
+            }
 
-    def update(self, pool_idx, topk_row, seq_len):
-        st = self.state[pool_idx]
+    def update(self, pool_idx, layer, topk_row, seq_len):
+        st = self.state[(pool_idx, layer)]
         out_slots, out_miss = [], []
         for token_pos in topk_row:
             if token_pos < 0 or token_pos >= seq_len:
@@ -191,7 +192,7 @@ def main() -> int:
     # admission（恒等布局 + 全层建表）后清空 HBM 热区数据，验证导入回填
     oracle = None
     if args.oracle:
-        oracle = _CpuSieveOracle([(args.prefill, r) for r in range(args.req_num)])
+        oracle = _CpuSieveOracle([(args.prefill, r) for r in range(args.req_num)], args.layers)
     for r in range(args.req_num):
         coord.admit_request(r, r, args.prefill, host_bases[r])
         if oracle is not None:
@@ -244,7 +245,7 @@ def main() -> int:
             gpu_slots = coord.top_k_device_slots[: args.req_num].cpu().numpy()
             gpu_miss = coord.is_miss[: args.req_num].cpu().numpy()
             for r in range(args.req_num):
-                exp_slots, exp_miss = oracle.update(r, batch[r], args.prefill)
+                exp_slots, exp_miss = oracle.update(r, layer_id, batch[r], args.prefill)
                 if not np.array_equal(gpu_miss[r], np.array(exp_miss, dtype=np.int32)):
                     log("[xds][ERROR] oracle is_miss mismatch step={} req={}\n gpu={}\n exp={}\n slots={}\n"
                         " numReal={} prefill={} tokens[0]={} ht[0][:8]={}".format(
