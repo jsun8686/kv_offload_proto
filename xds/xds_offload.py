@@ -70,11 +70,11 @@ class XdsOffloadCoordinator:
         self.sieve_hand[:, req_pool_idx, :].zero_()
         self.prefill_lens[req_pool_idx] = prefill_len
         self.req_host_base[req_batch_idx] = host_base_row
-        # 全层哈希表构建（blockDim = layerNum × 1）
+        # 全层哈希表构建（blockDim = layerNum × 1；stream 对齐 torch 当前流，见 sieve_update 注释）
         _kvops.sieve_ht_init(self.device_buffer_tokens.data_ptr(), self.device_buffer_ht.data_ptr(),
                              self.prefill_lens.data_ptr(), req_pool_idx, 1, self.layer_num, self.pool_size,
-                             self.device_buffer_size, self.padded_buffer_size, self.ht_size, 0,
-                             self.layer_num)
+                             self.device_buffer_size, self.padded_buffer_size, self.ht_size,
+                             torch.npu.current_stream().cuda_stream, self.layer_num)
 
     def set_batch(self, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor) -> None:
         """每 decode 步前设置批上下文（eager；图模式由调用方 fill_ num_real）。"""
@@ -90,6 +90,9 @@ class XdsOffloadCoordinator:
     def sieve_update(self, layer_id: int, topk_indices: torch.Tensor, block_dim: int = 8) -> None:
         if topk_indices.dtype != torch.int32:
             raise ValueError("topk_indices must be int32")
+        # stream 必须传 torch_npu 当前流（对齐 sglang hisparse_lru_host.cpp get_npu_stream）：
+        # stream 0 与 torch fill_/copy_（num_real/prefill_lens 等）无序，内核会读到初始零值
+        npu_stream = torch.npu.current_stream().cuda_stream
         _kvops.sieve_update(topk_indices.data_ptr(), self._req_pool_indices.data_ptr(),
                             self._seq_lens.data_ptr(), self.prefill_lens.data_ptr(),
                             self.device_buffer_tokens[layer_id].data_ptr(),
@@ -98,7 +101,7 @@ class XdsOffloadCoordinator:
                             self.sieve_hand[layer_id].data_ptr(), self.top_k_device_slots.data_ptr(),
                             self.is_miss.data_ptr(), self.num_real.data_ptr(), self.top_k,
                             self.device_buffer_size, self.padded_buffer_size, self.visited_stride_b,
-                            self.max_num_reqs, self.pool_size, 0, block_dim)
+                            self.max_num_reqs, self.pool_size, npu_stream, block_dim)
 
     def miss_count(self) -> torch.Tensor:
         """device 侧 miss 统计张量（padding 行 is_miss==0，无需 num_real 切片；

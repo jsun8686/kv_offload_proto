@@ -8,6 +8,8 @@
 
 from typing import List, Optional
 
+import torch
+
 try:
     from ems_client import EmsClient
 except ImportError:  # 本地离线单测（未安装扩展包，NPU 机 pip -e 安装后可用）
@@ -212,6 +214,10 @@ class EmsPool:
                    block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
+        # stream=0（未指定）改用 torch_npu 当前流：与 torch 侧 fill_/copy_/to(dev) 同流有序
+        # （对齐 sglang hisparse_lru_host.cpp 的 get_npu_stream；stream 0 上内核会读到 torch 写入前的旧值）
+        if stream == 0:
+            stream = torch.npu.current_stream().cuda_stream
         status = self.next_status(block_dim)
         layer_offset = layer_id * self.per_layer_seg_rows
         for s in range(self.node_num):
@@ -227,6 +233,8 @@ class EmsPool:
                               block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
+        if stream == 0:  # 同 batch_read：对齐 torch_npu 当前流
+            stream = torch.npu.current_stream().cuda_stream
         status = self.next_status(block_dim)
         for s in range(self.node_num):
             seg = self.pool.segments[s]
