@@ -37,7 +37,7 @@ void EmsdTerminateHandler()
         printf(" unknown\n");
     }
     fflush(stdout);
-    _exit(70);
+    _Exit(70);
 }
 }  // namespace
 

@@ -208,9 +208,6 @@ void EmsdCtrlServer::DispatchLoop()
         }
     }
 }
-        task();
-    }
-}
 
 int EmsdCtrlServer::HandleCmd(uint16_t cmd, const std::vector<uint8_t> &payload, int fd)
 {

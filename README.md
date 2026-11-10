@@ -58,7 +58,7 @@ python -m xds.xds_decode ... --oracle
 | SIEVE 哈希（Knuth 散列+backward-shift 删除） | `kvops/kernel/hisp_kernel_common.h`（哈希-only；visited 位图 /8） |
 | sieve 派生公式（htSize/reqsPerCore/UB 预算） | `kvops_ext.cpp kv_sieve_update`（与 sglang-0730 host 派生严格一致） |
 | launch 参数（host/内核共用布局） | `kvops/kernel/kvc_args.h`（args + 8B overflow 尾槽） |
-| 稠密导入契约 | `kvc_gather_rows`：isMiss==1 且 (row/S)%N==myNode 才搬；src=reqHostBase[bid]+tokenPos（行分配连续性契约）；dst=hotRowBase+slot（热缓冲固定偏移契约） |
+| 稠密导入契约 | `kvc_gather_rows`：isMiss==1 且 (row/S)%N==myNode 才搬；src=reqHostBase[bid]+tokenPos（行分配连续性契约）；dst=hotRowBase+(bid\*topK+slot)（热缓冲 per-request 分区，槽位是 per-req sieve 槽） |
 | status 槽 | 每 block 独占 64B 槽（gather 按 blockDim 分片 ≤8，环形游标不足回卷）；非终态=阶段码（E2/E3/E4），终态=`(1<<32)\|errCode` 写 ub(0)；`poll_status` 读 b*64 槽等 doneSeq==1 |
 
 ## 参数（xds_decode 常用）

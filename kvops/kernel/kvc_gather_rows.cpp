@@ -106,7 +106,11 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(uint64_t channel, uint64_t
         const uint64_t segRow = KvcSegRowOf(static_cast<uint32_t>(row), args->stripeRows, args->nodeNum);
         GM_ADDR src = reinterpret_cast<GM_ADDR>(
             args->segBase + (static_cast<uint64_t>(args->layerOffsetRows) + segRow) * args->rowBytes);
-        GM_ADDR dst = reinterpret_cast<GM_ADDR>(args->hotRowBase + static_cast<uint64_t>(slot) * args->rowBytes);
+        // 热缓冲 per-request 分区：每请求预留 topK 行（槽位是 per-req 的 sieve 槽，
+        // 多请求共写 hotRowBase+slot*rowBytes 会互相覆盖——联调实证 req1 数据盖掉 req0）
+        GM_ADDR dst = reinterpret_cast<GM_ADDR>(args->hotRowBase +
+                                                (static_cast<uint64_t>(bid) * args->topK +
+                                                 static_cast<uint64_t>(slot)) * args->rowBytes);
         ret = hcomm.template ReadNbi<false>(args->channel, dst, src, args->rowBytes);
         if (ret != 0) {
             KvcStatusFinish(w, 0x200 + (static_cast<uint64_t>(pos) & 0xFF) + (static_cast<uint64_t>(ret) << 16));

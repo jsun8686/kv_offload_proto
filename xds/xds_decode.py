@@ -274,13 +274,15 @@ def main() -> int:
             for k in np.nonzero(coord.is_miss[r_].cpu().numpy())[0]:
                 slot_ = int(coord.top_k_device_slots[r_, k].item())
                 if 0 <= slot_ < dbs:
-                    expect_map[slot_] = host_bases[r_] + int(batch[r_][k])
+                    expect_map[(r_, slot_)] = host_bases[r_] + int(batch[r_][k])
         slot_line = []
-        for s_ in range(dbs):
-            w0 = int(hbm_sync[(hot_rows_base + s_) * (row_bytes // 4)])
-            src = w0_to_row.get(w0)
-            slot_line.append("s{}:exp={},got={}".format(
-                s_, expect_map.get(s_, "-"), (str(src[0]) + "@L" + str(src[1])) if src else hex(w0)))
+        for r_ in range(args.req_num):
+            for s_ in range(min(dbs, args.topk)):
+                # 热缓冲 per-request 分区：行索引 = r*topK + slot（与 gather 内核 dst 契约一致）
+                w0 = int(hbm_sync[(hot_rows_base + r_ * args.topk + s_) * (row_bytes // 4)])
+                src = w0_to_row.get(w0)
+                slot_line.append("r{}s{}:exp={},got={}".format(
+                    r_, s_, expect_map.get((r_, s_), "-"), (str(src[0]) + "@L" + str(src[1])) if src else hex(w0)))
         log("[xds] hot slot map: " + "; ".join(slot_line))
         checked = 0
         for r in range(args.req_num):
@@ -294,9 +296,10 @@ def main() -> int:
                 continue
             row = host_bases[r] + token_pos
             expect = row_word(row, layer_id, 0)
-            got = int(hbm_sync[(hot_rows_base + slot) * (row_bytes // 4)])
+            # 热缓冲 per-request 分区：行索引 = r*topK + slot（与 gather 内核 dst 契约一致）
+            got = int(hbm_sync[(hot_rows_base + r * args.topk + slot) * (row_bytes // 4)])
             if got != expect:
-                base_w = (hot_rows_base + slot) * (row_bytes // 4)
+                base_w = (hot_rows_base + r * args.topk + slot) * (row_bytes // 4)
                 words4 = hbm_sync[base_w:base_w + 4].tolist()
                 exp4 = [row_word(row, layer_id, w) for w in range(4)]
                 log("[xds][ERROR] verify failed step={} layer={} req={} token={} row={} slot={} expect={} "
