@@ -60,6 +60,9 @@ class XdsOffloadCoordinator:
         self.top_k_device_slots = torch.zeros((max_num_reqs, top_k), dtype=torch.int32, device=device)
         self.is_miss = torch.zeros((max_num_reqs, top_k), dtype=torch.int8, device=device)
         self.num_real = torch.zeros(1, dtype=torch.int32, device=device)
+        # sieve 内核自报诊断槽（64B）：misclassification 时读回内核实际看到的 GM 值，
+        # 区分"输入读到垃圾"（流/ABI 问题）与"输出写错地方"
+        self._diag_status = _kvops.alloc_status(1)
 
     # ── admission：请求进入 decode（prefill KV 已全层导出到远端） ────────────
     def admit_request(self, req_batch_idx: int, req_pool_idx: int, prefill_len: int, host_base_row: int) -> None:
@@ -108,9 +111,22 @@ class XdsOffloadCoordinator:
                             self.sieve_hand[layer_id].data_ptr(), self.top_k_device_slots.data_ptr(),
                             self.is_miss.data_ptr(), self.num_real.data_ptr(), self.top_k,
                             self.device_buffer_size, self.padded_buffer_size, self.visited_stride_b,
-                            self.max_num_reqs, self.pool_size, _npu_stream(), block_dim)
+                            self.max_num_reqs, self.pool_size, _npu_stream(), block_dim,
+                            status=self._diag_status)
 
     def miss_count(self) -> torch.Tensor:
         """device 侧 miss 统计张量（padding 行 is_miss==0，无需 num_real 切片；
         上层按步累积、定期 flush 时才 host 同步）"""
         return self.is_miss.sum()
+
+    def read_diag(self):
+        """读回 sieve 内核自报诊断（须在流同步后调用，如同步后的 wait 之后）。
+
+        返回 [numReal, reqIdx, prefill, seqLen, topk0, firstSlot, firstMiss, terminal]；
+        firstSlot=0x80000000(INT32_MIN) 表示 bid0 走了 padding/防御路径。
+        """
+        if _kvops is None:
+            return None
+        words = [_kvops.peek_status(self._diag_status + i * 8) for i in range(8)]
+        term = words[0]
+        return [w & 0xFFFFFFFF for w in words[1:]] + [term]

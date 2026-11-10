@@ -80,6 +80,20 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
         endReq = maxNumReqs;
     }
 
+    // 诊断自报（status != 0 时；仅 block 0 写，多 block 共槽会互踩）：
+    // 把内核实际读到的 GM 值写回状态槽，区分"输入读到垃圾"与"输出写错地方"。
+    // 槽布局：w0=阶段/终态，w1=numReal，w2=reqIdx(bid0)，w3=prefill(bid0)，
+    //        w4=seqLen(bid0)，w5=topk[0](bid0)，w6=首个输出 slot，w7=首个输出 miss
+    KvcStatusWriter dw;
+    const bool diag = (args->status != 0) && (blockIdx == 0);
+    if (diag) {
+        KvcStatusInit(dw, args->status);
+        KvcStatusSet(dw, 0, 0xE0);  // SIEVE_ENTERED
+        KvcStatusSet(dw, 1, static_cast<uint64_t>(static_cast<uint32_t>(numReal)));
+    }
+    int32_t diagFirstSlot = INT32_MIN;
+    int32_t diagFirstMiss = -1;
+
     TPipe pipe;
     TBuf<TPosition::VECCALC> tokBuf;
     TBuf<TPosition::VECCALC> visBuf;
@@ -99,6 +113,9 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
 
         // padding 行（图 replay）：只写哑输出，不读未定义内容
         if (bid >= numReal) {
+            if (diag && bid == 0) {
+                KvcStatusSet(dw, 6, static_cast<uint64_t>(INT32_MIN));
+            }
             for (int32_t k = 0; k < topK; ++k) {
                 reqOutSlots[k] = -1;
                 reqIsMiss[k] = 0;
@@ -107,6 +124,9 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
         }
 
         const int64_t reqIdx = reqPoolPtr[bid];
+        if (diag && bid == 0) {
+            KvcStatusSet(dw, 2, static_cast<uint64_t>(static_cast<uint32_t>(reqIdx)));
+        }
         // 防御：越界池行写哑输出，不进行 GM 越界寻址
         if (reqIdx < 0 || reqIdx >= poolSize) {
             for (int32_t k = 0; k < topK; ++k) {
@@ -118,6 +138,10 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
 
         const int32_t seqLen = seqLenPtr[bid];
         const int32_t prefill = prefillPtr[reqIdx];
+        if (diag && bid == 0) {
+            KvcStatusSet(dw, 3, static_cast<uint64_t>(static_cast<uint32_t>(prefill)));
+            KvcStatusSet(dw, 4, static_cast<uint64_t>(static_cast<uint32_t>(seqLen)));
+        }
         __gm__ int32_t *reqTopk = topkPtr + static_cast<int64_t>(bid) * topK;
         __gm__ int32_t *reqTokens = tokensPtr + reqIdx * padded;
         __gm__ uint8_t *reqVis = visPtr + reqIdx * visStrideB;
@@ -143,16 +167,27 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
 
         for (int32_t k = 0; k < topK; ++k) {
             const int32_t tokenPos = reqTopk[k];
+            if (diag && bid == 0 && k == 0) {
+                KvcStatusSet(dw, 5, static_cast<uint64_t>(static_cast<uint32_t>(tokenPos)));
+            }
 
             if (tokenPos < 0 || tokenPos >= seqLen) {
                 reqOutSlots[k] = -1;
                 reqIsMiss[k] = 0;
+                if (diag && bid == 0 && k == 0) {
+                    diagFirstSlot = -1;
+                    diagFirstMiss = 0;
+                }
                 continue;
             }
             if (tokenPos >= prefill) {
                 // decode 增量 token：扩展槽，永不淘汰、永不 miss
                 reqOutSlots[k] = padded + (tokenPos - prefill);
                 reqIsMiss[k] = 0;
+                if (diag && bid == 0 && k == 0) {
+                    diagFirstSlot = reqOutSlots[k];
+                    diagFirstMiss = 0;
+                }
                 continue;
             }
 
@@ -161,6 +196,10 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
                 reqOutSlots[k] = hitSlot;
                 reqIsMiss[k] = 0;
                 hisp::vis_set(visLocal, hitSlot);
+                if (diag && bid == 0 && k == 0) {
+                    diagFirstSlot = hitSlot;
+                    diagFirstMiss = 0;
+                }
                 continue;
             }
 
@@ -183,6 +222,10 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
 
             reqOutSlots[k] = h;
             reqIsMiss[k] = 1;
+            if (diag && bid == 0 && k == 0) {
+                diagFirstSlot = h;
+                diagFirstMiss = 1;
+            }
             tokLocal.SetValue(h, tokenPos);
             hisp::vis_set(visLocal, h);
             hand = h + 1;
@@ -200,6 +243,11 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
             DataCopy(htGm, htLocal, htSize);
         }
         PipeBarrier<PIPE_ALL>();
+    }
+    if (diag) {
+        KvcStatusSet(dw, 6, static_cast<uint64_t>(static_cast<uint32_t>(diagFirstSlot)));
+        KvcStatusSet(dw, 7, static_cast<uint64_t>(static_cast<uint32_t>(diagFirstMiss)));
+        KvcStatusFinish(dw, 0);  // (doneSeq<<32)|0 = 完成且无错误
     }
     KvcKernelEpilogue();
 }

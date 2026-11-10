@@ -289,17 +289,24 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
         ChannelHandle ch = seg.channel;
         const uint32_t poolId = seg.poolId, segIdx = segIndex;
         std::thread([this, ch, poolId, segIdx] {
-            (void)BindDeviceCtx();  // GetStatus 依赖线程私有 device 上下文
-            for (int i = 0; i < 12; ++i) {
-                int32_t status = -1;
-                const int r = api_.HcommChannelGetStatus(&ch, 1, &status);
-                printf("[emsd] chStatus poolId=%u segIndex=%u r=%d status=%d (0=READY 1=IN_PROGRESS 2=FAILED 3=TIMEOUT)\n",
-                       poolId, segIdx, r, status);
-                fflush(stdout);
-                if (r != 0 || status == 0 || status == 2 || status == 3) {
-                    break;
+            try {  // GetStatus 可能抛 NetworkApiException（如对端已断），绝不允许逃出线程
+                (void)BindDeviceCtx();  // GetStatus 依赖线程私有 device 上下文
+                for (int i = 0; i < 12; ++i) {
+                    int32_t status = -1;
+                    const int r = api_.HcommChannelGetStatus(&ch, 1, &status);
+                    printf("[emsd] chStatus poolId=%u segIndex=%u r=%d status=%d (0=READY 1=IN_PROGRESS 2=FAILED 3=TIMEOUT)\n",
+                           poolId, segIdx, r, status);
+                    fflush(stdout);
+                    if (r != 0 || status == 0 || status == 2 || status == 3) {
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+            } catch (const std::exception &e) {
+                printf("[emsd][ERROR] chStatus poll exception poolId=%u segIndex=%u: %s\n", poolId, segIdx,
+                       e.what());
+            } catch (...) {
+                printf("[emsd][ERROR] chStatus poll unknown exception poolId=%u segIndex=%u\n", poolId, segIdx);
             }
         }).detach();
     }

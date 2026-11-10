@@ -300,7 +300,8 @@ void kv_sieve_update(uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t seq
                      uint64_t deviceBufferTokens, uint64_t deviceBufferVisited, uint64_t deviceBufferHt,
                      uint64_t sieveHand, uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal,
                      uint32_t topK, uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t visitedStrideB,
-                     uint32_t maxNumReqs, uint32_t poolSize, uint64_t stream, uint32_t blockDim)
+                     uint32_t maxNumReqs, uint32_t poolSize, uint64_t stream, uint32_t blockDim,
+                     uint64_t status)
 {
     EnsureInited();
     if (paddedBufferSize % 16 != 0) {
@@ -350,6 +351,7 @@ void kv_sieve_update(uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t seq
     args.reqsPerCore = static_cast<uint32_t>(reqsPerCore);
     args.htSize = static_cast<uint32_t>(htSize);
     args.poolSize = poolSize;
+    args.status = status;  // 0=不写；非 0=内核自报诊断槽（block 0 写实际读到的 GM 值）
     LaunchCommon(g_fnSieveUpdate, &args, sizeof(args), blockDim, stream);
 }
 
@@ -411,7 +413,8 @@ PYBIND11_MODULE(_kvops, m)
           py::arg("device_buffer_visited"), py::arg("device_buffer_ht"), py::arg("sieve_hand"),
           py::arg("topk_device_slots"), py::arg("is_miss"), py::arg("num_real"), py::arg("top_k"),
           py::arg("device_buffer_size"), py::arg("padded_buffer_size"), py::arg("visited_stride_b"),
-          py::arg("max_num_reqs"), py::arg("pool_size"), py::arg("stream") = 0, py::arg("block_dim") = 8);
+          py::arg("max_num_reqs"), py::arg("pool_size"), py::arg("stream") = 0, py::arg("block_dim") = 8,
+          py::arg("status") = 0);
     m.def("sieve_ht_init", &kv_sieve_ht_init, py::arg("device_buffer_tokens"), py::arg("device_buffer_ht"),
           py::arg("prefill_lens"), py::arg("req_start"), py::arg("num_reqs"), py::arg("layer_num"),
           py::arg("pool_size"), py::arg("device_buffer_size"), py::arg("padded_buffer_size"),
