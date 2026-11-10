@@ -242,8 +242,12 @@ def main() -> int:
             for r in range(args.req_num):
                 exp_slots, exp_miss = oracle.update(r, batch[r], args.prefill)
                 if not np.array_equal(gpu_miss[r], np.array(exp_miss, dtype=np.int8)):
-                    log("[xds][ERROR] oracle is_miss mismatch step={} req={}\n gpu={}\n exp={}".format(
-                        step, r, gpu_miss[r].tolist(), exp_miss))
+                    log("[xds][ERROR] oracle is_miss mismatch step={} req={}\n gpu={}\n exp={}\n slots={}\n"
+                        " numReal={} prefill={} tokens[0]={} ht[0][:8]={}".format(
+                            step, r, gpu_miss[r].tolist(), exp_miss, gpu_slots[r].tolist(),
+                            coord.num_real.item(), coord.prefill_lens[:args.req_num].cpu().tolist(),
+                            coord.device_buffer_tokens[layer_id, 0, :8].cpu().tolist(),
+                            coord.device_buffer_ht[layer_id, 0, :8].cpu().tolist()))
                     return 1
                 norm = lambda s: -1 if s < 0 else (  # noqa: E731
                     (coord.padded_buffer_size + (-s - 2)) if s <= -2 else s)
