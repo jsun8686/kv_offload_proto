@@ -9,9 +9,39 @@
 #include "kvc_common.h"
 #include "kvc_args.h"
 
-extern "C" __global__ __aicore__ void kvc_gather_rows(GM_ADDR argsBuf)
+// fatbin 纯设备编译路径无 auto-gen 包装：kernel 实参 = host 参数块逐字段自然对齐布局
+// （见 kvc_scatter_rows_alllayer.cpp 头注释），非 GM 指针。签名与 KvcGatherArgs 字段
+// 顺序/类型严格一致（尾置 reserved 省略），体内重组为结构体。
+extern "C" __global__ __aicore__ void kvc_gather_rows(uint64_t channel, uint64_t segBase, uint64_t topkIndices,
+                                                      uint64_t reqPoolIndices, uint64_t reqHostBase,
+                                                      uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal,
+                                                      uint64_t hotRowBase, uint64_t status,
+                                                      uint32_t layerOffsetRows, uint32_t perLayerSegRows,
+                                                      uint32_t rowBytes, uint32_t stripeRows, uint32_t nodeNum,
+                                                      uint32_t myNode, uint32_t topK, uint32_t maxNumReqs,
+                                                      uint32_t positionsPerCore)
 {
-    const __gm__ KvcGatherArgs *args = reinterpret_cast<const __gm__ KvcGatherArgs *>(argsBuf);
+    KvcGatherArgs argsStorage{};
+    argsStorage.channel = channel;
+    argsStorage.segBase = segBase;
+    argsStorage.topkIndices = topkIndices;
+    argsStorage.reqPoolIndices = reqPoolIndices;
+    argsStorage.reqHostBase = reqHostBase;
+    argsStorage.topKDeviceSlots = topKDeviceSlots;
+    argsStorage.isMiss = isMiss;
+    argsStorage.numReal = numReal;
+    argsStorage.hotRowBase = hotRowBase;
+    argsStorage.status = status;
+    argsStorage.layerOffsetRows = layerOffsetRows;
+    argsStorage.perLayerSegRows = perLayerSegRows;
+    argsStorage.rowBytes = rowBytes;
+    argsStorage.stripeRows = stripeRows;
+    argsStorage.nodeNum = nodeNum;
+    argsStorage.myNode = myNode;
+    argsStorage.topK = topK;
+    argsStorage.maxNumReqs = maxNumReqs;
+    argsStorage.positionsPerCore = positionsPerCore;
+    const KvcGatherArgs *args = &argsStorage;
     const int32_t blockIdx = GetBlockIdx();
 
     __gm__ int32_t *numRealPtr = reinterpret_cast<__gm__ int32_t *>(args->numReal);

@@ -11,9 +11,28 @@
 #include "kvc_args.h"
 #include "kvc_common.h"
 
-extern "C" __global__ __aicore__ void hisp_sieve_ht_init(GM_ADDR argsBuf)
+// fatbin 纯设备编译路径无 auto-gen 包装：kernel 实参 = host 参数块逐字段自然对齐布局
+// （见 kvc_scatter_rows_alllayer.cpp 头注释），非 GM 指针。签名与 HispSieveHtInitArgs
+// 字段顺序/类型严格一致（尾置 reserved 省略），体内重组为结构体。
+extern "C" __global__ __aicore__ void hisp_sieve_ht_init(uint64_t deviceBufferTokens, uint64_t deviceBufferHt,
+                                                         uint64_t prefillLens, uint64_t status, uint32_t reqStart,
+                                                         uint32_t numReqs, uint32_t layerNum, uint32_t poolSize,
+                                                         uint32_t deviceBufferSize, uint32_t paddedBufferSize,
+                                                         uint32_t htSize)
 {
-    const __gm__ HispSieveHtInitArgs *args = reinterpret_cast<const __gm__ HispSieveHtInitArgs *>(argsBuf);
+    HispSieveHtInitArgs argsStorage{};
+    argsStorage.deviceBufferTokens = deviceBufferTokens;
+    argsStorage.deviceBufferHt = deviceBufferHt;
+    argsStorage.prefillLens = prefillLens;
+    argsStorage.status = status;
+    argsStorage.reqStart = reqStart;
+    argsStorage.numReqs = numReqs;
+    argsStorage.layerNum = layerNum;
+    argsStorage.poolSize = poolSize;
+    argsStorage.deviceBufferSize = deviceBufferSize;
+    argsStorage.paddedBufferSize = paddedBufferSize;
+    argsStorage.htSize = htSize;
+    const HispSieveHtInitArgs *args = &argsStorage;
     // GM 解引用集中读入本地标量（引用形参 API 要求左值；兼省重复 GM 加载）
     const int32_t numReqs = args->numReqs;
     const int32_t layerNum = args->layerNum;
@@ -24,11 +43,13 @@ extern "C" __global__ __aicore__ void hisp_sieve_ht_init(GM_ADDR argsBuf)
 
     const int32_t b = GetBlockIdx();
     if (b >= layerNum * numReqs) {
+        KvcKernelEpilogue();  // c310 收尾序列所有核统一执行（对齐 PoC 约定）
         return;
     }
     const int32_t layer = b / numReqs;
     const int64_t reqIdx = args->reqStart + b % numReqs;
     if (reqIdx < 0 || reqIdx >= poolSize) {
+        KvcKernelEpilogue();
         return;
     }
 

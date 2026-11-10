@@ -8,12 +8,39 @@
 #include "kvc_common.h"
 #include "kvc_args.h"
 
-extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(GM_ADDR argsBuf)
+// fatbin 纯设备编译路径（ascendc_fatbin_library）无 auto-gen 包装：kernel 实参就是
+// host 参数块本身（kvops_ext LaunchCommon 按结构体 memcpy 后 aclrtLaunchKernelWithHostArgs
+// 原样下发），不是"指向参数块的 GM 指针"。旧签名 GM_ADDR argsBuf 会把结构体首字段
+// channel 误当 GM 指针解引用，args->status 等字段读出垃圾地址，MTE3 写状态页即
+// "DDR address out of range"（aivec errcode 95，kvc_scatter_rows_alllayer+0x34c 实测）。
+// 故签名与 KvcScatterAllArgs 字段顺序/类型严格一致（自然对齐打包，尾置 reserved 省略），
+// 体内重组为结构体，下游代码不变。
+extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(uint64_t channel, uint64_t segBase,
+                                                                uint64_t srcLayer0Base, uint64_t srcLayerStride,
+                                                                uint64_t status, uint32_t perLayerSegRows,
+                                                                uint32_t rowBytes, uint32_t rowLo, uint32_t rowCnt,
+                                                                uint32_t layerNum, uint32_t stripeRows,
+                                                                uint32_t nodeNum, uint32_t myNode)
 {
+    KvcScatterAllArgs argsStorage{};
+    argsStorage.channel = channel;
+    argsStorage.segBase = segBase;
+    argsStorage.srcLayer0Base = srcLayer0Base;
+    argsStorage.srcLayerStride = srcLayerStride;
+    argsStorage.status = status;
+    argsStorage.perLayerSegRows = perLayerSegRows;
+    argsStorage.rowBytes = rowBytes;
+    argsStorage.rowLo = rowLo;
+    argsStorage.rowCnt = rowCnt;
+    argsStorage.layerNum = layerNum;
+    argsStorage.stripeRows = stripeRows;
+    argsStorage.nodeNum = nodeNum;
+    argsStorage.myNode = myNode;
+    const KvcScatterAllArgs *args = &argsStorage;
     if (GetBlockIdx() != 0) {
+        KvcKernelEpilogue();  // c310 收尾序列所有核统一执行（对齐 PoC 约定）
         return;
     }
-    const __gm__ KvcScatterAllArgs *args = reinterpret_cast<const __gm__ KvcScatterAllArgs *>(argsBuf);
     KvcStatusWriter w;
     KvcStatusInit(w, args->status);
 

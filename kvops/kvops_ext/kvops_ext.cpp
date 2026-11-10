@@ -106,11 +106,18 @@ int64_t Gcd(int64_t a, int64_t b)
 void LaunchCommon(void *fn, const void *argsStruct, size_t argsSize, uint32_t blockDim, uint64_t stream)
 {
     uint8_t buf[160];
-    if (argsSize + 8 > sizeof(buf)) {
+    // 尾槽（工具链为 kernel 恒追加的 8B device buffer 地址参数）按 8B 对齐放置：
+    // 结构体 sizeof 非 8 倍数时（如 KvcScatterAllArgs=76B）直接接在末尾会把尾槽放到
+    // 非对齐偏移，kernel 侧按对齐 ABI 读到的就是垃圾地址
+    const size_t alignedSize = (argsSize + 7U) & ~static_cast<size_t>(7U);
+    if (alignedSize + 8 > sizeof(buf)) {
         throw std::runtime_error("args too large");
     }
     memcpy(buf, argsStruct, argsSize);
-    memcpy(buf + argsSize, &g_overflowBuf, 8);  // 尾槽 = 8B device buffer 地址
+    if (alignedSize > argsSize) {
+        memset(buf + argsSize, 0, alignedSize - argsSize);
+    }
+    memcpy(buf + alignedSize, &g_overflowBuf, 8);  // 尾槽 = 8B device buffer 地址
 
     LaunchAttr attrs[3]{};
     attrs[0].id = LAUNCH_ATTR_SCHEM_MODE;
@@ -122,7 +129,7 @@ void LaunchCommon(void *fn, const void *argsStruct, size_t argsSize, uint32_t bl
     LaunchCfg cfg{attrs, 3};
 
     int32_t ret = rt.aclrtLaunchKernelWithHostArgs(fn, blockDim, reinterpret_cast<void *>(stream), &cfg, buf,
-                                                   argsSize + 8, nullptr, 0);
+                                                   alignedSize + 8, nullptr, 0);
     if (ret != 0) {
         throw std::runtime_error("LaunchKernelWithHostArgs ret=" + std::to_string(ret));
     }

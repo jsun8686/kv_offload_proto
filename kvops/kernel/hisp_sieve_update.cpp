@@ -14,9 +14,38 @@
 #include "kvc_args.h"
 #include "kvc_common.h"
 
-extern "C" __global__ __aicore__ void hisp_sieve_update(GM_ADDR argsBuf)
+// fatbin 纯设备编译路径无 auto-gen 包装：kernel 实参 = host 参数块逐字段自然对齐布局
+// （见 kvc_scatter_rows_alllayer.cpp 头注释），非 GM 指针。签名与 HispSieveUpdateArgs
+// 字段顺序/类型严格一致（尾置 reserved 省略），体内重组为结构体。
+extern "C" __global__ __aicore__ void hisp_sieve_update(
+    uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t seqLens, uint64_t prefillLens,
+    uint64_t deviceBufferTokens, uint64_t deviceBufferVisited, uint64_t deviceBufferHt, uint64_t sieveHand,
+    uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal, uint64_t status, uint32_t topK,
+    uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t visitedStrideB, uint32_t maxNumReqs,
+    uint32_t reqsPerCore, uint32_t htSize, uint32_t poolSize)
 {
-    const __gm__ HispSieveUpdateArgs *args = reinterpret_cast<const __gm__ HispSieveUpdateArgs *>(argsBuf);
+    HispSieveUpdateArgs argsStorage{};
+    argsStorage.topkIndices = topkIndices;
+    argsStorage.reqPoolIndices = reqPoolIndices;
+    argsStorage.seqLens = seqLens;
+    argsStorage.prefillLens = prefillLens;
+    argsStorage.deviceBufferTokens = deviceBufferTokens;
+    argsStorage.deviceBufferVisited = deviceBufferVisited;
+    argsStorage.deviceBufferHt = deviceBufferHt;
+    argsStorage.sieveHand = sieveHand;
+    argsStorage.topKDeviceSlots = topKDeviceSlots;
+    argsStorage.isMiss = isMiss;
+    argsStorage.numReal = numReal;
+    argsStorage.status = status;
+    argsStorage.topK = topK;
+    argsStorage.deviceBufferSize = deviceBufferSize;
+    argsStorage.paddedBufferSize = paddedBufferSize;
+    argsStorage.visitedStrideB = visitedStrideB;
+    argsStorage.maxNumReqs = maxNumReqs;
+    argsStorage.reqsPerCore = reqsPerCore;
+    argsStorage.htSize = htSize;
+    argsStorage.poolSize = poolSize;
+    const HispSieveUpdateArgs *args = &argsStorage;
     // GM 解引用集中读入本地标量
     const int32_t topK = args->topK;
     const int32_t dbs = args->deviceBufferSize;
