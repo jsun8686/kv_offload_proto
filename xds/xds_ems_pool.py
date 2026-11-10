@@ -180,9 +180,12 @@ class EmsPool:
         self._status_base = _kvops.alloc_status(self._status_count)
 
     def next_status(self, slots: int = 1) -> int:
-        # 每 block 独占 64B 槽（与内核 KvcStatusInit 的 blockIdx*64 步进一致）。
-        # blockDim>1 时调用方必须一次性预留 blockDim 个槽，不能跨 op 复用，
-        # 否则本 op 的 64B 整页刷写会覆盖上一 op 仍待轮询的槽。
+        # 每 block 占 64B 槽（与内核 KvcStatusInit 的 blockIdx*64、KvcStatusFlush 整页 64B 刷写一致）；
+        # blockDim>1 时按方法预订 slots 槽（跨 op 复用，上 op 已 wait 完成后其槽可复用）。
+        # 环回保护：剩余槽不足时回卷到 0——否则从 cursor 起连续 slots 会写出缓冲尾部
+        # （实测症状：1 槽 op 后接 8 槽 op，memset 512B 越界 64B，driver 报 Invalid addr）。
+        if self._status_cursor + slots > self._status_count:
+            self._status_cursor = 0
         addr = self._status_base + self._status_cursor * 64
         self._status_cursor = (self._status_cursor + slots) % self._status_count
         return addr

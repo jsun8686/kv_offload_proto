@@ -169,7 +169,9 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
     if (rt.aclrtMalloc(&g_overflowBuf, 8, 0) != 0 || g_overflowBuf == nullptr) {
         throw std::runtime_error("alloc overflow buf failed");
     }
-    (void)rt.aclrtMemset(g_overflowBuf, 8, 0, 8);
+    if (rt.aclrtMemset(g_overflowBuf, 8, 0, 8) != 0) {
+        throw std::runtime_error("memset overflow buf failed");
+    }
 
     BinOpt opt{};
     opt.type = BINARY_LOAD_OPT_LAZY_LOAD;
@@ -198,7 +200,12 @@ uint64_t kv_alloc_status(int count)
     if (rt.aclrtMalloc(&buf, static_cast<size_t>(count) * 64, 0) != 0 || buf == nullptr) {
         throw std::runtime_error("alloc status failed");
     }
-    (void)rt.aclrtMemset(buf, static_cast<size_t>(count) * 64, 0, static_cast<size_t>(count) * 64);
+    const size_t statusBytes = static_cast<size_t>(count) * 64;
+    if (rt.aclrtMemset(buf, statusBytes, 0, statusBytes) != 0) {
+        // memset 失败当场抛出：地址非法/越界在分配阶段即暴露（曾因 (void) 吞错拖到 poll 才发现）
+        throw std::runtime_error("alloc_status memset failed, addr=" + std::to_string(reinterpret_cast<uint64_t>(buf)) +
+                                 " bytes=" + std::to_string(statusBytes));
+    }
     return reinterpret_cast<uint64_t>(buf);
 }
 
@@ -267,7 +274,10 @@ void kv_import_seg(uint64_t channel, uint64_t segBase, uint32_t layerOffsetRows,
     args.maxNumReqs = maxNumReqs;
     const uint32_t totalPos = maxNumReqs * topK;
     args.positionsPerCore = (totalPos + blockDim - 1) / blockDim;  // 对齐由 Python 侧校验（64 元素）
-    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 64, 0, blockDim * 64);  // 每 block 独占 64B 槽
+    if (rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 64, 0, blockDim * 64) != 0) {
+        throw std::runtime_error("import_seg status memset failed, status=" + std::to_string(status) +
+                                 " bytes=" + std::to_string(blockDim * 64));
+    }  // 每 block 独占 64B 槽
     LaunchCommon(g_fnGather, &args, sizeof(args), blockDim, stream);
 }
 
@@ -291,7 +301,10 @@ void kv_export_seg_alllayer(uint64_t channel, uint64_t segBase, uint32_t perLaye
     args.stripeRows = stripeRows;
     args.nodeNum = nodeNum;
     args.myNode = myNode;
-    (void)rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 64, 0, blockDim * 64);  // 每 block 独占 64B 槽
+    if (rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 64, 0, blockDim * 64) != 0) {
+        throw std::runtime_error("export_seg_alllayer status memset failed, status=" + std::to_string(status) +
+                                 " bytes=" + std::to_string(blockDim * 64));
+    }
     LaunchCommon(g_fnScatterAll, &args, sizeof(args), blockDim, stream);
 }
 
