@@ -207,9 +207,10 @@ int EmsdHcomm::SegRegister(uint32_t segIndex, uint32_t poolId, void *base, uint6
     char memTag[64];
     (void)snprintf(memTag, sizeof(memTag), "kv_seg_%u_%u", poolId, segIndex);
     CommMem commMem{};
-    // 恒 HOST：段内存恒 host DRAM（mmap）；device/host 两种 locType 下均如此——
-    // MemFabric device_urma 生产实证组合（ToHcommMem 默认 HOST，HVA 直注册有回退先例）
-    commMem.type = COMM_MEM_TYPE_HOST;
+    // DEVICE 内存（HBM）注册：AIV 通道 exchangeAllMems 握手交换 DVA 域 mem key，
+    // 裸 mmap host 页无 DVA 时握手无法完成（联调实证：双端 60s IN_PROGRESS、server GetStatus 报错）。
+    // 对齐 aiv_urma_poc（aclrtMalloc + COMM_MEM_TYPE_DEVICE）；host DRAM 池待跨模式包/VA manager 后置。
+    commMem.type = COMM_MEM_TYPE_DEVICE;
     commMem.addr = base;
     commMem.size = size;
     HcommResult ret = api_.HcommMemReg(endpoint_, memTag, &commMem, &seg.memHandle);
@@ -288,6 +289,7 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
         ChannelHandle ch = seg.channel;
         const uint32_t poolId = seg.poolId, segIdx = segIndex;
         std::thread([this, ch, poolId, segIdx] {
+            (void)BindDeviceCtx();  // GetStatus 依赖线程私有 device 上下文
             for (int i = 0; i < 12; ++i) {
                 int32_t status = -1;
                 const int r = api_.HcommChannelGetStatus(&ch, 1, &status);

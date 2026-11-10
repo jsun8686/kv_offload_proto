@@ -130,6 +130,9 @@ int EmsdCtrlServer::Run()
         return -1;
     }
     hcommInited_ = true;
+    if (pool_.Init(cfg_.aclLib) != 0) {  // 段内存分配器：aclrtMalloc/aclrtFree（HBM）
+        return -1;
+    }
     int lfd = Listen(cfg_.listenPort);
     if (lfd < 0) {
         return -1;

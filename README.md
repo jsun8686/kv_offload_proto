@@ -17,8 +17,8 @@ miss 识别为 device 侧 SIEVE 算子（移植自 sglang-0730，哈希-only + v
 资源节点 A（master emsd）      资源节点 B（worker emsd）        NPU 机（计算节点）
 ┌──────────────────────┐      ┌──────────────────────┐      ┌────────────────────────────┐
 │ TCP master（打散/汇总）│◄────►│ TCP worker            │      │ python -m xds.xds_decode    │
-│ host DRAM 段0+MemReg  │      │ host DRAM 段1+MemReg  │◄─────│  xds_decode（入口/驱动）     │
-│ Endpoint(HOST)+AIV    │◄─────┼──────────────────────┼──────│  xds_offload（SIEVE 协调器） │
+│ HBM 段0+MemReg        │      │ HBM 段1+MemReg        │◄─────│  xds_decode（入口/驱动）     │
+│ Endpoint(DEVICE)+AIV  │◄─────┼──────────────────────┼──────│  xds_offload（SIEVE 协调器） │
 │   server 通道          │ TCP  │ AIV server 通道       │ URMA │  xds_ems_pool（池+批量读写） │
 └──────────────────────┘ (控制)└──────────────────────┘(数据)└────────────────────────────┘
 ```
@@ -33,13 +33,14 @@ miss 识别为 device 侧 SIEVE 算子（移植自 sglang-0730，哈希-only + v
 # 1) 资源节点 A（master；members=静态成员表 ip:ctrlPort）
 #    双 loc 模式：--loc device（默认，当前 CANN 包）= 卡到卡：EID 自动按 --device 的 phyId
 #    匹配 rootinfo（PoC 同构）；--loc host（待跨模式/noDevice 包）= --host-addr <ipv6> 手填
-#    （ipourma host 地址，noDevice 仓 rank_graph 标准填法）。两种模式段内存均恒 host DRAM
-#    + COMM_MEM_TYPE_HOST（MemFabric device_urma 生产实证组合）
+#    （ipourma host 地址，noDevice 仓 rank_graph 标准填法）。段内存取自 --device 卡 HBM
+#    （aclrtMalloc+COMM_MEM_TYPE_DEVICE——AIV 通道 mem key 交换要求 DVA 域，PoC 实证组合；
+#    裸 mmap host 页无 DVA，握手卡 IN_PROGRESS，联调实证）
 ./build/emsd/emsd --role master --ip <A_ip> --port 27000 --device 4 --loc device \
-    --members <A_ip>:27000,<B_ip>:27001 --pool-size-gb 8
+    --members <A_ip>:27000,<B_ip>:27001 --pool-size-gb 1
 
 # 2) 资源节点 B（worker）
-./build/emsd/emsd --role worker --ip <B_ip> --port 27001 --device 5 --loc device --pool-size-gb 8
+./build/emsd/emsd --role worker --ip <B_ip> --port 27001 --device 5 --loc device --pool-size-gb 1
 
 # 3) NPU 机跑 decode 驱动（EID 全自动：device→phyId→rootinfo 匹配；默认 direct 模式）
 python -m xds.xds_decode --ems-master <A_ip>:27000 --device 0 \

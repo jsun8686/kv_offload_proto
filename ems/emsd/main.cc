@@ -5,7 +5,7 @@
  *
  * 用法：
  *   master: emsd --role master --ip <本机IP> --port 27000 \
- *               --members <ip1:port1:hcommPort1,ip2:port2:hcommPort2,...> [--pool-size-gb 8]
+ *               --members <ip1:port1:hcommPort1,ip2:port2:hcommPort2,...> [--pool-size-gb 1]
  *   worker: emsd --role worker --ip <本机IP> --port 27001 \
  *               --master <ip:port>   （worker 启动即向 master 注册，静态成员表由此生成）
  *
@@ -28,7 +28,7 @@ void Usage(const char *bin)
            "  master: --members ip1:port1:hcommPort1[,ip2:port2:hcommPort2...]\n"
            "  loc device（默认，当前包）: EID 自动按 rootinfo 匹配 device_id==phyId（卡到卡）\n"
            "  loc host（待跨模式包）: --host-addr 必填（ipourma host IPv6，V6 即 EID 载体）\n"
-           "  两种模式段内存均恒 host DRAM + COMM_MEM_TYPE_HOST（MemFabric 生产实证组合）\n"
+           "  段内存取自 --device 卡 HBM（AIV 通道 mem key 交换要求 DVA 域，PoC 实证组合）\n"
            "env: KV_EMSD_HCOMM_LIB 覆盖 libhcomm 路径\n",
            bin);
 }
@@ -51,7 +51,7 @@ int main(int argc, char **argv)
     std::string role = "worker";
     std::string members;
     std::string loc = "device";
-    int poolGb = 8;
+    int poolGb = 1;
     int deviceId = 0;
 
     for (int i = 1; i < argc; i++) {
