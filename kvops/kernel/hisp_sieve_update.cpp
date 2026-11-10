@@ -20,9 +20,9 @@
 extern "C" __global__ __aicore__ void hisp_sieve_update(
     uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t seqLens, uint64_t prefillLens,
     uint64_t deviceBufferTokens, uint64_t deviceBufferVisited, uint64_t deviceBufferHt, uint64_t sieveHand,
-    uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal, uint64_t status, uint32_t topK,
-    uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t visitedStrideB, uint32_t maxNumReqs,
-    uint32_t reqsPerCore, uint32_t htSize, uint32_t poolSize)
+    uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numRealGm, uint64_t status, uint32_t topKIn,
+    uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t visitedStrideB, uint32_t maxNumReqsIn,
+    uint32_t reqsPerCoreIn, uint32_t htSizeIn, uint32_t poolSizeIn)
 {
     HispSieveUpdateArgs argsStorage{};
     argsStorage.topkIndices = topkIndices;
@@ -35,16 +35,16 @@ extern "C" __global__ __aicore__ void hisp_sieve_update(
     argsStorage.sieveHand = sieveHand;
     argsStorage.topKDeviceSlots = topKDeviceSlots;
     argsStorage.isMiss = isMiss;
-    argsStorage.numReal = numReal;
+    argsStorage.numReal = numRealGm;
     argsStorage.status = status;
-    argsStorage.topK = topK;
+    argsStorage.topK = topKIn;
     argsStorage.deviceBufferSize = deviceBufferSize;
     argsStorage.paddedBufferSize = paddedBufferSize;
     argsStorage.visitedStrideB = visitedStrideB;
-    argsStorage.maxNumReqs = maxNumReqs;
-    argsStorage.reqsPerCore = reqsPerCore;
-    argsStorage.htSize = htSize;
-    argsStorage.poolSize = poolSize;
+    argsStorage.maxNumReqs = maxNumReqsIn;
+    argsStorage.reqsPerCore = reqsPerCoreIn;
+    argsStorage.htSize = htSizeIn;
+    argsStorage.poolSize = poolSizeIn;
     const HispSieveUpdateArgs *args = &argsStorage;
     // GM 解引用集中读入本地标量
     const int32_t topK = args->topK;

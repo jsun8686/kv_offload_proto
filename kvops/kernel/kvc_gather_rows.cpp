@@ -14,7 +14,7 @@
 // 顺序/类型严格一致（尾置 reserved 省略），体内重组为结构体。
 extern "C" __global__ __aicore__ void kvc_gather_rows(uint64_t channel, uint64_t segBase, uint64_t topkIndices,
                                                       uint64_t reqPoolIndices, uint64_t reqHostBase,
-                                                      uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal,
+                                                      uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numRealGm,
                                                       uint64_t hotRowBase, uint64_t status,
                                                       uint32_t layerOffsetRows, uint32_t perLayerSegRows,
                                                       uint32_t rowBytes, uint32_t stripeRows, uint32_t nodeNum,
@@ -29,7 +29,7 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(uint64_t channel, uint64_t
     argsStorage.reqHostBase = reqHostBase;
     argsStorage.topKDeviceSlots = topKDeviceSlots;
     argsStorage.isMiss = isMiss;
-    argsStorage.numReal = numReal;
+    argsStorage.numReal = numRealGm;
     argsStorage.hotRowBase = hotRowBase;
     argsStorage.status = status;
     argsStorage.layerOffsetRows = layerOffsetRows;

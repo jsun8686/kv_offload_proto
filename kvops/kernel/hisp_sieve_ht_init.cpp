@@ -16,9 +16,9 @@
 // 字段顺序/类型严格一致（尾置 reserved 省略），体内重组为结构体。
 extern "C" __global__ __aicore__ void hisp_sieve_ht_init(uint64_t deviceBufferTokens, uint64_t deviceBufferHt,
                                                          uint64_t prefillLens, uint64_t status, uint32_t reqStart,
-                                                         uint32_t numReqs, uint32_t layerNum, uint32_t poolSize,
+                                                         uint32_t numReqsIn, uint32_t layerNumIn, uint32_t poolSizeIn,
                                                          uint32_t deviceBufferSize, uint32_t paddedBufferSize,
-                                                         uint32_t htSize)
+                                                         uint32_t htSizeIn)
 {
     HispSieveHtInitArgs argsStorage{};
     argsStorage.deviceBufferTokens = deviceBufferTokens;
@@ -26,12 +26,12 @@ extern "C" __global__ __aicore__ void hisp_sieve_ht_init(uint64_t deviceBufferTo
     argsStorage.prefillLens = prefillLens;
     argsStorage.status = status;
     argsStorage.reqStart = reqStart;
-    argsStorage.numReqs = numReqs;
-    argsStorage.layerNum = layerNum;
-    argsStorage.poolSize = poolSize;
+    argsStorage.numReqs = numReqsIn;
+    argsStorage.layerNum = layerNumIn;
+    argsStorage.poolSize = poolSizeIn;
     argsStorage.deviceBufferSize = deviceBufferSize;
     argsStorage.paddedBufferSize = paddedBufferSize;
-    argsStorage.htSize = htSize;
+    argsStorage.htSize = htSizeIn;
     const HispSieveHtInitArgs *args = &argsStorage;
     // GM 解引用集中读入本地标量（引用形参 API 要求左值；兼省重复 GM 加载）
     const int32_t numReqs = args->numReqs;
