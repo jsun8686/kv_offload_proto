@@ -78,13 +78,18 @@ static inline __aicore__ void KvcStatusFinish(KvcStatusWriter &w, uint64_t errCo
     KvcStatusSet(w, 0, (1ULL << 32) | (errCode & 0xFFFFFFFFULL));
 }
 
-// c310 收尾 flush（950 平台约定，fatbin 纯设备编译需手动补齐）
+// c310 收尾 flush（950 平台约定，fatbin 纯设备编译需手动补齐）。
+// 注意：本分支生效依赖编译链定义 __DAV_C310__（SOC_VERSION=ascend950pr_*）——
+// 若宏未定义则此函数为空壳，标量 GM store（sieve 的 isMiss/slots/hand）将滞留缓存
+// 对 host 不可见（联调实证症状：DataCopy 回写可见、标量写丢失）。#warning 为编译期探针。
 static inline __aicore__ void KvcKernelEpilogue()
 {
 #if defined(__DAV_C310__)
     pipe_barrier(PIPE_ALL);
     dsb(mem_dsb_t::DSB_ALL);
     dci();
+#else
+#warning "__DAV_C310__ NOT defined: KvcKernelEpilogue is EMPTY (scalar GM stores will not be flushed)"
 #endif
 }
 
