@@ -28,6 +28,7 @@ namespace {
 struct DynApi {
     int32_t (*aclrtSetDevice)(int32_t);
     int32_t (*aclrtGetPhyDevIdByLogicDevId)(int32_t, int32_t *);
+    int32_t (*rtGetDeviceInfo)(uint32_t, int32_t, int32_t, int64_t *);  // 内部接口，可能缺失（PoC 同款容忍）
     HcommResult (*HcommEndpointCreate)(const EndpointDesc *, EndpointHandle *);
     HcommResult (*HcommEndpointDestroy)(EndpointHandle);
     HcommResult (*HcommMemReg)(EndpointHandle, const char *, const CommMem *, HcommMemHandle *);
@@ -81,6 +82,11 @@ void cli_init(int deviceId, const std::string &rootinfoPath, const std::string &
     g_api.aclrtSetDevice = Sym<decltype(g_api.aclrtSetDevice)>(g_aclLib, "aclrtSetDevice");
     g_api.aclrtGetPhyDevIdByLogicDevId =
         Sym<decltype(g_api.aclrtGetPhyDevIdByLogicDevId)>(g_aclLib, "aclrtGetPhyDevIdByLogicDevId");
+    // rtGetDeviceInfo 为内部接口：符号缺失时降级为 0（对齐 PoC 的容忍策略，不视为致命错误）
+    g_api.rtGetDeviceInfo = reinterpret_cast<decltype(g_api.rtGetDeviceInfo)>(dlsym(g_aclLib, "rtGetDeviceInfo"));
+    if (g_api.rtGetDeviceInfo == nullptr) {
+        printf("[cli][WARN] rtGetDeviceInfo unavailable, topology fields stay 0: %s\n", dlerror());
+    }
     g_api.HcommEndpointCreate = Sym<decltype(g_api.HcommEndpointCreate)>(g_hcommLib, "HcommEndpointCreate");
     g_api.HcommEndpointDestroy = Sym<decltype(g_api.HcommEndpointDestroy)>(g_hcommLib, "HcommEndpointDestroy");
     g_api.HcommMemReg = Sym<decltype(g_api.HcommMemReg)>(g_hcommLib, "HcommMemReg");
@@ -113,7 +119,28 @@ void cli_init(int deviceId, const std::string &rootinfoPath, const std::string &
     memcpy(g_localDesc.commAddr.eid, eid.data(), EMS_EID_LEN);  // 16B 有效（PoC 同款填法）
     g_localDesc.loc.locType = ENDPOINT_LOC_TYPE_DEVICE;
     g_localDesc.loc.device.devPhyId = static_cast<uint32_t>(phyId);  // 用 phyId（PoC 同款：desc 填物理 ID）
-    // superDevId/serverIdx/superPodIdx 留 0：noDevice 基线 DEVICE loc 的路由以 EID 为准（联调校准）
+    // 拓扑四元组对齐 aiv_urma_poc（缺这些字段时 UBC_CTP 握手无法推进，实测卡 IN_PROGRESS）：
+    //   sdid/serverIdx/superPodIdx 经 rtGetDeviceInfo 查询（infoType 复刻 MemFabric hybm_define.h）
+    if (g_api.rtGetDeviceInfo != nullptr) {
+        constexpr int32_t kInfoSdid = 26;
+        constexpr int32_t kInfoServerId = 27;
+        constexpr int32_t kInfoSuperPodId = 28;
+        int64_t v = 0;
+        uint32_t sdid = 0, serverIdx = 0, superPodIdx = 0;
+        if (g_api.rtGetDeviceInfo(static_cast<uint32_t>(deviceId), 0, kInfoSdid, &v) == 0) {
+            sdid = static_cast<uint32_t>(v);
+        }
+        if (g_api.rtGetDeviceInfo(static_cast<uint32_t>(deviceId), 0, kInfoServerId, &v) == 0) {
+            serverIdx = static_cast<uint32_t>(v);
+        }
+        if (g_api.rtGetDeviceInfo(static_cast<uint32_t>(deviceId), 0, kInfoSuperPodId, &v) == 0) {
+            superPodIdx = static_cast<uint32_t>(v);
+        }
+        g_localDesc.loc.device.superDevId = sdid;
+        g_localDesc.loc.device.serverIdx = serverIdx;
+        g_localDesc.loc.device.superPodIdx = superPodIdx;
+        printf("[cli] topology: phyId=%d sdid=%u serverIdx=%u superPodIdx=%u\n", phyId, sdid, serverIdx, superPodIdx);
+    }
     HcommResult ret = g_api.HcommEndpointCreate(&g_localDesc, &g_endpoint);
     if (ret != 0 || g_endpoint == nullptr) {
         throw std::runtime_error("HcommEndpointCreate ret=" + std::to_string(ret) + " eid=" +
@@ -193,14 +220,27 @@ py::tuple cli_link_channel(const std::string &peerDescBytes, uint16_t hcommPort,
         throw std::runtime_error("ChannelCreate(client) ret=" + std::to_string(ret) + " port=" +
                                  std::to_string(hcommPort));
     }
+    // 状态语义（对齐 MemFabric hcomm_api_wrapper）：READY=0 / IN_PROGRESS=1 / FAILED=2 / TIMEOUT=3。
+    // 只认 0 会把 FAILED/TIMEOUT 吞成"等满超时"，握手失败的真实原因不可见——必须区分并报出。
     for (uint32_t waited = 0; waited < readyTimeoutSec * 10U; waited++) {
         int32_t status = -1;
         ret = g_api.HcommChannelGetStatus(&channel, 1, &status);
         if (ret != 0) {
+            (void)g_api.HcommChannelDestroy(&channel, 1);
             throw std::runtime_error("ChannelGetStatus ret=" + std::to_string(ret));
         }
         if (status == 0) {  // READY
+            printf("[cli] channel READY, port=%u channel=0x%llx\n", hcommPort, (unsigned long long)channel);
             return py::make_tuple(static_cast<uint64_t>(channel), status);
+        }
+        if (status == 2 || status == 3) {  // FAILED / TIMEOUT：终态，立即报错带状态值
+            (void)g_api.HcommChannelDestroy(&channel, 1);
+            throw std::runtime_error(std::string("channel handshake ") + (status == 2 ? "FAILED" : "TIMEOUT") +
+                                     ", port=" + std::to_string(hcommPort));
+        }
+        if (waited % 50U == 0U) {  // 每 5s 报一次进展（IN_PROGRESS=1 或其他未知值）
+            printf("[cli] channel status=%d (0=READY 1=IN_PROGRESS 2=FAILED 3=TIMEOUT), port=%u waited=%u.%us\n",
+                   status, hcommPort, waited / 10U, (waited % 10U) * 100U);
         }
         usleep(100 * 1000);
     }

@@ -10,8 +10,10 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -93,6 +95,12 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
         // 供 BindDeviceCtx 在工作线程重绑（设备上下文线程私有）
         aclrtSetDeviceFn_ = aclrtSetDevice;
         printf("[emsd] aclrtSetDevice ok, deviceId=%d\n", deviceId);
+        // rtGetDeviceInfo（内部接口）查拓扑三元组：缺失时容忍降级为 0（对齐 PoC 策略）
+        rtGetDeviceInfoFn_ = reinterpret_cast<int32_t (*)(uint32_t, int32_t, int32_t, int64_t *)>(
+            dlsym(aclLibHandle_, "rtGetDeviceInfo"));
+        if (rtGetDeviceInfoFn_ == nullptr) {
+            printf("[emsd][WARN] rtGetDeviceInfo unavailable, topology fields stay 0: %s\n", dlerror());
+        }
 
         auto aclrtGetPhyDevIdByLogicDevId =
             reinterpret_cast<int32_t (*)(int32_t, int32_t *)>(dlsym(aclLibHandle_, "aclrtGetPhyDevIdByLogicDevId"));
@@ -137,7 +145,29 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
         memcpy(localDesc_.commAddr.eid, eid.data(), EMS_EID_LEN);  // 16B 有效（PoC 同款填法）
         localDesc_.loc.locType = ENDPOINT_LOC_TYPE_DEVICE;
         localDesc_.loc.device.devPhyId = static_cast<uint32_t>(phyId);
-        // superDevId/serverIdx/superPodIdx 留 0：路由以 EID 为准（联调校准）
+        // 拓扑四元组对齐 aiv_urma_poc（缺这些字段时 UBC_CTP 握手无法推进，实测卡 IN_PROGRESS）：
+        //   sdid/serverIdx/superPodIdx 经 rtGetDeviceInfo 查询（infoType 复刻 MemFabric hybm_define.h）
+        if (rtGetDeviceInfoFn_ != nullptr) {
+            constexpr int32_t kInfoSdid = 26;
+            constexpr int32_t kInfoServerId = 27;
+            constexpr int32_t kInfoSuperPodId = 28;
+            int64_t v = 0;
+            uint32_t sdid = 0, serverIdx = 0, superPodIdx = 0;
+            if (rtGetDeviceInfoFn_(static_cast<uint32_t>(deviceId), 0, kInfoSdid, &v) == 0) {
+                sdid = static_cast<uint32_t>(v);
+            }
+            if (rtGetDeviceInfoFn_(static_cast<uint32_t>(deviceId), 0, kInfoServerId, &v) == 0) {
+                serverIdx = static_cast<uint32_t>(v);
+            }
+            if (rtGetDeviceInfoFn_(static_cast<uint32_t>(deviceId), 0, kInfoSuperPodId, &v) == 0) {
+                superPodIdx = static_cast<uint32_t>(v);
+            }
+            localDesc_.loc.device.superDevId = sdid;
+            localDesc_.loc.device.serverIdx = serverIdx;
+            localDesc_.loc.device.superPodIdx = superPodIdx;
+            printf("[emsd] topology: deviceId=%d phyId=%d sdid=%u serverIdx=%u superPodIdx=%u\n", deviceId, phyId,
+                   sdid, serverIdx, superPodIdx);
+        }
     }
 
     HcommResult ret = api_.HcommEndpointCreate(&localDesc_, &endpoint_);
@@ -252,6 +282,25 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     seg.linked = true;
     printf("[emsd] LinkServer created, poolId=%u segIndex=%u channel=0x%llx\n", seg.poolId, segIndex,
            (unsigned long long)seg.channel);
+    // 诊断（联调期可回退）：后台轮询 server 侧通道状态，观察握手推进到哪一步。
+    // 状态语义（对齐 MemFabric hcomm_api_wrapper）：READY=0 / IN_PROGRESS=1 / FAILED=2 / TIMEOUT=3。
+    {
+        ChannelHandle ch = seg.channel;
+        const uint32_t poolId = seg.poolId, segIdx = segIndex;
+        std::thread([this, ch, poolId, segIdx] {
+            for (int i = 0; i < 12; ++i) {
+                int32_t status = -1;
+                const int r = api_.HcommChannelGetStatus(&ch, 1, &status);
+                printf("[emsd] chStatus poolId=%u segIndex=%u r=%d status=%d (0=READY 1=IN_PROGRESS 2=FAILED 3=TIMEOUT)\n",
+                       poolId, segIdx, r, status);
+                fflush(stdout);
+                if (r != 0 || status == 0 || status == 2 || status == 3) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+            }
+        }).detach();
+    }
     return KV_OK;
 }
 

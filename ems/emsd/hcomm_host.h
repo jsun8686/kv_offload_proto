@@ -88,6 +88,7 @@ private:
     EmsdSeg segs_[KV_MAX_SEG_NUM]{};
     // device 模式上下文重绑状态（BindDeviceCtx 用）
     int32_t (*aclrtSetDeviceFn_)(int32_t) = nullptr;
+    int32_t (*rtGetDeviceInfoFn_)(uint32_t, int32_t, int32_t, int64_t *) = nullptr;  // 内部接口，可能缺失
     int32_t deviceId_ = -1;
     bool hostLoc_ = true;
 };
