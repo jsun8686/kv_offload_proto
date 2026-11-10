@@ -24,7 +24,7 @@ extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(GM_ADDR argsBuf)
     Hcomm<COMM_PROTOCOL_UBC_CTP> hcomm;
     int32_t ret = hcomm.Init(ws, KVC_HCOMM_WS_SIZE);
     if (ret != 0) {
-        KvcStatusSet(w, 1, 0x100 + ret);
+        KvcStatusFinish(w, 0x100 + static_cast<uint64_t>(ret));
         KvcKernelEpilogue();
         return;
     }
@@ -43,8 +43,8 @@ extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(GM_ADDR argsBuf)
             GM_ADDR dst = reinterpret_cast<GM_ADDR>(args->segBase + (segLayer + segRow) * args->rowBytes);
             ret = hcomm.template WriteNbi<false>(args->channel, dst, src, args->rowBytes);
             if (ret != 0) {
-                KvcStatusSet(w, 1, 0x200 + ((l * args->rowCnt + (row - args->rowLo)) & 0xFF) +
-                                           (static_cast<uint64_t>(ret) << 16));
+                KvcStatusFinish(w, 0x200 + ((l * args->rowCnt + (row - args->rowLo)) & 0xFF) +
+                                        (static_cast<uint64_t>(ret) << 16));
                 KvcKernelEpilogue();
                 return;
             }
@@ -55,13 +55,13 @@ extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(GM_ADDR argsBuf)
 
     ret = hcomm.Commit(args->channel);
     if (ret != 0) {
-        KvcStatusSet(w, 1, 0x300 + ret);
+        KvcStatusFinish(w, 0x300 + static_cast<uint64_t>(ret));
         KvcKernelEpilogue();
         return;
     }
     KvcStatusSet(w, 0, KVC_STAGE_COMMIT_OK);
     ret = hcomm.Drain(args->channel);
-    const uint64_t done = (queued << 40) | (1ULL << 32) | static_cast<uint64_t>(ret == 0 ? 0 : 0x400 + ret);
-    KvcStatusSet(w, 1, done);
+    KvcStatusSet(w, 1, queued);  // 诊断区：搬运行数（poll 不读）
+    KvcStatusFinish(w, ret == 0 ? 0 : 0x400 + static_cast<uint64_t>(ret));
     KvcKernelEpilogue();
 }

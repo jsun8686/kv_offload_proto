@@ -237,5 +237,13 @@ class EmsPool:
             for b in range(block_dim):
                 rc = _kvops.poll_status(status + s * 64 + b * 8, timeout_us)
                 if rc != 0:
+                    # 负哨兵为 poll 自身失败（与内核 errCode 分开报，避免误读为内核错误）
+                    if rc == -0x1000:
+                        raise RuntimeError(
+                            "kv op poll memcpy failed on node {} block {}".format(s, b))
+                    if rc == -0x2000:
+                        raise RuntimeError(
+                            "kv op poll timeout on node {} block {} (kernel doneSeq not set in {:.0f}s)".format(
+                                s, b, timeout_us / 1e6))
                     raise RuntimeError("kv op failed on node {} block {}: errCode=0x{:x}".format(
                         s, b, rc & 0xFFFFFFFF))

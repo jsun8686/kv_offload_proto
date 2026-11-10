@@ -27,7 +27,7 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(GM_ADDR argsBuf)
     const int32_t endPos = startPos + static_cast<int32_t>(args->positionsPerCore);
     const int32_t posEnd = (endPos > totalPos) ? totalPos : endPos;
     if (startPos >= posEnd) {
-        KvcStatusSet(w, 1, (1ULL << 32));  // 空分片：直接置完成
+        KvcStatusFinish(w, 0);  // 空分片：直接置完成
         KvcKernelEpilogue();
         return;
     }
@@ -39,7 +39,7 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(GM_ADDR argsBuf)
     Hcomm<COMM_PROTOCOL_UBC_CTP> hcomm;
     int32_t ret = hcomm.Init(ws, KVC_HCOMM_WS_SIZE);
     if (ret != 0) {
-        KvcStatusSet(w, 1, 0x100 + ret);
+        KvcStatusFinish(w, 0x100 + static_cast<uint64_t>(ret));
         KvcKernelEpilogue();
         return;
     }
@@ -76,7 +76,7 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(GM_ADDR argsBuf)
         GM_ADDR dst = reinterpret_cast<GM_ADDR>(args->hotRowBase + static_cast<uint64_t>(slot) * args->rowBytes);
         ret = hcomm.template ReadNbi<false>(args->channel, dst, src, args->rowBytes);
         if (ret != 0) {
-            KvcStatusSet(w, 1, 0x200 + (static_cast<uint64_t>(pos) & 0xFF) + (static_cast<uint64_t>(ret) << 16));
+            KvcStatusFinish(w, 0x200 + (static_cast<uint64_t>(pos) & 0xFF) + (static_cast<uint64_t>(ret) << 16));
             KvcKernelEpilogue();
             return;
         }
@@ -85,12 +85,12 @@ extern "C" __global__ __aicore__ void kvc_gather_rows(GM_ADDR argsBuf)
 
     ret = hcomm.Commit(args->channel);
     if (ret != 0) {
-        KvcStatusSet(w, 1, 0x300 + ret);
+        KvcStatusFinish(w, 0x300 + static_cast<uint64_t>(ret));
         KvcKernelEpilogue();
         return;
     }
     ret = hcomm.Drain(args->channel);
-    const uint64_t done = (queued << 40) | (1ULL << 32) | static_cast<uint64_t>(ret == 0 ? 0 : 0x400 + ret);
-    KvcStatusSet(w, 1, done);
+    KvcStatusSet(w, 1, queued);  // 诊断区：搬运行数（poll 不读）
+    KvcStatusFinish(w, ret == 0 ? 0 : 0x400 + static_cast<uint64_t>(ret));
     KvcKernelEpilogue();
 }

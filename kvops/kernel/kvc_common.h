@@ -15,7 +15,11 @@ using namespace AscendC;
 
 constexpr uint32_t KVC_HCOMM_WS_SIZE = 512;  // HCOMM_URMA_TMP_BUF_SIZE
 
-// status 槽（GM，8B）：errCode u32 + doneSeq u32；整页 64B 经 UB+DataCopy(MTE3) 写回
+// status 槽协议（GM，ub(0) 单槽 8B = statusAddr + blockIdx*8）：
+//   非终态：低 32 位=阶段码（E2/E3/E4），高 32 位=0（host poll 继续等待）；
+//   终态：  (doneSeq=1 << 32) | errCode —— host 判 (val>>32)==1 后取低 32 位。
+//   ub(1) 起为诊断区（如 queued 计数），poll 不读；整页 64B 经 UB+DataCopy(MTE3) 写回。
+//   注意：终态必须写 ub(0)（联调实证：写 ub(1) 时 poll 永远等不到 doneSeq，60s 超时）。
 constexpr uint64_t KVC_STATUS_PENDING = 0;
 constexpr uint64_t KVC_STAGE_INIT_OK = 0xE2;
 constexpr uint64_t KVC_STAGE_QUEUE_OK = 0xE3;
@@ -65,6 +69,12 @@ static inline __aicore__ void KvcStatusSet(KvcStatusWriter &w, uint32_t idx, uin
     }
     w.ub(idx) = value;
     KvcStatusFlush(w);
+}
+
+// 终态写回（ub(0) 单槽）：(doneSeq=1 << 32) | (errCode & 0xFFFFFFFF)，host poll 由此判定完成
+static inline __aicore__ void KvcStatusFinish(KvcStatusWriter &w, uint64_t errCode)
+{
+    KvcStatusSet(w, 0, (1ULL << 32) | (errCode & 0xFFFFFFFFULL));
 }
 
 // c310 收尾 flush（950 平台约定，fatbin 纯设备编译需手动补齐）
