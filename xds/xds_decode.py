@@ -140,7 +140,7 @@ def main() -> int:
     hbm = torch.zeros((args.layers, args.layer_rows, row_bytes // 4), dtype=torch.int32, device=dev)
 
     master_ip, master_port = args.ems_master.rsplit(":", 1)
-    from xds.xds_ems_pool import EmsPool
+    from xds.xds_ems_pool import EmsPool, _kvops
     from xds.xds_offload import XdsOffloadCoordinator
 
     fatbin = args.fatbin
@@ -230,6 +230,10 @@ def main() -> int:
                              hbm[layer_id, hot_rows_base:], args.req_num, args.topk,
                              block_dim=args.block_dim)
         pool.wait(st, block_dim=args.block_dim)
+        if _kvops is not None:
+            # gather 诊断区（每 block 槽 +8）的 queued 计数：0=未搬运（条件链 skip），>0=已提交 WQE
+            queued = [_kvops.peek_status(st + b * 64 + 8) for b in range(args.block_dim)]
+            log("[xds] gather queued per block: {}".format(queued))
         dt = time.perf_counter() - t0
         t_read_total += dt
 
@@ -273,8 +277,12 @@ def main() -> int:
             expect = row_word(row, layer_id, 0)
             got = int(hbm_sync[(hot_rows_base + slot) * (row_bytes // 4)])
             if got != expect:
+                base_w = (hot_rows_base + slot) * (row_bytes // 4)
+                words4 = hbm_sync[base_w:base_w + 4].tolist()
+                exp4 = [row_word(row, layer_id, w) for w in range(4)]
                 log("[xds][ERROR] verify failed step={} layer={} req={} token={} row={} slot={} expect={} "
-                    "got={}".format(step, layer_id, r, token_pos, row, slot, expect, got))
+                    "got={} words4={} exp4={}".format(step, layer_id, r, token_pos, row, slot, expect, got,
+                                                      [hex(w) for w in words4], [hex(w) for w in exp4]))
                 return 1
             checked += 1
         log("[xds] step {}: layer={} miss={} rows in {:.1f} us (checked={})".format(
