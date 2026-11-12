@@ -103,11 +103,12 @@ extern "C" __global__ __aicore__ void gather_selection_rmt(
     LocalTensor<int32_t> statusLocal = statusBuf.Get<int32_t>();
     LocalTensor<int32_t> actualLocal = actualBuf.Get<int32_t>();
 
-    // 远端回源（仅存在远端块时初始化；单流提交；V1.0 单通道，多通道去重 V2）
+    // 远端回源（仅存在远端块时初始化；单流提交；V2 多节点：去重通道集逐通道收尾）
     Hcomm<COMM_PROTOCOL_UBC_CTP> hcomm;
     bool hcommInited = false;
     bool rmtQueued = false;
-    ChannelHandle rmtCh = 0;
+    ChannelHandle rmtChs[8];  // 去重后的通道集（上限 8 节点；V0 实证多流共享 channel 丢 WQE，
+    uint32_t rmtChCnt = 0;    // 故仍单核单流提交，仅收尾按通道逐个 Commit+Drain）
     LocalTensor<uint8_t> ws = wsBuf.Get<uint8_t>();
     uint64_t totalActual = 0;
 
@@ -191,7 +192,21 @@ extern "C" __global__ __aicore__ void gather_selection_rmt(
                             KvcKernelEpilogue();
                             return;
                         }
-                        rmtCh = static_cast<ChannelHandle>(ch);
+                        bool known = false;
+                        for (uint32_t ci = 0; ci < rmtChCnt; ++ci) {
+                            if (rmtChs[ci] == static_cast<ChannelHandle>(ch)) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) {
+                            if (rmtChCnt >= sizeof(rmtChs) / sizeof(rmtChs[0])) {
+                                KvcStatusFinish(w, 0x180);
+                                KvcKernelEpilogue();
+                                return;
+                            }
+                            rmtChs[rmtChCnt++] = static_cast<ChannelHandle>(ch);
+                        }
                         rmtQueued = true;
                     }
                 }
@@ -224,7 +239,21 @@ extern "C" __global__ __aicore__ void gather_selection_rmt(
                             KvcKernelEpilogue();
                             return;
                         }
-                        rmtCh = static_cast<ChannelHandle>(ch);
+                        bool known = false;
+                        for (uint32_t ci = 0; ci < rmtChCnt; ++ci) {
+                            if (rmtChs[ci] == static_cast<ChannelHandle>(ch)) {
+                                known = true;
+                                break;
+                            }
+                        }
+                        if (!known) {
+                            if (rmtChCnt >= sizeof(rmtChs) / sizeof(rmtChs[0])) {
+                                KvcStatusFinish(w, 0x181);
+                                KvcKernelEpilogue();
+                                return;
+                            }
+                            rmtChs[rmtChCnt++] = static_cast<ChannelHandle>(ch);
+                        }
                         rmtQueued = true;
                     }
                 }
@@ -253,19 +282,21 @@ extern "C" __global__ __aicore__ void gather_selection_rmt(
         totalActual += static_cast<uint64_t>(actual);
     }
 
-    // 单流收尾：远端提交的全部 WQE 一次 Commit（与 WQE 同管道保序）+ Drain 后才可写终态
+    // 单流收尾：远端提交的全部 WQE 按通道逐个 Commit（与 WQE 同管道保序）+ Drain 后才可写终态
     if (rmtQueued) {
-        int32_t ret = hcomm.template Commit<PIPE_MTE3>(rmtCh);
-        if (ret != 0) {
-            KvcStatusFinish(w, 0x400 + static_cast<uint64_t>(ret));
-            KvcKernelEpilogue();
-            return;
-        }
-        ret = hcomm.Drain(rmtCh);
-        if (ret != 0) {
-            KvcStatusFinish(w, 0x500 + static_cast<uint64_t>(ret));
-            KvcKernelEpilogue();
-            return;
+        for (uint32_t ci = 0; ci < rmtChCnt; ++ci) {
+            int32_t ret = hcomm.template Commit<PIPE_MTE3>(rmtChs[ci]);
+            if (ret != 0) {
+                KvcStatusFinish(w, 0x400 + (static_cast<uint64_t>(ci) << 24) + (static_cast<uint64_t>(ret) & 0xFFFFFF));
+                KvcKernelEpilogue();
+                return;
+            }
+            ret = hcomm.Drain(rmtChs[ci]);
+            if (ret != 0) {
+                KvcStatusFinish(w, 0x500 + (static_cast<uint64_t>(ci) << 24) + (static_cast<uint64_t>(ret) & 0xFFFFFF));
+                KvcKernelEpilogue();
+                return;
+            }
         }
     }
     KvcStatusSet(w, 1, totalActual);  // 诊断区：总选取 token 数（poll 不读）

@@ -244,52 +244,77 @@ class EmsPool:
         return status
 
     # ── 完成等待：聚合 N 段状态槽 ────────────────────────────────────────────
-    # ==== V1.1：full 池两区导出（kv 大区 + rope 大区）并生成 full_rmt_* 三表 ====
-    # 远端段布局：[kv 大区: F_BLK 块 × BS*kvDim fp16][rope 大区: F_BLK 块 × BS*ropeDim fp16]
+    # ==== V1.1/V2：full 池两区导出（每段 kv 大区 + rope 大区）并生成 full_rmt_* 三表 ====
+    # 段内布局：[kv 大区: per_node 块 × BS*kvDim fp16][rope 大区: per_node 块 × BS*ropeDim fp16]（满容量对齐，尾段留洞）
+    # 行交错分布（kv_layout 语义，stripe_rows=1）：全局行 r → 段 r%n、段内行 r//n，
+    # 段 s 的段内连续区 = 全局行 {t*n+s}。导出构造"全局交错源"（[段][段内行] 转置为 [段内行][段]），
+    # 一次全区 batch_write 由内核 KvcNodeOf 自动分发到各段；段内两区连续故表寻址为段内字节偏移。
     # 内核寻址约定（gather_selection_rmt）：块内 kv 连续 / 块内 rope 连续，addr 表给每块基址。
-    # perm[q] = 块 q 落入的远端槽位（None 恒等）；调用方保证 EmsPool 以
-    # layer_num=1、layer_rows=总行数(kv 行 + rope 行)、row_bytes=kv_dim*2 实例化。
+    # perm[q] = 块 q 的全局槽位（None 恒等：段 q//per_node、槽 q%per_node）。
     def export_full_rmt_pool(self, full_kv, full_rope, block_size: int, kv_dim: int, rope_dim: int,
                              perm=None, stream: int = 0):
         if self.pool is None or not self.channels:
             raise RuntimeError("pool not created")
+        n = self.node_num
         f_blk = full_kv.shape[0]
         if full_kv.shape != (f_blk, block_size, kv_dim) or full_rope.shape != (f_blk, block_size, rope_dim):
             raise ValueError("pool/source shape mismatch: kv={} rope={}".format(full_kv.shape, full_rope.shape))
         if self.row_bytes != kv_dim * 2:
             raise ValueError("pool row_bytes {} != kv_dim*2 {}".format(self.row_bytes, kv_dim * 2))
-        kv_rows = f_blk * block_size
-        if kv_rows * kv_dim * 2 % self.row_bytes or f_blk * block_size * rope_dim * 2 % self.row_bytes:
-            raise ValueError("region bytes not multiple of row_bytes %d" % self.row_bytes)
-        rope_rows = f_blk * block_size * rope_dim * 2 // self.row_bytes
-        if kv_rows + rope_rows > self.layer_rows:
-            raise ValueError("pool rows {} < kv {} + rope {}".format(self.layer_rows, kv_rows, rope_rows))
+        if block_size * rope_dim * 2 % self.row_bytes:
+            raise ValueError("rope block bytes not multiple of row_bytes %d" % self.row_bytes)
+        if self.stripe_rows != 1:
+            raise ValueError("export layout requires stripe_rows=1 (row interleave), got %d" % self.stripe_rows)
 
+        per_node = (f_blk + n - 1) // n
+        seg_rows = per_node * block_size * (kv_dim + rope_dim) // kv_dim  # 每段满容量行数
+        if self.layer_rows < n * seg_rows:
+            raise ValueError("pool rows {} < {}x{} (per-node seg rows)".format(self.layer_rows, n, seg_rows))
+
+        dev = full_kv.device
         if perm is None:
-            src_kv, src_rope = full_kv, full_rope
-            slot = torch.arange(f_blk, dtype=torch.int64)
+            gslot = torch.arange(f_blk, dtype=torch.int64, device=dev)
         else:
-            slot = perm.to(torch.int64)
-            if slot.shape[0] != f_blk or sorted(slot.tolist()) != list(range(f_blk)):
+            gslot = perm.to(torch.int64).to(dev)
+            if gslot.shape[0] != f_blk or sorted(gslot.tolist()) != list(range(f_blk)):
                 raise ValueError("perm must be a permutation of [0, f_blk)")
-            inv = torch.empty_like(slot)
-            inv[slot] = torch.arange(f_blk, dtype=torch.int64)  # inv[s]=块：槽 s 存哪块
-            src_kv = full_kv[inv].contiguous()
-            src_rope = full_rope[inv].contiguous()
+        route = gslot // per_node   # 块 q 所在段
+        slot = gslot % per_node     # 段内槽位
 
-        st = self.batch_write_alllayers(0, kv_rows, src_kv.data_ptr(), 0, stream=stream)
-        self.wait(st)
-        st = self.batch_write_alllayers(kv_rows, rope_rows, src_rope.data_ptr(), 0, stream=stream)
+        # 段内容：[n, per_node*BS, D]（kv/rope 各一份，槽序连续；尾段不满留 0）
+        seg_kv = torch.zeros((n, per_node * block_size, kv_dim), dtype=full_kv.dtype, device=dev)
+        seg_rope = torch.zeros((n, per_node * block_size, rope_dim), dtype=full_rope.dtype, device=dev)
+        for s in range(n):
+            mask = (route == s)
+            cnt = int(mask.sum())
+            if cnt == 0:
+                continue
+            idx = torch.nonzero(mask).flatten()   # 块 q 列表
+            order = torch.argsort(slot[mask])     # 段内槽序 → 连续源重排
+            seg_kv[s, :cnt * block_size] = full_kv[idx[order]].reshape(cnt * block_size, kv_dim)
+            seg_rope[s, :cnt * block_size] = full_rope[idx[order]].reshape(cnt * block_size, rope_dim)
+
+        # 段内行流：[kv 区 per_node*BS 行（每行 kv_dim 元素=整行）][rope 区字节流按行切]
+        row_elems = self.row_bytes // 2
+        kv_rows_full = per_node * block_size
+        rope_rows_full = per_node * block_size * rope_dim * 2 // self.row_bytes
+        seg_stream = torch.zeros((n, seg_rows, row_elems), dtype=full_kv.dtype, device=dev)
+        seg_stream[:, :kv_rows_full, :kv_dim] = seg_kv
+        seg_stream[:, kv_rows_full:, :] = seg_rope.reshape(n, rope_rows_full, row_elems)
+        # 全局交错源：[段][段内行] → 转置 [段内行][段] → 展平（全局行 x = t*n + s）
+        gsrc = seg_stream.transpose(0, 1).reshape(n * seg_rows, row_elems).contiguous()
+        st = self.batch_write_alllayers(0, n * seg_rows, gsrc.data_ptr(), 0, stream=stream)
         self.wait(st)
 
-        seg = self.pool.segments[0]
-        ch = self.channels[0]
+        # 三表：段内字节偏移（kv 区满容量偏移对齐 rope 区，与段内容构造一致）
         blk_kv_bytes = block_size * kv_dim * 2
         blk_rope_bytes = block_size * rope_dim * 2
-        rope_region_off = kv_rows * self.row_bytes
-        rmt_channel = torch.full((f_blk,), int(ch), dtype=torch.int64, device=full_kv.device)
-        rmt_kv_addr = seg.seg_base + slot.to(full_kv.device) * blk_kv_bytes
-        rmt_rope_addr = seg.seg_base + rope_region_off + slot.to(full_kv.device) * blk_rope_bytes
+        rope_region_off = kv_rows_full * self.row_bytes
+        seg_base = torch.tensor([s.seg_base for s in self.pool.segments[:n]], dtype=torch.int64, device=dev)
+        chn = torch.tensor([int(c) for c in self.channels[:n]], dtype=torch.int64, device=dev)
+        rmt_channel = chn[route]
+        rmt_kv_addr = seg_base[route] + slot * blk_kv_bytes
+        rmt_rope_addr = seg_base[route] + rope_region_off + slot * blk_rope_bytes
         return rmt_channel, rmt_kv_addr, rmt_rope_addr
 
     def wait(self, status: int, timeout_us: int = 60_000_000, block_dim: int = 1) -> None:
