@@ -96,4 +96,36 @@ struct HispSieveHtInitArgs {
     uint32_t reserved;
 };
 
+// ── gather_selection_kv_cache 远端池适配版（V2，接口同构 + full_rmt_* 三表）──
+// 语义基准：cann-recipes-infer test_npu_gather_selection_kv_cache.py golden（:96-136 基础路径）
+// 数据布局：热池/本地池均 [BlkNum, BLOCK_SIZE, D]（D 按 2B 元素计），页表 int32，账本 [TOPK+1] int32。
+// V1.0：本地路径（channel==0）+ 远端分支预留；V1.1：ReadNbi 回源接入。
+struct GatherSelectionRmtArgs {
+    uint64_t selKRope;          // [S_BLOCK_NUM, BS, K_ROPE] 热池 rope 区（原地写）
+    uint64_t selKvCache;        // [S_BLOCK_NUM, BS, KV_CACHE] 热池 kv 区（原地写）
+    uint64_t selBlockTable;     // [rows, S_MAX_BLOCK_NUM] int32 热池页表（rows=B*S*H）
+    uint64_t selBlockStatus;    // [B,S,H,TOPK+1] int32 账本（原地写；末位=长度）
+    uint64_t topkIndices;       // [B,S,H,TOPK] int32 topk 块段 id
+    uint64_t fullKRope;         // 本地池（纯远端传空：kRopeDim==0 跳过）
+    uint64_t fullKvCache;       // 本地池（纯远端传空）
+    uint64_t fullBlockTable;    // [B, F_MAX_BLOCK_NUM] int32 逻辑→物理块（原样使用）
+    uint64_t fullKvActualSeq;   // [B] int32
+    uint64_t fullQActualSeq;    // [B] int32
+    uint64_t rmtChannel;        // [F_BLOCK_NUM] int64 物理块→ChannelHandle（0=本地）
+    uint64_t rmtKvAddr;         // [F_BLOCK_NUM] int64 物理块→远端 kv 块基址
+    uint64_t rmtRopeAddr;       // [F_BLOCK_NUM] int64 物理块→远端 rope 块基址
+    uint64_t status;            // 内核 status 槽（kvc_common 64B 协议）
+    uint64_t actualSeq;         // [rows] int32 输出
+    uint32_t batch, seq, head;  // rows = batch*seq*head（head 恒 1）
+    uint32_t topk;
+    uint32_t blockSize;         // BLOCK_SIZE（物理块 token 数）
+    uint32_t fullMaxBlockNum;   // 页表列数
+    uint32_t selMaxBlockNum;
+    uint32_t fullKvBlockNum;    // 本地池物理块数（越界防御）
+    uint32_t selTopKBlockSize;  // topk 段粒度
+    uint32_t kvCacheDim;        // KV_CACHE 维（2B 元素数；0=纯远端）
+    uint32_t kRopeDim;          // K_ROPE 维（0=int8 空 rope 惯例）
+    uint32_t reserved;
+};
+
 #endif  // KVC_ARGS_H

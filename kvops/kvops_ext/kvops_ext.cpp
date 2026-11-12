@@ -80,6 +80,7 @@ void *g_fnGather = nullptr;
 void *g_fnScatterAll = nullptr;
 void *g_fnSieveUpdate = nullptr;
 void *g_fnSieveHtInit = nullptr;
+void *g_fnGatherSelRmt = nullptr;
 void *g_overflowBuf = nullptr;
 bool g_inited = false;
 
@@ -105,7 +106,7 @@ int64_t Gcd(int64_t a, int64_t b)
 
 void LaunchCommon(void *fn, const void *argsStruct, size_t argsSize, uint32_t blockDim, uint64_t stream)
 {
-    uint8_t buf[160];
+    uint8_t buf[512];  // GatherSelectionRmtArgs(160B)+尾槽 超出旧 160B 上限后扩容
     // 尾槽（工具链为 kernel 恒追加的 8B device buffer 地址参数）按 8B 对齐放置：
     // 结构体 sizeof 非 8 倍数时（如 KvcScatterAllArgs=76B）直接接在末尾会把尾槽放到
     // 非对齐偏移，kernel 侧按对齐 ABI 读到的就是垃圾地址
@@ -181,10 +182,10 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
     if (ret != 0 || g_binary == nullptr) {
         throw std::runtime_error("BinaryLoadFromFile ret=" + std::to_string(ret) + " path=" + fatbinPath);
     }
-    const char *names[4] = {"kvc_gather_rows", "kvc_scatter_rows_alllayer", "hisp_sieve_update",
-                            "hisp_sieve_ht_init"};
-    void **fns[4] = {&g_fnGather, &g_fnScatterAll, &g_fnSieveUpdate, &g_fnSieveHtInit};
-    for (int i = 0; i < 4; i++) {
+    const char *names[5] = {"kvc_gather_rows", "kvc_scatter_rows_alllayer", "hisp_sieve_update",
+                            "hisp_sieve_ht_init", "gather_selection_rmt"};
+    void **fns[5] = {&g_fnGather, &g_fnScatterAll, &g_fnSieveUpdate, &g_fnSieveHtInit, &g_fnGatherSelRmt};
+    for (int i = 0; i < 5; i++) {
         ret = rt.aclrtBinaryGetFunction(g_binary, names[i], fns[i]);
         if (ret != 0 || *fns[i] == nullptr) {
             throw std::runtime_error(std::string("GetFunction ") + names[i] + " ret=" + std::to_string(ret));
@@ -393,6 +394,55 @@ void kv_sieve_ht_init(uint64_t deviceBufferTokens, uint64_t deviceBufferHt, uint
     LaunchCommon(g_fnSieveHtInit, &args, sizeof(args), blockDim, stream);
 }
 
+// gather_selection_kv_cache 远端池适配版（V2，doc/npu_gather_selection_kv_cache_rmt.md）。
+// channel==0 走本地 DataCopyPad（V1.0）；非 0 走 ReadNbi 回源（V1.1，需 EmsPool 建链与三表）。
+void kv_gather_selection_rmt(uint64_t selKRope, uint64_t selKvCache, uint64_t selBlockTable,
+                             uint64_t selBlockStatus, uint64_t topkIndices, uint64_t fullKRope,
+                             uint64_t fullKvCache, uint64_t fullBlockTable, uint64_t fullKvActualSeq,
+                             uint64_t fullQActualSeq, uint64_t rmtChannel, uint64_t rmtKvAddr,
+                             uint64_t rmtRopeAddr, uint64_t status, uint64_t actualSeq, uint32_t batch,
+                             uint32_t seq, uint32_t head, uint32_t topk, uint32_t blockSize,
+                             uint32_t fullMaxBlockNum, uint32_t selMaxBlockNum, uint32_t fullKvBlockNum,
+                             uint32_t selTopKBlockSize, uint32_t kvCacheDim, uint32_t kRopeDim,
+                             uint64_t stream, uint32_t blockDim)
+{
+    EnsureInited();
+    if (head != 1) {
+        throw std::runtime_error("gather_selection_rmt: head must be 1 (MLA shared KV)");
+    }
+    if (blockSize % selTopKBlockSize != 0) {
+        throw std::runtime_error("gather_selection_rmt: blockSize must be divisible by selTopKBlockSize");
+    }
+    GatherSelectionRmtArgs args{};
+    args.selKRope = selKRope;
+    args.selKvCache = selKvCache;
+    args.selBlockTable = selBlockTable;
+    args.selBlockStatus = selBlockStatus;
+    args.topkIndices = topkIndices;
+    args.fullKRope = fullKRope;
+    args.fullKvCache = fullKvCache;
+    args.fullBlockTable = fullBlockTable;
+    args.fullKvActualSeq = fullKvActualSeq;
+    args.fullQActualSeq = fullQActualSeq;
+    args.rmtChannel = rmtChannel;
+    args.rmtKvAddr = rmtKvAddr;
+    args.rmtRopeAddr = rmtRopeAddr;
+    args.status = status;
+    args.actualSeq = actualSeq;
+    args.batch = batch;
+    args.seq = seq;
+    args.head = head;
+    args.topk = topk;
+    args.blockSize = blockSize;
+    args.fullMaxBlockNum = fullMaxBlockNum;
+    args.selMaxBlockNum = selMaxBlockNum;
+    args.fullKvBlockNum = fullKvBlockNum;
+    args.selTopKBlockSize = selTopKBlockSize;
+    args.kvCacheDim = kvCacheDim;
+    args.kRopeDim = kRopeDim;
+    LaunchCommon(g_fnGatherSelRmt, &args, sizeof(args), blockDim, stream);
+}
+
 void kv_close()
 {
     if (g_binary != nullptr) {
@@ -434,5 +484,14 @@ PYBIND11_MODULE(_kvops, m)
           py::arg("prefill_lens"), py::arg("req_start"), py::arg("num_reqs"), py::arg("layer_num"),
           py::arg("pool_size"), py::arg("device_buffer_size"), py::arg("padded_buffer_size"),
           py::arg("ht_size"), py::arg("stream") = 0, py::arg("block_dim") = 0);
+    m.def("gather_selection_rmt", &kv_gather_selection_rmt, py::arg("sel_k_rope"), py::arg("sel_kv_cache"),
+          py::arg("sel_block_table"), py::arg("sel_block_status"), py::arg("topk_indices"),
+          py::arg("full_k_rope"), py::arg("full_kv_cache"), py::arg("full_block_table"),
+          py::arg("full_kv_actual_seq"), py::arg("full_q_actual_seq"), py::arg("rmt_channel"),
+          py::arg("rmt_kv_addr"), py::arg("rmt_rope_addr"), py::arg("status"), py::arg("actual_seq"),
+          py::arg("batch"), py::arg("seq"), py::arg("head"), py::arg("topk"), py::arg("block_size"),
+          py::arg("full_max_block_num"), py::arg("sel_max_block_num"), py::arg("full_kv_block_num"),
+          py::arg("sel_topk_block_size"), py::arg("kv_cache_dim"), py::arg("k_rope_dim"),
+          py::arg("stream") = 0, py::arg("block_dim") = 1);
     m.def("close", &kv_close);
 }
