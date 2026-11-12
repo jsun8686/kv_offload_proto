@@ -33,10 +33,11 @@ F_MAX_BLK, F_BLK_NUM = 16, 64      # full 页表列数 / 物理块数
 S_MAX_BLK = 16                      # 每行 selection 页表列数
 
 
-def golden(topk_idx, full_tbl, kv_seq, q_seq, full_kv, full_rope, sel_tbl, bs=BLOCK_SIZE, topk_bs=TOPK_BS):
+def golden(topk_idx, full_tbl, kv_seq, q_seq, full_kv, full_rope, sel_tbl, bs=BLOCK_SIZE, topk_bs=TOPK_BS,
+           kv_dim=KV_DIM, rope_dim=ROPE_DIM):
     rows = B * S * H
-    sel_kv = torch.zeros((F_BLK_NUM, bs, KV_DIM), dtype=full_kv.dtype)
-    sel_rope = torch.zeros((F_BLK_NUM, bs, ROPE_DIM), dtype=full_rope.dtype)
+    sel_kv = torch.zeros((full_kv.shape[0], bs, kv_dim), dtype=full_kv.dtype)
+    sel_rope = torch.zeros((full_rope.shape[0], bs, rope_dim), dtype=full_rope.dtype)
     status = torch.full((rows, TOPK + 1), -1, dtype=torch.int32)
     actual = torch.zeros(rows, dtype=torch.int32)
     for row in range(rows):

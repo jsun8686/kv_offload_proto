@@ -244,6 +244,54 @@ class EmsPool:
         return status
 
     # ── 完成等待：聚合 N 段状态槽 ────────────────────────────────────────────
+    # ==== V1.1：full 池两区导出（kv 大区 + rope 大区）并生成 full_rmt_* 三表 ====
+    # 远端段布局：[kv 大区: F_BLK 块 × BS*kvDim fp16][rope 大区: F_BLK 块 × BS*ropeDim fp16]
+    # 内核寻址约定（gather_selection_rmt）：块内 kv 连续 / 块内 rope 连续，addr 表给每块基址。
+    # perm[q] = 块 q 落入的远端槽位（None 恒等）；调用方保证 EmsPool 以
+    # layer_num=1、layer_rows=总行数(kv 行 + rope 行)、row_bytes=kv_dim*2 实例化。
+    def export_full_rmt_pool(self, full_kv, full_rope, block_size: int, kv_dim: int, rope_dim: int,
+                             perm=None, stream: int = 0):
+        if self.pool is None or not self.channels:
+            raise RuntimeError("pool not created")
+        f_blk = full_kv.shape[0]
+        if full_kv.shape != (f_blk, block_size, kv_dim) or full_rope.shape != (f_blk, block_size, rope_dim):
+            raise ValueError("pool/source shape mismatch: kv={} rope={}".format(full_kv.shape, full_rope.shape))
+        if self.row_bytes != kv_dim * 2:
+            raise ValueError("pool row_bytes {} != kv_dim*2 {}".format(self.row_bytes, kv_dim * 2))
+        kv_rows = f_blk * block_size
+        if kv_rows * kv_dim * 2 % self.row_bytes or f_blk * block_size * rope_dim * 2 % self.row_bytes:
+            raise ValueError("region bytes not multiple of row_bytes %d" % self.row_bytes)
+        rope_rows = f_blk * block_size * rope_dim * 2 // self.row_bytes
+        if kv_rows + rope_rows > self.layer_rows:
+            raise ValueError("pool rows {} < kv {} + rope {}".format(self.layer_rows, kv_rows, rope_rows))
+
+        if perm is None:
+            src_kv, src_rope = full_kv, full_rope
+            slot = torch.arange(f_blk, dtype=torch.int64)
+        else:
+            slot = perm.to(torch.int64)
+            if slot.shape[0] != f_blk or sorted(slot.tolist()) != list(range(f_blk)):
+                raise ValueError("perm must be a permutation of [0, f_blk)")
+            inv = torch.empty_like(slot)
+            inv[slot] = torch.arange(f_blk, dtype=torch.int64)  # inv[s]=块：槽 s 存哪块
+            src_kv = full_kv[inv].contiguous()
+            src_rope = full_rope[inv].contiguous()
+
+        st = self.batch_write_alllayers(0, kv_rows, src_kv.data_ptr(), 0, stream=stream)
+        self.wait(st)
+        st = self.batch_write_alllayers(kv_rows, rope_rows, src_rope.data_ptr(), 0, stream=stream)
+        self.wait(st)
+
+        seg = self.pool.segments[0]
+        ch = self.channels[0]
+        blk_kv_bytes = block_size * kv_dim * 2
+        blk_rope_bytes = block_size * rope_dim * 2
+        rope_region_off = kv_rows * self.row_bytes
+        rmt_channel = torch.full((f_blk,), int(ch), dtype=torch.int64, device=full_kv.device)
+        rmt_kv_addr = seg.seg_base + slot.to(full_kv.device) * blk_kv_bytes
+        rmt_rope_addr = seg.seg_base + rope_region_off + slot.to(full_kv.device) * blk_rope_bytes
+        return rmt_channel, rmt_kv_addr, rmt_rope_addr
+
     def wait(self, status: int, timeout_us: int = 60_000_000, block_dim: int = 1) -> None:
         if _kvops is None:
             raise RuntimeError("kvops ext missing")
