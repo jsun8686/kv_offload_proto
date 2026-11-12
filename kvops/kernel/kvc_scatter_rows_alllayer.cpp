@@ -67,7 +67,12 @@ extern "C" __global__ __aicore__ void kvc_scatter_rows_alllayer(uint64_t channel
                 continue;
             }
             const uint64_t segRow = KvcSegRowOf(row, args->stripeRows, args->nodeNum);
-            GM_ADDR src = reinterpret_cast<GM_ADDR>(srcLayer + static_cast<uint64_t>(row) * args->rowBytes);
+            // src 基址语义 = 本次调用区域的第 0 行（row_lo 相对寻址）：
+            // export_full_rmt_pool 第二段导出传 rope 区首行 + row_lo=kv_rows，
+            // 若按绝对行号乘 rowBytes 会从 src 越界 256KB 读到已被 zero_() 的 sel 区，
+            // 远端 rope 表被写成全 0（gather 读回全 0，实测 rope mismatch 且 sel_rope 0/512 非零）
+            GM_ADDR src = reinterpret_cast<GM_ADDR>(srcLayer +
+                                                    static_cast<uint64_t>(row - args->rowLo) * args->rowBytes);
             GM_ADDR dst = reinterpret_cast<GM_ADDR>(args->segBase + (segLayer + segRow) * args->rowBytes);
             ret = hcomm.template WriteNbi<false>(args->channel, dst, src, args->rowBytes);
             if (ret != 0) {
