@@ -1,4 +1,4 @@
-# kv_offload_proto — XDS KV Cache AIV 直驱卸载原型
+﻿# kv_offload_proto — XDS KV Cache AIV 直驱卸载原型
 
 按《doc/kv_offload_design.md》实现：单仓三组件（ems / kvops / xds），数据面 HCOMM AIV 内核直驱
 （fatbin 显式加载链 + WithHostArgs + args+overflow 尾槽 + MTE3 status + c310 epilogue）；
@@ -54,7 +54,7 @@ python -m xds.xds_decode ... --oracle
 
 | 锚点 | 位置 |
 |---|---|
-| 行归属映射（每层均衡） | `common/kv_layout.h` ↔ 内核 `KvcNodeOf/KvcSegRowOf`（Python 对拍：`test/kv_layout_ref.py`） |
+| 行归属映射（每层均衡） | `common/kv_layout.h` ↔ 内核 `KvcNodeOf/KvcSegRowOf`（Python 对拍：`tests/kv_layout_ref.py`） |
 | SIEVE 哈希（Knuth 散列+backward-shift 删除） | `kvops/kernel/hisp_kernel_common.h`（哈希-only；visited 位图 /8） |
 | sieve 派生公式（htSize/reqsPerCore/UB 预算） | `kvops_ext.cpp kv_sieve_update`（与 sglang-0730 host 派生严格一致） |
 | launch 参数（host/内核共用布局） | `kvops/kernel/kvc_args.h`（args + 8B overflow 尾槽） |
