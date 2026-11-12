@@ -218,14 +218,17 @@ class EmsPool:
         # （对齐 sglang hisparse_lru_host.cpp 的 get_npu_stream；stream 0 上内核会读到 torch 写入前的旧值）
         if stream == 0:
             stream = torch.npu.current_stream().npu_stream
-        status = self.next_status(block_dim)
+        status = self.next_status(self.node_num * block_dim)
         layer_offset = layer_id * self.per_layer_seg_rows
         for s in range(self.node_num):
             seg = self.pool.segments[s]
+            # 每段独占槽区：内核按 blockIdx*64 相对各自基址写（wait 用 (s*block_dim+b)*64 寻址）。
+            # 传同一基址会让 N 段全部写 slot0——nodeNum>1 时段 s≥1 的槽全 0 超时（实测 dev3 导出）
+            seg_status = status + s * block_dim * 64
             _kvops.import_seg(self.channels[s], seg.seg_base, layer_offset, self.per_layer_seg_rows,
                               self.row_bytes, _ptr(topk_indices), _ptr(req_pool_indices), _ptr(req_host_base),
                               _ptr(topk_device_slots), _ptr(is_miss), _ptr(num_real), _ptr(hot_row_base), top_k,
-                              max_num_reqs, self.stripe_rows, self.node_num, s, status, stream, block_dim)
+                              max_num_reqs, self.stripe_rows, self.node_num, s, seg_status, stream, block_dim)
         return status
 
     # ── 批量写（prefill 全层连续区间导出）───────────────────────────────────
@@ -235,12 +238,14 @@ class EmsPool:
             raise RuntimeError("pool not created")
         if stream == 0:  # 同 batch_read：对齐 torch_npu 当前流
             stream = torch.npu.current_stream().npu_stream
-        status = self.next_status(block_dim)
+        status = self.next_status(self.node_num * block_dim)
         for s in range(self.node_num):
             seg = self.pool.segments[s]
+            # 同 batch_read：每段独占槽区（dev3 nodeNum=2 导出实测段 1 槽全 0 超时）
+            seg_status = status + s * block_dim * 64
             _kvops.export_seg_alllayer(self.channels[s], seg.seg_base, self.per_layer_seg_rows, self.row_bytes,
                                        row_lo, row_cnt, self.layer_num, _ptr(src_layer0_base), src_layer_stride,
-                                       self.stripe_rows, self.node_num, s, status, stream, block_dim)
+                                       self.stripe_rows, self.node_num, s, seg_status, stream, block_dim)
         return status
 
     # ── 完成等待：聚合 N 段状态槽 ────────────────────────────────────────────
