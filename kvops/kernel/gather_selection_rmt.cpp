@@ -170,7 +170,7 @@ extern "C" __global__ __aicore__ void gather_selection_rmt(
                         DataCopyPad(kvSeg, fullKvView[static_cast<int64_t>(fBlk) * bs * kvDim + fOff * kvDim],
                                     cpKv, padParams);
                         PipeBarrier<PIPE_ALL>();
-                        DataCopyPad(selKvView[dstKvBase], kvSeg, cpKv, padParams);
+                        DataCopyPad(selKvView[dstKvBase], kvSeg, cpKv);  // UB→GM 为 3 参（无 pad）
                     } else {
                         if (!hcommInited) {
                             int32_t ret = hcomm.Init(ws, KVC_HCOMM_WS_SIZE);
@@ -203,7 +203,7 @@ extern "C" __global__ __aicore__ void gather_selection_rmt(
                                                           fOff * ropeDim],
                                     cpRope, padParams);
                         PipeBarrier<PIPE_ALL>();
-                        DataCopyPad(selRopeView[dstRopeBase], ropeSeg, cpRope, padParams);
+                        DataCopyPad(selRopeView[dstRopeBase], ropeSeg, cpRope);  // UB→GM 为 3 参（无 pad）
                     } else {
                         if (!hcommInited) {
                             int32_t ret = hcomm.Init(ws, KVC_HCOMM_WS_SIZE);
@@ -243,12 +243,12 @@ extern "C" __global__ __aicore__ void gather_selection_rmt(
         GlobalTensor<int32_t> statusRow;
         statusRow.SetGlobalBuffer(statusGmPtr + static_cast<int64_t>(row) * (topk + 1));
         DataCopyExtParams cpStatus{1, static_cast<uint32_t>((topk + 1) * sizeof(int32_t)), 0, 0, 0};
-        DataCopyPad(statusRow, statusLocal, cpStatus, padParams);
+        DataCopyPad(statusRow, statusLocal, cpStatus);  // UB→GM 为 3 参（无 pad）
         actualLocal.SetValue(0, actual);
         GlobalTensor<int32_t> actualOne;
         actualOne.SetGlobalBuffer(actualGmPtr + row);
         DataCopyExtParams cpActual{1, sizeof(int32_t), 0, 0, 0};
-        DataCopyPad(actualOne, actualLocal, cpActual, padParams);
+        DataCopyPad(actualOne, actualLocal, cpActual);  // UB→GM 为 3 参（无 pad）
         PipeBarrier<PIPE_ALL>();
         totalActual += static_cast<uint64_t>(actual);
     }
