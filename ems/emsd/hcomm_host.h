@@ -44,6 +44,8 @@ struct EmsdSeg {
     std::string channelTag;
     bool linked = false;      // LINK_EXCHANGE 完成（server 通道已建）
     ChannelHandle channel = 0;
+    bool remoteImported = false;       // LINK_EXCHANGE 导入的对端 mem 是否未释放（重跑前必须 Unimport）
+    std::vector<uint8_t> peerMemDesc;  // 对端 memDesc 副本：供 SegRelease 精确 Unimport（重复 import 同 desc 会失败 -4）
 };
 
 class EmsdHcomm {
