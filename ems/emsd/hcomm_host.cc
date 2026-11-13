@@ -13,9 +13,25 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+namespace {
+// 握手阶段计时（联调插桩）：定位建链 35s 花在 ChannelCreate 内部还是 READY 轮询期
+const char *TsNow()
+{
+    static thread_local char buf[32];
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    tm tmv{};
+    localtime_r(&ts.tv_sec, &tmv);
+    (void)snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                   static_cast<int>(ts.tv_nsec / 1000000));
+    return buf;
+}
+}  // namespace
 
 // LINK_EXCHANGE 帧内 desc 缓冲与 EndpointDesc ABI 的锚定：hcomm 头文件升级导致
 // sizeof(EndpointDesc) 变化时此处编译失败，避免再次线上才发现 KV_EP_DESC_BUF 不够用
@@ -255,7 +271,9 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     // 导入对端（框架/NPU 侧）内存描述：本端 host 大块对框架可见，框架侧内存对本端可见
     // （数据面单边直驱仅要求对端可写本段，import 为交换协议完整性保留）
     CommMem remoteMem{};
+    printf("[emsd] %s LinkServer MemImport enter, segIndex=%u\n", TsNow(), segIndex);
     HcommResult ret = api_.HcommMemImport(endpoint_, peerMemDesc, peerMemDescLen, &remoteMem);
+    printf("[emsd] %s LinkServer MemImport ret=%d, segIndex=%u\n", TsNow(), ret, segIndex);
     if (ret != 0) {
         printf("[emsd][ERROR] MemImport failed, poolId=%u segIndex=%u ret=%d\n", seg.poolId, segIndex, ret);
         return KV_ERR_HCOMM;
@@ -271,7 +289,10 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     chDesc.port = seg.hcommListenPort;
     chDesc.qos = 0;
     chDesc.channelName = const_cast<char *>(seg.channelTag.c_str());
+    printf("[emsd] %s LinkServer ChannelCreate(server) enter, segIndex=%u port=%u\n", TsNow(), segIndex,
+           seg.hcommListenPort);
     ret = api_.HcommChannelCreate(endpoint_, COMM_ENGINE_AIV, &chDesc, 1, &seg.channel);
+    printf("[emsd] %s LinkServer ChannelCreate(server) ret=%d, segIndex=%u\n", TsNow(), ret, segIndex);
     if (ret != 0 || seg.channel == 0) {
         printf("[emsd][ERROR] ChannelCreate(AIV,server) failed, poolId=%u segIndex=%u port=%u ret=%d\n", seg.poolId,
                segIndex, seg.hcommListenPort, ret);
@@ -290,16 +311,24 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
         const uint32_t poolId = seg.poolId, segIdx = segIndex;
         std::thread([this, ch, poolId, segIdx] {
             (void)BindDeviceCtx();  // GetStatus 依赖线程私有 device 上下文
-            for (int i = 0; i < 12; ++i) {
+            int32_t lastStatus = -99;
+            for (int i = 0; i < 120; ++i) {  // 120s 窗口 @1s：覆盖 35s 握手全程，翻转即打时间戳
                 int32_t status = -1;
                 const int r = api_.HcommChannelGetStatus(&ch, 1, &status);
-                printf("[emsd] chStatus poolId=%u segIndex=%u r=%d status=%d (0=READY 1=IN_PROGRESS 2=FAILED 3=TIMEOUT)\n",
-                       poolId, segIdx, r, status);
+                if (status != lastStatus || i % 10 == 0) {
+                    printf("[emsd] %s chStatus poolId=%u segIndex=%u r=%d status=%d (0=READY 1=IN_PROGRESS 2=FAILED "
+                           "3=TIMEOUT)%s\n",
+                           TsNow(), poolId, segIdx, r, status, status != lastStatus ? " FLIP" : "");
+                    lastStatus = status;
+                }
+                if (status == 0) {
+                    break;
+                }
                 fflush(stdout);
                 if (r != 0 || status == 0 || status == 2 || status == 3) {
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+                std::this_thread::sleep_for(std::chrono::seconds(1));
             }
         }).detach();
     }

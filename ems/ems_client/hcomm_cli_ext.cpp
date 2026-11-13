@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,6 +26,19 @@
 namespace py = pybind11;
 
 namespace {
+// 握手阶段计时：定位建链 35s 花在 ChannelCreate 调用内部还是返回后的状态轮询期
+const char *TsNow()
+{
+    static thread_local char buf[32];
+    timespec ts{};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    tm tmv{};
+    localtime_r(&ts.tv_sec, &tmv);
+    (void)snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                   static_cast<int>(ts.tv_nsec / 1000000));
+    return buf;
+}
+
 struct DynApi {
     int32_t (*aclrtSetDevice)(int32_t);
     int32_t (*aclrtGetPhyDevIdByLogicDevId)(int32_t, int32_t *);
@@ -215,19 +229,28 @@ py::tuple cli_link_channel(const std::string &peerDescBytes, uint16_t hcommPort,
     chDesc.qos = 0;
     chDesc.channelName = const_cast<char *>(channelTag.c_str());
     ChannelHandle channel = 0;
+    printf("[cli] %s ChannelCreate(client) enter, port=%u\n", TsNow(), hcommPort);
     HcommResult ret = g_api.HcommChannelCreate(g_endpoint, COMM_ENGINE_AIV, &chDesc, 1, &channel);
+    printf("[cli] %s ChannelCreate(client) ret=%d, port=%u\n", TsNow(), hcommPort);
     if (ret != 0 || channel == 0) {
         throw std::runtime_error("ChannelCreate(client) ret=" + std::to_string(ret) + " port=" +
                                  std::to_string(hcommPort));
     }
     // 状态语义（对齐 MemFabric hcomm_api_wrapper）：READY=0 / IN_PROGRESS=1 / FAILED=2 / TIMEOUT=3。
     // 只认 0 会把 FAILED/TIMEOUT 吞成"等满超时"，握手失败的真实原因不可见——必须区分并报出。
+    // 联调插桩：状态翻转即打时间戳（区分耗时在 Create 内部还是轮询期；轮询间隔 100ms）
+    int32_t lastStatus = -99;
     for (uint32_t waited = 0; waited < readyTimeoutSec * 10U; waited++) {
         int32_t status = -1;
         ret = g_api.HcommChannelGetStatus(&channel, 1, &status);
         if (ret != 0) {
             (void)g_api.HcommChannelDestroy(&channel, 1);
             throw std::runtime_error("ChannelGetStatus ret=" + std::to_string(ret));
+        }
+        if (status != lastStatus) {
+            printf("[cli] %s status %d -> %d, port=%u waited=%u.%us\n", TsNow(), lastStatus, status, hcommPort,
+                   waited / 10U, (waited % 10U) * 100U);
+            lastStatus = status;
         }
         if (status == 0) {  // READY
             printf("[cli] channel READY, port=%u channel=0x%llx\n", hcommPort, (unsigned long long)channel);
@@ -237,10 +260,6 @@ py::tuple cli_link_channel(const std::string &peerDescBytes, uint16_t hcommPort,
             (void)g_api.HcommChannelDestroy(&channel, 1);
             throw std::runtime_error(std::string("channel handshake ") + (status == 2 ? "FAILED" : "TIMEOUT") +
                                      ", port=" + std::to_string(hcommPort));
-        }
-        if (waited % 50U == 0U) {  // 每 5s 报一次进展（IN_PROGRESS=1 或其他未知值）
-            printf("[cli] channel status=%d (0=READY 1=IN_PROGRESS 2=FAILED 3=TIMEOUT), port=%u waited=%u.%us\n",
-                   status, hcommPort, waited / 10U, (waited % 10U) * 100U);
         }
         usleep(100 * 1000);
     }
