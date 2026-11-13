@@ -303,10 +303,13 @@ class EmsPool:
             raise ValueError("pool rows {} < {}x{} (per-node seg rows)".format(self.layer_rows, n, seg_rows))
 
         dev = full_kv.device
+        # 块路由索引只有 f_blk(≈32) 个元素，全程 CPU 计算：
+        # 避开 torch_npu 在 NPU 上建 int64 中间张量的 internal-format 告警，
+        # 以及 int64 ArgSort 落到 AiCPU 的告警；最后按需 .to(dev) 供高级索引使用。
         if perm is None:
-            gslot = torch.arange(f_blk, dtype=torch.int64, device=dev)
+            gslot = torch.arange(f_blk, dtype=torch.int64)
         else:
-            gslot = perm.to(torch.int64).to(dev)
+            gslot = perm.detach().to("cpu", torch.int64)
             if gslot.shape[0] != f_blk or sorted(gslot.tolist()) != list(range(f_blk)):
                 raise ValueError("perm must be a permutation of [0, f_blk)")
         route = gslot // per_node   # 块 q 所在段
@@ -320,10 +323,11 @@ class EmsPool:
             cnt = int(mask.sum())
             if cnt == 0:
                 continue
-            idx = torch.nonzero(mask).flatten()   # 块 q 列表
-            order = torch.argsort(slot[mask])     # 段内槽序 → 连续源重排
-            seg_kv[s, :cnt * block_size] = full_kv[idx[order]].reshape(cnt * block_size, kv_dim)
-            seg_rope[s, :cnt * block_size] = full_rope[idx[order]].reshape(cnt * block_size, rope_dim)
+            idx = torch.nonzero(mask).flatten()   # 块 q 列表（CPU）
+            order = torch.argsort(slot[mask])     # 段内槽序 → 连续源重排（CPU）
+            idx = idx[order].to(dev)
+            seg_kv[s, :cnt * block_size] = full_kv[idx].reshape(cnt * block_size, kv_dim)
+            seg_rope[s, :cnt * block_size] = full_rope[idx].reshape(cnt * block_size, rope_dim)
 
         # 段内行流：[kv 区 per_node*BS 行（每行 kv_dim 元素=整行）][rope 区字节流按行切]
         row_elems = self.row_bytes // 2
@@ -343,6 +347,8 @@ class EmsPool:
         rope_region_off = kv_rows_full * self.row_bytes
         seg_base = torch.tensor([s.seg_base for s in self.pool.segments[:n]], dtype=torch.int64, device=dev)
         chn = torch.tensor([int(c) for c in self.channels[:n]], dtype=torch.int64, device=dev)
+        route = route.to(dev)
+        slot = slot.to(dev)
         rmt_channel = chn[route]
         rmt_kv_addr = seg_base[route] + slot * blk_kv_bytes
         rmt_rope_addr = seg_base[route] + rope_region_off + slot * blk_rope_bytes
