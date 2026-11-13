@@ -193,15 +193,29 @@ class EmsPool:
         return addr
 
     def destroy(self) -> None:
+        # 控制面尽力清理：任一阶段失败仅告警不抛出（联调实证：emsd 侧 SegRelease/等 worker
+        # 应答可阻塞超过 client 超时，raise 会掩盖已通过的 golden 结论并留僵尸状态）
         if _cli is not None:
             for h in self.channels:
-                _cli.channel_destroy(h)
+                try:
+                    _cli.channel_destroy(h)
+                except Exception as e:  # noqa: BLE001
+                    print("[pool] warn: channel_destroy 0x%x failed: %s" % (int(h), e))
             if self.pool is not None:
-                _cli.close()
+                try:
+                    _cli.close()
+                except Exception as e:  # noqa: BLE001
+                    print("[pool] warn: cli close failed: %s" % e)
         if _kvops is not None:
-            _kvops.close()
+            try:
+                _kvops.close()
+            except Exception as e:  # noqa: BLE001
+                print("[pool] warn: kvops close failed: %s" % e)
         if self.pool is not None:
-            self._ems.pool_destroy(self.pool.pool_id)
+            try:
+                self._ems.pool_destroy(self.pool.pool_id)
+            except Exception as e:  # noqa: BLE001
+                print("[pool] warn: pool_destroy failed (emsd 侧可能仍在清理，检查 emsd 日志): %s" % e)
             self.pool = None
         self._ems.close()
 

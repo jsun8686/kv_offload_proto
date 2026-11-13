@@ -324,13 +324,19 @@ int EmsdHcomm::SegRelease(uint32_t segIndex, bool destroyChannel)
         return KV_ERR_NOT_FOUND;
     }
     EmsdSeg &seg = segs_[segIndex];
+    printf("[emsd] SegRelease begin, poolId=%u segIndex=%u linked=%d ch=0x%llx\n", seg.poolId, segIndex,
+           seg.linked ? 1 : 0, (unsigned long long)seg.channel);
     if (destroyChannel && seg.linked && seg.channel != 0) {
+        printf("[emsd] SegRelease HcommChannelDestroy begin, segIndex=%u\n", segIndex);
         (void)api_.HcommChannelDestroy(&seg.channel, 1);
+        printf("[emsd] SegRelease HcommChannelDestroy done, segIndex=%u\n", segIndex);
     }
     if (seg.memHandle != nullptr) {
+        printf("[emsd] SegRelease HcommMemUnreg begin, segIndex=%u\n", segIndex);
         (void)api_.HcommMemUnreg(endpoint_, seg.memHandle);
+        printf("[emsd] SegRelease HcommMemUnreg done, segIndex=%u\n", segIndex);
     }
-    printf("[emsd] SegRelease, poolId=%u segIndex=%u\n", seg.poolId, segIndex);
+    printf("[emsd] SegRelease done, poolId=%u segIndex=%u\n", seg.poolId, segIndex);
     seg = EmsdSeg{};
     return KV_OK;
 }

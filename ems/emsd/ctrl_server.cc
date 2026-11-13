@@ -371,32 +371,45 @@ int EmsdCtrlServer::OnPoolCreate(const KvPoolCreateReq &req, int fd)
 int EmsdCtrlServer::OnPoolDestroy(uint32_t poolId, int fd)
 {
     // 广播 SEG_FREE（master 本地 + worker），逐节点尽力释放
+    // 联调实证：client 侧 120s 超时无响应，逐步打印定位阻塞点（本地释放/Connect/等 worker 应答）
+    printf("[emsd] PoolDestroy begin, poolId=%u members=%zu\n", poolId, cfg_.members.size());
     int status = KV_OK;
     for (const auto &m : cfg_.members) {
         if (m.nodeId == 0) {
+            printf("[emsd] PoolDestroy local SegRelease begin, poolId=%u\n", poolId);
             (void)hcomm_.SegRelease(0, true);
+            printf("[emsd] PoolDestroy local SegRelease done, poolId=%u\n", poolId);
             (void)pool_.SegFree(poolId, 0);
             continue;
         }
+        printf("[emsd] PoolDestroy connect worker %s:%u begin\n", m.ip.c_str(), m.ctrlPort);
         int fdw = Connect(m.ip, m.ctrlPort);
         if (fdw < 0) {
+            printf("[emsd] PoolDestroy connect worker %s:%u FAILED\n", m.ip.c_str(), m.ctrlPort);
             status = KV_ERR_IO;
             continue;
         }
+        printf("[emsd] PoolDestroy SEG_FREE -> worker node%u begin\n", m.nodeId);
         KvPoolDestroyReq req{poolId, m.nodeId};  // reserved 字段承载 segIndex（= nodeId）
         if (SendMsg(fdw, KV_CMD_SEG_FREE, &req, sizeof(req)) != 0) {
+            printf("[emsd] PoolDestroy SEG_FREE send to node%u FAILED\n", m.nodeId);
             status = KV_ERR_IO;
         } else {
             KvMsgHeader hdr{};
             std::vector<uint8_t> resp;
             if (RecvMsg(fdw, hdr, resp) != 0 || resp.size() < sizeof(KvGenericResp)) {
+                printf("[emsd] PoolDestroy SEG_FREE resp from node%u FAILED/timeout\n", m.nodeId);
                 status = KV_ERR_IO;
             } else if (reinterpret_cast<KvGenericResp *>(resp.data())->status != KV_OK) {
                 status = reinterpret_cast<KvGenericResp *>(resp.data())->status;
+                printf("[emsd] PoolDestroy SEG_FREE node%u status=%d\n", m.nodeId, status);
+            } else {
+                printf("[emsd] PoolDestroy SEG_FREE node%u ok\n", m.nodeId);
             }
         }
         close(fdw);
     }
+    printf("[emsd] PoolDestroy done, poolId=%u status=%d\n", poolId, status);
     KvGenericResp resp{status, 0};
     return SendResp(fd, KV_CMD_POOL_DESTROY, &resp, sizeof(resp));
 }
