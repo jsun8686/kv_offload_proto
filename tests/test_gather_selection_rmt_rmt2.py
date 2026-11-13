@@ -76,8 +76,9 @@ def main():
         route_cnt, "on" if args.perm else "off"))
 
     rows = B * S * H
-    full_tbl = torch.arange(B * F_MAX_BLK, dtype=torch.int32, device=dev).reshape(B, F_MAX_BLK) % F_BLK_NUM
-    sel_tbl = torch.arange(rows * S_MAX_BLK, dtype=torch.int32, device=dev).reshape(rows, S_MAX_BLK) % F_BLK_NUM
+    # CPU 上算好再搬上卡：NPU 上建 int32 中间张量会触发 internal-format 回退告警（数值无影响）
+    full_tbl = (torch.arange(B * F_MAX_BLK, dtype=torch.int32) % F_BLK_NUM).reshape(B, F_MAX_BLK).to(dev)
+    sel_tbl = (torch.arange(rows * S_MAX_BLK, dtype=torch.int32) % F_BLK_NUM).reshape(rows, S_MAX_BLK).to(dev)
     topk_idx = torch.randint(0, 24, (rows, TOPK), dtype=torch.int32, device=dev)
     topk_idx[:, 10:] = -1
     kv_seq = torch.tensor([32, 17], dtype=torch.int32, device=dev)

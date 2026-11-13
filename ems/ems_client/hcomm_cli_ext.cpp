@@ -231,7 +231,7 @@ py::tuple cli_link_channel(const std::string &peerDescBytes, uint16_t hcommPort,
     ChannelHandle channel = 0;
     printf("[cli] %s ChannelCreate(client) enter, port=%u\n", TsNow(), hcommPort);
     HcommResult ret = g_api.HcommChannelCreate(g_endpoint, COMM_ENGINE_AIV, &chDesc, 1, &channel);
-    printf("[cli] %s ChannelCreate(client) ret=%d, port=%u\n", TsNow(), hcommPort);
+    printf("[cli] %s ChannelCreate(client) ret=%d, port=%u\n", TsNow(), ret, hcommPort);
     if (ret != 0 || channel == 0) {
         throw std::runtime_error("ChannelCreate(client) ret=" + std::to_string(ret) + " port=" +
                                  std::to_string(hcommPort));
