@@ -88,10 +88,10 @@ torch_npu.npu_gather_selection_kv_cache_rmt(
 
 | 阶段 | 内容 | 验收 | 状态 |
 |---|---|---|---|
-| **V1.0 基建** | 内核骨架（本地回退路径）；args/launch；热池创建 | 本地模式（channel=0）与 golden 一致 | ✅ `tests/test_gather_selection_rmt.py` PASS |
+| **V1.0 基建** | 内核骨架（本地回退路径）；args/launch；热池创建 | 本地模式（channel=0）与 golden 一致 | ✅ `..._rmt.py` PASS |
 | **V1.1 单节点远端** | 读点分流 ReadNbi；两区导出；三表生成 | 单 emsd golden 对拍全绿 | ✅ `..._rmt.py` PASS（ropeDim 64/256 × perm） |
 | **V2 多节点** | 表路由多 channel；emsd 集群 | 跨节点段取回对拍 | ✅ `..._rmt2.py` PASS（恒等 + perm 乱序，[32,32]/node） |
-| **V3 生产对接** | torch 挂载；GLM 5.2 modeling +3 参；DSA 流水评估 | GLM 5.2 offload 围跑 | ⬜ |
+| **V3 生产对接** | torch 挂载；GLM 5.2 modeling +3 参；DSA 流水评估 | torch 层 e2e PASS（§10） | 🔶 挂载+文档就绪，NPU e2e/GLM 围跑待跑 |
 
 ## 7. 风险与开放问题
 
@@ -154,3 +154,38 @@ python -m tests.test_gather_selection_rmt_rmt --device 7 --ems-master <ip>:27000
 ```
 
 基准观测：channel READY ≈8.1s/条（时序探针优化后，曾 35s）；destroy 全链 <0.1s。
+
+## 10. torch 层挂载与 GLM 5.2 对接（V3）
+
+**挂载（已实现，`torchops/`）**：`load_gather_rmt_op()` 幂等属性挂载
+`torch_npu.npu_gather_selection_kv_cache_rmt`（对齐 GLM `custom_op_loader.load_offload_gather_op`
+形态，eager 路径；GE/npugraph converter 不在 V3 范围）。同步算子语义（poll 至完成）；
+底层 27 参 pybind，`stream=当前流`、`blockDim=1`。校验：dtype/shape/连续性/设备一致、
+空 full×channel 全非 0 互斥、head==1、整除约束。
+
+**GLM 5.2 调用点改造**（`modeling_glm.py` gather 调用处，+3 参）：
+
+```python
+# 原调用（10 参）追加：
+full_rmt_channel=offload_cache.rmt_channel,       # OffloadCache 持有 EmsPool 三表
+full_rmt_kv_addr=offload_cache.rmt_kv_addr,
+full_rmt_rope_addr=offload_cache.rmt_rope_addr,
+# full_k_rope/full_kv_cache 传空 int8 tensor（纯远端部署）
+```
+
+边界与挂账：OffloadCache 由 XDS 池管理器扮演（full 池生命周期 = EmsPool pool_create/destroy，
+导出时机 = DSA install 同位点）；BLOCK_SIZE 与 pa_max_length 对齐值待定；
+GLM 侧围跑在 cann-recipes-infer 环境单独验证。
+
+## 11. DSA install 流水评估（URMA 替代 H2D）
+
+| 维度 | 现状（H2D install） | rmt 方案（按需回源） |
+|---|---|---|
+| 数据路径 | Host swapped 内存 --PCIe--> HBM 热池 | 远端 EMS HBM --UBC/URMA--> HBM 热池 |
+| 搬运时机 | DSA install 整段预取 | gather 首次 miss 按需（topk 粒度） |
+| 带宽量级 | PCIe ~26GB/s（x8 Gen4） | URMA 实测待标定（V0 单流 0.06GB/s 为小包未优化值，多核+整块流为优化方向） |
+| CPU/H2D 争用 | 与权重加载争 PCIe | 独立超节点互连平面 |
+| 命中语义 | install 后热池才有效 | 账本式，miss 即回源，install 步骤可省 |
+
+结论：rmt 方案将"预取式 install"退化为"按需回源"，消除 H2D 步骤与 PCIe 争用；
+带宽优化（多核并行/整块流水）在多核阶段实施后复测。
