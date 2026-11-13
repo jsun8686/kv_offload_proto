@@ -83,6 +83,8 @@ void *g_fnSieveHtInit = nullptr;
 void *g_fnGatherSelRmt = nullptr;
 void *g_overflowBuf = nullptr;
 bool g_inited = false;
+int g_deviceId = -1;
+std::string g_fatbinPath;
 
 template <typename T>
 T Sym(const char *name)
@@ -147,7 +149,16 @@ void EnsureInited()
 void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtLibPath)
 {
     if (g_inited) {
-        throw std::runtime_error("kvops already inited");
+        // 幂等：同一进程内 local 测试路径与 EmsPool.create_pool 都会调 init；
+        // 同 device+同 fatbin 直接复用已加载的 binary/function（重复 SetDevice/Malloc/BinaryLoad
+        // 只会报错或泄漏）。参数不一致才是真错误，报错里带上已持有的值便于定位。
+        if (deviceId == g_deviceId && fatbinPath == g_fatbinPath) {
+            printf("[kvops] init skipped: already inited (device=%d)\n", deviceId);
+            return;
+        }
+        throw std::runtime_error("kvops already inited with device=" + std::to_string(g_deviceId) +
+                                 " fatbin=" + g_fatbinPath + ", refusing re-init with device=" +
+                                 std::to_string(deviceId) + " fatbin=" + fatbinPath);
     }
     rtLib = dlopen(rtLibPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (rtLib == nullptr) {
@@ -192,6 +203,8 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
         }
     }
     g_inited = true;
+    g_deviceId = deviceId;
+    g_fatbinPath = fatbinPath;
 }
 
 uint64_t kv_alloc_status(int count)
