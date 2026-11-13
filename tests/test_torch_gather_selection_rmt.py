@@ -52,7 +52,7 @@ def build_case(dev):
 def check(g, sel_kv, sel_rope, sel_tbl, status_out, actual_out, tag):
     g_kv, g_rope, g_status, g_actual = g
     assert torch.equal(actual_out.cpu(), g_actual), "[%s] actual_seq mismatch" % tag
-    assert torch.equal(status_out.cpu(), g_status), "[%s] block_status mismatch" % tag
+    assert torch.equal(status_out.view(B * S * H, TOPK + 1).cpu(), g_status), "[%s] block_status mismatch" % tag
     rows = B * S * H
     for row in range(rows):
         for k in range(TOPK):
