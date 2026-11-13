@@ -146,8 +146,13 @@ int EmsdCtrlServer::Run()
         if (cfd < 0) {
             continue;
         }
+        // 控制连接空闲回收超时：须显著长于 client 会话周期（pool_create → 建链握手 ×N
+        // 节点 → 数据面 → pool_destroy）。联调实证：60s（readyTimeoutSec）会在双节点
+        // 场景（2×35s 握手 ≈ 110s 空闲）提前杀掉 pool_destroy 的会话连接读者，
+        // 且 HandleConn 退出路径不 close fd（无 FIN/RST），client 侧 send 成功、
+        // recv 干等至自身超时——症状即"emsd 无任何 PoolDestroy 日志、全程空闲"。
         timeval tv{};
-        tv.tv_sec = static_cast<long>(cfg_.readyTimeoutSec);
+        tv.tv_sec = static_cast<long>(CTRL_CONN_IDLE_TIMEOUT_SEC);
         (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         std::thread(&EmsdCtrlServer::HandleConn, this, cfd).detach();
     }
@@ -155,19 +160,25 @@ int EmsdCtrlServer::Run()
 
 int EmsdCtrlServer::HandleConn(int fd)
 {
+    int ret = 0;
     while (true) {  // 连接上串行处理多条命令（LINK_EXCHANGE 复用连接）
         KvMsgHeader hdr{};
         std::vector<uint8_t> payload;
         if (RecvMsg(fd, hdr, payload) != 0) {
-            return 0;  // 对端关闭/协议错/读超时，断连即可
+            // 对端关闭/协议错/空闲超时（SO_RCVTIMEO）：断连并回收 fd。
+            // 原实现泄漏 cfd：无 FIN/RST，client 侧 send 成功但 recv 永久等待（联调实证）
+            printf("[emsd] ctrl conn closed/idle-timeout, fd=%d\n", fd);
+            break;
         }
         // 命令处理投放到专用线程：HCCP 上下文（RaInit/RaCtxInit/设备上下文）线程私有，
         // 在连接工作线程上直接调用 hcomm 会出现"建链日志在、握手不推进"的半失效
-        int ret = Dispatch(hdr.cmd, payload, fd);
+        ret = Dispatch(hdr.cmd, payload, fd);
         if (ret != 0) {
-            return ret;
+            break;
         }
     }
+    close(fd);
+    return ret;
 }
 
 int EmsdCtrlServer::Dispatch(uint16_t cmd, const std::vector<uint8_t> &payload, int fd)

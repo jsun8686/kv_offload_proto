@@ -6,6 +6,7 @@
 # 行分配连续性契约：alloc 优先返回连续行区间（decode 追加行同段延伸），离散段 ≤ 4 兜底
 # —— 内核侧 src 行号 = req_host_base[req] + tokenPos 的公式依赖此契约。
 
+import time
 from typing import List, Optional
 
 import torch
@@ -193,17 +194,26 @@ class EmsPool:
         return addr
 
     def destroy(self) -> None:
-        # 控制面尽力清理：任一阶段失败仅告警不抛出（联调实证：emsd 侧 SegRelease/等 worker
-        # 应答可阻塞超过 client 超时，raise 会掩盖已通过的 golden 结论并留僵尸状态）
+        # 控制面尽力清理：任一阶段失败仅告警不抛出（联调实证：emsd 侧拆池异常时 raise 会
+        # 掩盖已通过的 golden 结论并留僵尸状态）。全程阶段计时打印，与 emsd 日志对照定位。
+        t0 = time.time()
+
+        def _elap():
+            return time.time() - t0
+
         if _cli is not None:
             for h in self.channels:
                 try:
+                    print("[pool] channel_destroy 0x%x begin (+%.1fs)" % (int(h), _elap()))
                     _cli.channel_destroy(h)
+                    print("[pool] channel_destroy 0x%x done (+%.1fs)" % (int(h), _elap()))
                 except Exception as e:  # noqa: BLE001
                     print("[pool] warn: channel_destroy 0x%x failed: %s" % (int(h), e))
             if self.pool is not None:
                 try:
+                    print("[pool] cli close begin (+%.1fs)" % _elap())
                     _cli.close()
+                    print("[pool] cli close done (+%.1fs)" % _elap())
                 except Exception as e:  # noqa: BLE001
                     print("[pool] warn: cli close failed: %s" % e)
         if _kvops is not None:
@@ -213,9 +223,11 @@ class EmsPool:
                 print("[pool] warn: kvops close failed: %s" % e)
         if self.pool is not None:
             try:
-                self._ems.pool_destroy(self.pool.pool_id)
+                print("[pool] pool_destroy req begin (+%.1fs)" % _elap())
+                self._ems.pool_destroy(self.pool.pool_id, timeout_sec=300)
+                print("[pool] pool_destroy req done (+%.1fs)" % _elap())
             except Exception as e:  # noqa: BLE001
-                print("[pool] warn: pool_destroy failed (emsd 侧可能仍在清理，检查 emsd 日志): %s" % e)
+                print("[pool] warn: pool_destroy failed (检查 emsd 日志): %s" % e)
             self.pool = None
         self._ems.close()
 

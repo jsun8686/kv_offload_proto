@@ -49,6 +49,11 @@ struct EmsdConfig {
     std::vector<EmsdMember> members;  // 静态成员表（master 有效，含自身）
 };
 
+// 控制连接空闲回收超时（秒）：须覆盖 client 完整会话周期（pool_create → N 节点建链握手
+// → 数据面 → pool_destroy）。不可复用 readyTimeoutSec（60s，channel READY 诊断用）——
+// 双节点 2×35s 握手即超 60s，会话连接读者被误杀且 fd 泄漏致 client 侧 recv 永久等待。
+constexpr uint32_t CTRL_CONN_IDLE_TIMEOUT_SEC = 3600;
+
 class EmsdCtrlServer {
 public:
     explicit EmsdCtrlServer(const EmsdConfig &cfg);

@@ -53,11 +53,29 @@ class EmsClient:
                 size_bytes, layer_num, layer_rows, row_bytes))
         return pool
 
-    def pool_destroy(self, pool_id: int) -> None:
-        cmd, resp = self._request(kp.CMD_POOL_DESTROY, kp.encode_pool_destroy_req(pool_id))
-        status = kp.decode_generic_resp(resp)
-        if status != kp.KV_OK:
-            raise EmsError(status, "pool_destroy failed, poolId={}".format(pool_id))
+    def pool_destroy(self, pool_id: int, timeout_sec: float = None, reconnect_retry: bool = True) -> None:
+        # 拆池容忍会话连接被中间超时切断：首次失败后重连重试一次。
+        # 重试安全——emsd 侧 SEG_FREE/池释放幂等（已释放返回 NOT_FOUND，destroy 本就尽力而为）
+        try:
+            self._pool_destroy_once(pool_id, timeout_sec)
+        except (socket.timeout, OSError, EmsError):
+            if not reconnect_retry:
+                raise
+            self.close()
+            self.connect()
+            self._pool_destroy_once(pool_id, timeout_sec)
+
+    def _pool_destroy_once(self, pool_id: int, timeout_sec: float = None) -> None:
+        old = self._sock.gettimeout()
+        if timeout_sec is not None:
+            self._sock.settimeout(timeout_sec)
+        try:
+            cmd, resp = self._request(kp.CMD_POOL_DESTROY, kp.encode_pool_destroy_req(pool_id))
+            status = kp.decode_generic_resp(resp)
+            if status != kp.KV_OK:
+                raise EmsError(status, "pool_destroy failed, poolId={}".format(pool_id))
+        finally:
+            self._sock.settimeout(old)
 
     def link_exchange(self, seg: kp.SegmentInfo, endpoint_desc: bytes, mem_desc: bytes,
                       sock=None) -> int:
