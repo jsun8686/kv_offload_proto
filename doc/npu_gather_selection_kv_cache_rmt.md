@@ -1,6 +1,6 @@
 # 设计：npu_gather_selection_kv_cache × 远端内存池适配（V2 重构）
 
-> 状态：**V1.0 / V1.1 / V2 已验收**（本地 golden / 单节点远端 golden / 双节点多通道 golden 全绿，2026-11-13）
+> 状态：**V1.0 / V1.1 / V2 / V3(e2e) 已验收**（本地 / 单节点远端 / 双节点多通道 / torch 层全绿，2026-11-13；GLM 围跑挂账）
 > 上游参照：cann-recipes-infer `ops/ascendc/src/gather_selection_kv_cache`（AscendC 源）、
 > `models/glm_5_2`（对接模型）、`ops/ascendc/examples/test_npu_gather_selection_kv_cache.py`（golden 语义）
 
@@ -91,7 +91,7 @@ torch_npu.npu_gather_selection_kv_cache_rmt(
 | **V1.0 基建** | 内核骨架（本地回退路径）；args/launch；热池创建 | 本地模式（channel=0）与 golden 一致 | ✅ `..._rmt.py` PASS |
 | **V1.1 单节点远端** | 读点分流 ReadNbi；两区导出；三表生成 | 单 emsd golden 对拍全绿 | ✅ `..._rmt.py` PASS（ropeDim 64/256 × perm） |
 | **V2 多节点** | 表路由多 channel；emsd 集群 | 跨节点段取回对拍 | ✅ `..._rmt2.py` PASS（恒等 + perm 乱序，[32,32]/node） |
-| **V3 生产对接** | torch 挂载；GLM 5.2 modeling +3 参；DSA 流水评估 | torch 层 e2e PASS（§10） | 🔶 挂载+文档就绪，NPU e2e/GLM 围跑待跑 |
+| **V3 生产对接** | torch 挂载；GLM 5.2 modeling +3 参；DSA 流水评估 | torch 层 e2e PASS（§10） | ✅ e2e 双路径×2 轮 PASS；GLM 围跑挂账 |
 
 ## 7. 风险与开放问题
 
