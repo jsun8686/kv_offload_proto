@@ -1,6 +1,6 @@
 # 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
 
-> 状态：D1.0 实施中（单核远端 golden 先行；多核矩阵为 D2）
+> 状态：**D1.0 已验收**（单核远端 golden 恒等+perm 双 PASS，2026-11-17）；D1.1 torch 层实施中
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
 > H2D 透明搬运）；golden 基准 = 其 `golden.py`（miss_mask 唯一闸门 + sentinel 零搬运对拍）
 > 姊妹篇：`npu_gather_selection_kv_cache_rmt.md`（rmt 系工程范式/实证沉淀，本文复用其基建）
@@ -86,8 +86,8 @@ D2c 一轮矩阵同时回答 V0 遗留问题（多核共享 channel 并发提交
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **D1.0** | 文档 + 内核（多核结构、纯远端）+ args/launch/pybind + golden 测试 | 单核远端 golden PASS（恒等+perm） |
-| **D1.1** | torch 壳 `torchops/dsa_gather_rmt_op.py` → `torch_npu.npu_dsa_gather_rmt` + e2e | torch 层 PASS |
+| **D1.0** | 文档 + 内核（多核结构、纯远端）+ args/launch/pybind + golden 测试 | ✅ 单核远端 golden PASS（恒等+perm，records=256） |
+| **D1.1** | torch 壳 `torchops/dsa_gather_rmt_op.py` → `torch_npu.npu_dsa_gather_rmt` + e2e | 实施中（`tests/test_torch_dsa_gather_rmt.py`） |
 | **D2** | block-dim 矩阵实测（D2c → 依结果 D2a） | 多核 golden + 性能报告 + 丢 WQE 根因结论 |
 
 ## 7. 与 gather_selection_rmt 的关系

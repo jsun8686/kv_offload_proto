@@ -13,5 +13,7 @@
 """
 
 from torchops.gather_rmt_op import load_gather_rmt_op, npu_gather_selection_kv_cache_rmt
+from torchops.dsa_gather_rmt_op import load_dsa_gather_rmt_op, npu_dsa_gather_rmt
 
-__all__ = ["load_gather_rmt_op", "npu_gather_selection_kv_cache_rmt"]
+__all__ = ["load_gather_rmt_op", "npu_gather_selection_kv_cache_rmt",
+           "load_dsa_gather_rmt_op", "npu_dsa_gather_rmt"]
