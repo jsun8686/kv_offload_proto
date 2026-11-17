@@ -68,6 +68,7 @@ if(_TARGET STREQUAL "kernel" OR _TARGET STREQUAL "all")
         ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/hisp_sieve_update.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/hisp_sieve_ht_init.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/gather_selection_rmt.cpp
+${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/dsa_gather_rmt.cpp
     )
     if(COMMAND ascendc_include_directories)
         ascendc_include_directories(kvc_kernel PRIVATE

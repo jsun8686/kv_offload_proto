@@ -81,6 +81,7 @@ void *g_fnScatterAll = nullptr;
 void *g_fnSieveUpdate = nullptr;
 void *g_fnSieveHtInit = nullptr;
 void *g_fnGatherSelRmt = nullptr;
+void *g_fnDsaGatherRmt = nullptr;
 void *g_overflowBuf = nullptr;
 bool g_inited = false;
 int g_deviceId = -1;
@@ -193,10 +194,11 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
     if (ret != 0 || g_binary == nullptr) {
         throw std::runtime_error("BinaryLoadFromFile ret=" + std::to_string(ret) + " path=" + fatbinPath);
     }
-    const char *names[5] = {"kvc_gather_rows", "kvc_scatter_rows_alllayer", "hisp_sieve_update",
-                            "hisp_sieve_ht_init", "gather_selection_rmt"};
-    void **fns[5] = {&g_fnGather, &g_fnScatterAll, &g_fnSieveUpdate, &g_fnSieveHtInit, &g_fnGatherSelRmt};
-    for (int i = 0; i < 5; i++) {
+    const char *names[6] = {"kvc_gather_rows", "kvc_scatter_rows_alllayer", "hisp_sieve_update",
+                             "hisp_sieve_ht_init", "gather_selection_rmt", "dsa_gather_rmt"};
+    void **fns[6] = {&g_fnGather, &g_fnScatterAll, &g_fnSieveUpdate, &g_fnSieveHtInit, &g_fnGatherSelRmt,
+                     &g_fnDsaGatherRmt};
+    for (int i = 0; i < 6; i++) {
         ret = rt.aclrtBinaryGetFunction(g_binary, names[i], fns[i]);
         if (ret != 0 || *fns[i] == nullptr) {
             throw std::runtime_error(std::string("GetFunction ") + names[i] + " ret=" + std::to_string(ret));
@@ -456,6 +458,54 @@ void kv_gather_selection_rmt(uint64_t selKRope, uint64_t selKvCache, uint64_t se
     LaunchCommon(g_fnGatherSelRmt, &args, sizeof(args), blockDim, stream);
 }
 
+void kv_dsa_gather_rmt(uint64_t residentKv, uint64_t residentRope, uint64_t residentBlockTable,
+                       uint64_t hostBlockTable, uint64_t requestPoolIndices, uint64_t topkTokenPositions,
+                       uint64_t residentSlots, uint64_t missMask, uint64_t rmtChannel, uint64_t rmtKvAddr,
+                       uint64_t rmtRopeAddr, uint64_t status, uint32_t numRequests, uint32_t queryCount,
+                       uint32_t blockSize, uint32_t kvDim, uint32_t ropeDim, uint32_t kvElemSize,
+                       uint32_t ropeElemSize, uint32_t hostPoolCapacity, uint32_t hostTableWidth,
+                       uint32_t residentTableWidth, uint32_t hostBlkNum, uint32_t residentBlkNum,
+                       uint64_t stream, uint32_t blockDim)
+{
+    EnsureInited();
+    if (blockSize == 0 || queryCount == 0 || numRequests == 0) {
+        throw std::runtime_error("dsa_gather_rmt: blockSize/queryCount/numRequests must be positive");
+    }
+    if (kvElemSize == 0 || ropeElemSize == 0 || kvElemSize > 2 || ropeElemSize > 2) {
+        throw std::runtime_error("dsa_gather_rmt: elem size must be 1 (int8) or 2 (fp16/bf16)");
+    }
+    if (kvDim * kvElemSize % 32 != 0 || ropeDim * ropeElemSize % 32 != 0) {
+        throw std::runtime_error("dsa_gather_rmt: kv/rope record bytes must be 32B aligned");
+    }
+    DsaGatherRmtArgs args{};
+    args.residentKv = residentKv;
+    args.residentRope = residentRope;
+    args.residentBlockTable = residentBlockTable;
+    args.hostBlockTable = hostBlockTable;
+    args.requestPoolIndices = requestPoolIndices;
+    args.topkTokenPositions = topkTokenPositions;
+    args.residentSlots = residentSlots;
+    args.missMask = missMask;
+    args.rmtChannel = rmtChannel;
+    args.rmtKvAddr = rmtKvAddr;
+    args.rmtRopeAddr = rmtRopeAddr;
+    args.status = status;
+    args.numRequests = numRequests;
+    args.queryCount = queryCount;
+    args.blockSize = blockSize;
+    args.kvDim = kvDim;
+    args.ropeDim = ropeDim;
+    args.kvElemSize = kvElemSize;
+    args.ropeElemSize = ropeElemSize;
+    args.hostPoolCapacity = hostPoolCapacity;
+    args.hostTableWidth = hostTableWidth;
+    args.residentTableWidth = residentTableWidth;
+    args.hostBlkNum = hostBlkNum;
+    args.residentBlkNum = residentBlkNum;
+    args.residentInit = 0;  // V1 dense decode 布局
+    LaunchCommon(g_fnDsaGatherRmt, &args, sizeof(args), blockDim, stream);
+}
+
 void kv_close()
 {
     if (g_binary != nullptr) {
@@ -506,5 +556,14 @@ PYBIND11_MODULE(_kvops, m)
           py::arg("full_max_block_num"), py::arg("sel_max_block_num"), py::arg("full_kv_block_num"),
           py::arg("sel_topk_block_size"), py::arg("kv_cache_dim"), py::arg("k_rope_dim"),
           py::arg("stream") = 0, py::arg("block_dim") = 1);
+    m.def("dsa_gather_rmt", &kv_dsa_gather_rmt, py::arg("resident_kv"), py::arg("resident_rope"),
+          py::arg("resident_block_table"), py::arg("host_block_table"), py::arg("request_pool_indices"),
+          py::arg("topk_token_positions"), py::arg("resident_slots"), py::arg("miss_mask"),
+          py::arg("rmt_channel"), py::arg("rmt_kv_addr"), py::arg("rmt_rope_addr"), py::arg("status"),
+          py::arg("num_requests"), py::arg("query_count"), py::arg("block_size"), py::arg("kv_dim"),
+          py::arg("rope_dim"), py::arg("kv_elem_size"), py::arg("rope_elem_size"),
+          py::arg("host_pool_capacity"), py::arg("host_table_width"), py::arg("resident_table_width"),
+          py::arg("host_blk_num"), py::arg("resident_blk_num"), py::arg("stream") = 0,
+          py::arg("block_dim") = 1);
     m.def("close", &kv_close);
 }
