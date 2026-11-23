@@ -58,8 +58,39 @@ if(_TARGET STREQUAL "kernel" OR _TARGET STREQUAL "all")
     if(NOT ASC_DEVKIT_ROOT)
         set(ASC_DEVKIT_ROOT "$ENV{HOME}/asc-devkit" CACHE PATH "asc-devkit root for hcomm.h")
     endif()
-    if(NOT EXISTS ${ASC_DEVKIT_ROOT}/include/adv_api/hcomm/hcomm.h)
-        message(FATAL_ERROR "${ASC_DEVKIT_ROOT}/include/adv_api/hcomm/hcomm.h not found, set -DASC_DEVKIT_ROOT")
+    # hcomm 头文件定位（跨版本兼容）：
+    #   - CANN <= 9.1：asc-devkit 源码自带 include/adv_api/hcomm/hcomm.h（设备侧 Hcomm API）；
+    #   - CANN >= 9.2：asc-devkit 移除 hcomm 目录，HCOMM 头文件随 cann-hcomm 包发布在
+    #     ${ASCEND_HOME_PATH}/include/hcomm/（官方头文件布局，无 adv_api 前缀）。
+    # 内核源码统一按 "adv_api/hcomm/hcomm.h" 引用——探测到新布局时在构建目录生成
+    # adv_api/hcomm -> <cann>/include/hcomm 符号链接兼容目录，源码零改动。
+    set(KVOPS_HCOMM_INC_ROOT "")
+    foreach(kvops_cand IN ITEMS
+            "${ASC_DEVKIT_ROOT}/include"
+            "$ENV{ASCEND_HOME_PATH}/include"
+            "${ASCEND_CANN_PACKAGE_PATH}/include")
+        if(EXISTS "${kvops_cand}/adv_api/hcomm/hcomm.h")
+            set(KVOPS_HCOMM_INC_ROOT "${kvops_cand}")
+            break()
+        elseif(EXISTS "${kvops_cand}/hcomm/hcomm.h")
+            set(KVOPS_HCOMM_INC_ROOT "${kvops_cand}")
+            set(KVOPS_HCOMM_NEED_COMPAT 1)
+            break()
+        endif()
+    endforeach()
+    if(KVOPS_HCOMM_INC_ROOT STREQUAL "")
+        message(FATAL_ERROR
+            "hcomm.h not found (checked asc-devkit and CANN include dirs). "
+            "For CANN >= 9.2 install the cann-hcomm package, or set -DASC_DEVKIT_ROOT to a kit that bundles it.")
+    endif()
+    if(KVOPS_HCOMM_NEED_COMPAT)
+        set(KVOPS_HCOMM_COMPAT_DIR ${CMAKE_CURRENT_BINARY_DIR}/hcomm_compat)
+        file(MAKE_DIRECTORY ${KVOPS_HCOMM_COMPAT_DIR}/adv_api)
+        if(NOT EXISTS ${KVOPS_HCOMM_COMPAT_DIR}/adv_api/hcomm)
+            execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink
+                    ${KVOPS_HCOMM_INC_ROOT}/hcomm ${KVOPS_HCOMM_COMPAT_DIR}/adv_api/hcomm)
+        endif()
+        set(KVOPS_HCOMM_INC_ROOT ${KVOPS_HCOMM_COMPAT_DIR})
     endif()
 
     ascendc_fatbin_library(kvc_kernel
@@ -73,12 +104,12 @@ ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/dsa_gather_rmt.cpp
     if(COMMAND ascendc_include_directories)
         ascendc_include_directories(kvc_kernel PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel
-            ${ASC_DEVKIT_ROOT}/include
+            ${KVOPS_HCOMM_INC_ROOT}
         )
     else()
         target_include_directories(kvc_kernel PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel
-            ${ASC_DEVKIT_ROOT}/include
+            ${KVOPS_HCOMM_INC_ROOT}
         )
     endif()
 endif()
