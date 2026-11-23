@@ -330,6 +330,7 @@ static inline HcommResult HcommChannelDescInit(HcommChannelDesc *channelDesc, ui
         channelDesc->role = HCOMM_SOCKET_ROLE_RESERVED;
         channelDesc->port = 0;
         channelDesc->channelName = NULL;
+        (void)memset_s(channelDesc->raws, sizeof(channelDesc->raws), 0, sizeof(channelDesc->raws));
         if (EndpointDescInit(&channelDesc->remoteEndpoint, 1) != 0) {
             return hcommEInternal;
         }
