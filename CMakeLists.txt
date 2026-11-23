@@ -60,13 +60,16 @@ if(_TARGET STREQUAL "kernel" OR _TARGET STREQUAL "all")
     endif()
     # hcomm 头文件定位（跨版本兼容）：
     #   - CANN <= 9.1：asc-devkit 源码自带 include/adv_api/hcomm/hcomm.h（设备侧 Hcomm API）；
-    #   - CANN >= 9.2：asc-devkit 移除 hcomm 目录，HCOMM 头文件随 cann-hcomm 包发布在
-    #     ${ASCEND_HOME_PATH}/include/hcomm/（官方头文件布局，无 adv_api 前缀）。
-    # 内核源码统一按 "adv_api/hcomm/hcomm.h" 引用——探测到新布局时在构建目录生成
+    #   - CANN >= 9.2：asc-devkit 移除 hcomm 目录，设备侧 C++ API 迁至 toolkit 自带目录
+    #     ${ASCEND_HOME_PATH}/aarch64-linux/asc/include/adv_api/hcomm/（platform_v220/v310 双平台）；
+    #     对外 C API 头在 ${ASCEND_HOME_PATH}/include/hcomm/（无 adv_api 前缀）。
+    # 内核源码统一按 "adv_api/hcomm/hcomm.h" 引用——命中无前缀布局时在构建目录生成
     # adv_api/hcomm -> <cann>/include/hcomm 符号链接兼容目录，源码零改动。
     set(KVOPS_HCOMM_INC_ROOT "")
     foreach(kvops_cand IN ITEMS
             "${ASC_DEVKIT_ROOT}/include"
+            "$ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include"
+            "${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/asc/include"
             "$ENV{ASCEND_HOME_PATH}/include"
             "${ASCEND_CANN_PACKAGE_PATH}/include")
         if(EXISTS "${kvops_cand}/adv_api/hcomm/hcomm.h")
