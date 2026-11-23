@@ -74,14 +74,24 @@ int EmsdDynApi::Load(const std::string &libPath)
 }
 
 int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int32_t deviceId,
-                    const std::string &rootinfoPath, bool hostLoc, const std::string &hostAddr)
+                    const std::string &rootinfoPath, bool hostLoc, const std::string &hostAddr, bool roce,
+                    const std::string &devIp)
 {
     libPath_ = hcommLib;
     hostLoc_ = hostLoc;
     deviceId_ = deviceId;
+    roce_ = roce;
+    devIp_ = devIp;
     std::array<uint8_t, EMS_EID_LEN> eid{};
     int32_t phyId = -1;
 
+    if (roce) {
+        // v2（A3 + AICPU 数据面）：仍走 device 上下文（endpoint 在 device 侧），但地址用 RoCE IP
+        if (devIp.empty()) {
+            printf("[emsd][ERROR] --roce requires --dev-ip <NPU RoCE IPv4> (or env KV_EMSD_DEV_IP)\n");
+            return -1;
+        }
+    }
     if (hostLoc) {
         // host 模式（跨模式/noDevice 构建包环境）：不依赖 NPU runtime；
         // 地址由使用方手填（--host-addr，ipourma 的 host IPv6，V6 即 EID 载体）
@@ -90,8 +100,8 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
             return -1;
         }
     } else {
-        // device 模式（当前 CANN 包可用）：挂 NPU runtime 上下文（host endpoint 初始化经
-        // hrtGetDevice 查当前 device，顺序关键）→ phyId → rootinfo 匹配 EID
+        // device 模式（当前 CANN 包可用；roce 复用本分支挂上下文）：挂 NPU runtime 上下文
+        // （host endpoint 初始化经 hrtGetDevice 查当前 device，顺序关键）→ phyId →（UBC 才取）EID
         aclLib_ = aclLib;
         aclLibHandle_ = dlopen(aclLib.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (aclLibHandle_ == nullptr) {
@@ -128,11 +138,15 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
             printf("[emsd][ERROR] aclrtGetPhyDevIdByLogicDevId failed, deviceId=%d phyId=%d\n", deviceId, phyId);
             return -1;
         }
-        if (EmsGetEid(rootinfoPath, static_cast<uint32_t>(phyId), eid) != 0) {
-            printf("[emsd][ERROR] EmsGetEid failed, phyId=%d rootinfo=%s\n", phyId, rootinfoPath.c_str());
-            return -1;
+        if (!roce) {
+            // UBC 路径才需要 EID；RoCE 路径 endpoint 地址为 NPU RoCE IP
+            if (EmsGetEid(rootinfoPath, static_cast<uint32_t>(phyId), eid) != 0) {
+                printf("[emsd][ERROR] EmsGetEid failed, phyId=%d rootinfo=%s\n", phyId, rootinfoPath.c_str());
+                return -1;
+            }
+            printf("[emsd] EID resolved, deviceId=%d phyId=%d eid=%s\n", deviceId, phyId,
+                   EmsEidToString(eid).c_str());
         }
-        printf("[emsd] EID resolved, deviceId=%d phyId=%d eid=%s\n", deviceId, phyId, EmsEidToString(eid).c_str());
     }
 
     if (api_.Load(hcommLib) != 0) {
@@ -144,8 +158,15 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
         printf("[emsd][ERROR] EndpointDescInit failed\n");
         return -1;
     }
-    localDesc_.protocol = COMM_PROTOCOL_UBC_CTP;  // = COMM_PROTOCOL_UB_CTP（跨节点 UBC，阶段一）
-    if (hostLoc) {
+    localDesc_.protocol = roce_ ? COMM_PROTOCOL_ROCE : COMM_PROTOCOL_UBC_CTP;
+    if (roce_) {
+        // DEVICE + RoCE（v2 数据面）：commAddr = NPU RoCE 参数面 IP（与框架侧 init_roce devIp 同平面）
+        localDesc_.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+        if (inet_pton(AF_INET, devIp_.c_str(), &localDesc_.commAddr.addr) != 1) {
+            printf("[emsd][ERROR] invalid --dev-ip ipv4: %s\n", devIp_.c_str());
+            return -1;
+        }
+    } else if (hostLoc) {
         // HOST 形态：commAddr=IP_V6（noDevice 仓 rank_graph 标准填法）；loc.host.id——
         // 不写 loc.device.*（union 会覆盖 host.id，MemFabric 同款注释）
         localDesc_.commAddr.type = COMM_ADDR_TYPE_IP_V6;
@@ -156,13 +177,15 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
         localDesc_.loc.locType = ENDPOINT_LOC_TYPE_HOST;
         localDesc_.loc.host.id = 0;
     } else {
-        // DEVICE 形态：commAddr=EID + device 四元组（devPhyId=phyId，PoC 卡到卡同款）
+        // DEVICE 形态（UBC）：commAddr=EID（PoC 卡到卡同款填法）
         localDesc_.commAddr.type = COMM_ADDR_TYPE_EID;
         memcpy(localDesc_.commAddr.eid, eid.data(), EMS_EID_LEN);  // 16B 有效（PoC 同款填法）
+    }
+    if (!hostLoc) {
+        // DEVICE 形态公共（UBC 与 ROCE）：loc 四元组 + 拓扑三元组
+        // （拓扑对齐 aiv_urma_poc；缺字段时 UBC_CTP 握手无法推进，实测卡 IN_PROGRESS）
         localDesc_.loc.locType = ENDPOINT_LOC_TYPE_DEVICE;
         localDesc_.loc.device.devPhyId = static_cast<uint32_t>(phyId);
-        // 拓扑四元组对齐 aiv_urma_poc（缺这些字段时 UBC_CTP 握手无法推进，实测卡 IN_PROGRESS）：
-        //   sdid/serverIdx/superPodIdx 经 rtGetDeviceInfo 查询（infoType 复刻 MemFabric hybm_define.h）
         if (rtGetDeviceInfoFn_ != nullptr) {
             constexpr int32_t kInfoSdid = 26;
             constexpr int32_t kInfoServerId = 27;
@@ -186,14 +209,15 @@ int EmsdHcomm::Init(const std::string &hcommLib, const std::string &aclLib, int3
         }
     }
 
+    const char *addrLog = hostLoc ? hostAddr.c_str() : (roce_ ? devIp_.c_str() : EmsEidToString(eid).c_str());
     HcommResult ret = api_.HcommEndpointCreate(&localDesc_, &endpoint_);
     if (ret != 0 || endpoint_ == nullptr) {
-        printf("[emsd][ERROR] HcommEndpointCreate ret=%d, loc=%s addr=%s\n", ret, hostLoc ? "host" : "device",
-               hostLoc ? hostAddr.c_str() : EmsEidToString(eid).c_str());
+        printf("[emsd][ERROR] HcommEndpointCreate ret=%d, loc=%s addr=%s\n", ret,
+               hostLoc ? "host" : (roce_ ? "device-roce" : "device"), addrLog);
         return -1;
     }
-    printf("[emsd] EndpointCreate ok, loc=%s handle=%p addr=%s\n", hostLoc ? "host" : "device", endpoint_,
-           hostLoc ? hostAddr.c_str() : EmsEidToString(eid).c_str());
+    printf("[emsd] EndpointCreate ok, loc=%s handle=%p addr=%s\n",
+           hostLoc ? "host" : (roce_ ? "device-roce" : "device"), endpoint_, addrLog);
     return 0;
 }
 
@@ -295,11 +319,14 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
            seg.hcommListenPort);
     // 端口复用重试：上一 run 的 server 通道刚 ChannelDestroy 时，driver 侧监听 socket 可能尚未完全释放，
     // 立刻同端口重建可能失败；退避重试 3 次（attempt 打日志便于区分是端口残留还是真失败）。
+    // 引擎：UBC 路径 AIV（AIV 直驱）；RoCE 路径（v2，A3）AICPU——AicpuTsRoceChannel 无 chip 门限，
+    // 数据面由框架侧 AICPU kernel 经 Hcomm*OnThread 发起（dlopen libccl_kernel.so）。
+    const CommEngine engine = roce_ ? COMM_ENGINE_AICPU : COMM_ENGINE_AIV;
     for (int attempt = 0; attempt < 3; ++attempt) {
         seg.channel = 0;
-        ret = api_.HcommChannelCreate(endpoint_, COMM_ENGINE_AIV, &chDesc, 1, &seg.channel);
-        printf("[emsd] %s LinkServer ChannelCreate(server) ret=%d, segIndex=%u attempt=%d\n", TsNow(), ret, segIndex,
-               attempt);
+        ret = api_.HcommChannelCreate(endpoint_, engine, &chDesc, 1, &seg.channel);
+        printf("[emsd] %s LinkServer ChannelCreate(server, %s) ret=%d, segIndex=%u attempt=%d\n", TsNow(),
+               roce_ ? "AICPU" : "AIV", ret, segIndex, attempt);
         if (ret == 0 && seg.channel != 0) {
             break;
         }
@@ -308,8 +335,8 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
         }
     }
     if (ret != 0 || seg.channel == 0) {
-        printf("[emsd][ERROR] ChannelCreate(AIV,server) failed, poolId=%u segIndex=%u port=%u ret=%d\n", seg.poolId,
-               segIndex, seg.hcommListenPort, ret);
+        printf("[emsd][ERROR] ChannelCreate(%s,server) failed, poolId=%u segIndex=%u port=%u ret=%d\n",
+               roce_ ? "AICPU" : "AIV", seg.poolId, segIndex, seg.hcommListenPort, ret);
         return KV_ERR_HCOMM;
     }
     // 创建即返回：server 侧 READY 依赖框架侧 client 通道建链完成后由 hcomm 内部交换推进，

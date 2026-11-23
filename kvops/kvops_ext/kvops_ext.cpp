@@ -4,7 +4,9 @@
  * kvops_ext：AIV 算子 launch 封装（fatbin 显式加载链，PoC 方案 B）。
  *   内核：kvc_gather_rows（稠密导入）/ kvc_scatter_rows_alllayer（全层导出）
  *         hisp_sieve_update（SIEVE miss 识别，哈希-only）/ hisp_sieve_ht_init（哈希表构建）
+ *         dsa_gather_rmt_v2（AICPU 搬运，Hcomm device-RoCE 数据面，A3 路径）
  * launch 均不在内部同步/读 device 内存（图捕获安全）；status 槽由调用方管理。
+ * v2 例外：同步算子（launch + SynchronizeStream + peek status），因 AICPU kernel 完成即数据落地。
  * sieve 派生公式与 sglang-0730 hisparse_lru_host.cpp 严格一致：
  *   htSize = 2 的幂 ≥ 2×(padded+topK)（装载因子 ≤0.5）
  *   reqsPerCore 对齐 64/gcd(topK,64)（每 block 输出段 64B cache line 对齐）
@@ -20,7 +22,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
+#include "dsa_gather_rmt_v2.h"
 #include "kvc_args.h"
 
 namespace py = pybind11;
@@ -31,11 +35,13 @@ constexpr int32_t LAUNCH_ATTR_SCHEM_MODE = 1;
 constexpr int32_t LAUNCH_ATTR_ENGINE_TYPE = 3;
 constexpr int32_t LAUNCH_ATTR_TIMEOUT_US = 8;
 constexpr int32_t BINARY_LOAD_OPT_LAZY_LOAD = 1;
+constexpr int32_t BINARY_LOAD_OPT_CPU_KERNEL_MODE = 3;  // aclrtBinaryLoadOptionType（MemFabric dl_cann_api_def.h 复刻）
 constexpr int32_t ENGINE_TYPE_AIV = 1;
 constexpr int64_t UB_BUDGET_BYTES = 176 * 1024;  // 192KB/核留余量
 
 union BinOptVal {
     uint32_t isLazyLoad;
+    int32_t cpuKernelMode;
     uint32_t rsv[4];
 };
 struct BinOpt {
@@ -71,21 +77,31 @@ struct RtApi {
     int32_t (*aclrtBinaryUnLoad)(void *);
     int32_t (*aclrtBinaryGetFunction)(const void *, const char *, void **);
     int32_t (*aclrtLaunchKernelWithHostArgs)(void *, uint32_t, void *, LaunchCfg *, void *, size_t, void *, size_t);
+    int32_t (*aclrtSynchronizeStream)(void *);
+    // AICPU kernel launch 链（aclrtKernelArgs* + LaunchKernelWithConfig，MemFabric 同款）
+    int32_t (*aclrtKernelArgsInit)(void *, void **);
+    int32_t (*aclrtKernelArgsAppend)(void *, void *, size_t, void **);
+    int32_t (*aclrtKernelArgsFinalize)(void *);
+    int32_t (*aclrtLaunchKernelWithConfig)(void *, uint32_t, void *, LaunchCfg *, void *, void *);
 };
 
 RtApi rt{};
 void *rtLib = nullptr;
 void *g_binary = nullptr;
+void *g_binaryAicpu = nullptr;  // v2 AICPU json binary（与 fatbin 同目录旁加载）
 void *g_fnGather = nullptr;
 void *g_fnScatterAll = nullptr;
 void *g_fnSieveUpdate = nullptr;
 void *g_fnSieveHtInit = nullptr;
 void *g_fnGatherSelRmt = nullptr;
 void *g_fnDsaGatherRmt = nullptr;
+void *g_fnDsaGatherRmtV2 = nullptr;  // nullptr = AICPU kernel 未部署（v2 调用时抛错，v1 不受影响）
 void *g_overflowBuf = nullptr;
 bool g_inited = false;
 int g_deviceId = -1;
 std::string g_fatbinPath;
+// channel→thread 注册表：EmsPool roce 建链后登记，v2 launch 取 thread 入参
+std::unordered_map<uint64_t, uint64_t> g_rmtThreads;
 
 template <typename T>
 T Sym(const char *name)
@@ -139,6 +155,34 @@ void LaunchCommon(void *fn, const void *argsStruct, size_t argsSize, uint32_t bl
     }
 }
 
+// AICPU kernel launch（v2 专用；MemFabric LaunchAicpuKernel 同款链）：
+// ArgsInit → Append(param 结构体) → Finalize → LaunchKernelWithConfig(blockDim=1)
+void LaunchAicpu(void *fn, const void *argsStruct, size_t argsSize, uint64_t stream)
+{
+    void *argsHandle = nullptr;
+    int32_t ret = rt.aclrtKernelArgsInit(fn, &argsHandle);
+    if (ret != 0 || argsHandle == nullptr) {
+        throw std::runtime_error("KernelArgsInit ret=" + std::to_string(ret));
+    }
+    void *paramHandle = nullptr;
+    ret = rt.aclrtKernelArgsAppend(argsHandle, const_cast<void *>(argsStruct), argsSize, &paramHandle);
+    if (ret != 0) {
+        throw std::runtime_error("KernelArgsAppend ret=" + std::to_string(ret));
+    }
+    ret = rt.aclrtKernelArgsFinalize(argsHandle);
+    if (ret != 0) {
+        throw std::runtime_error("KernelArgsFinalize ret=" + std::to_string(ret));
+    }
+    LaunchAttr attrs[1]{};
+    attrs[0].id = LAUNCH_ATTR_TIMEOUT_US;
+    attrs[0].value.timeoutUs = {600U * 1000U * 1000U, 0};  // 600s：覆盖大 pair 集全量回源
+    LaunchCfg cfg{attrs, 1};
+    ret = rt.aclrtLaunchKernelWithConfig(fn, 1, reinterpret_cast<void *>(stream), &cfg, argsHandle, nullptr);
+    if (ret != 0) {
+        throw std::runtime_error("LaunchKernelWithConfig ret=" + std::to_string(ret));
+    }
+}
+
 void EnsureInited()
 {
     if (!g_inited) {
@@ -175,6 +219,11 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
     rt.aclrtBinaryGetFunction = Sym<decltype(rt.aclrtBinaryGetFunction)>("aclrtBinaryGetFunction");
     rt.aclrtLaunchKernelWithHostArgs =
         Sym<decltype(rt.aclrtLaunchKernelWithHostArgs)>("aclrtLaunchKernelWithHostArgs");
+    rt.aclrtSynchronizeStream = Sym<decltype(rt.aclrtSynchronizeStream)>("aclrtSynchronizeStream");
+    rt.aclrtKernelArgsInit = Sym<decltype(rt.aclrtKernelArgsInit)>("aclrtKernelArgsInit");
+    rt.aclrtKernelArgsAppend = Sym<decltype(rt.aclrtKernelArgsAppend)>("aclrtKernelArgsAppend");
+    rt.aclrtKernelArgsFinalize = Sym<decltype(rt.aclrtKernelArgsFinalize)>("aclrtKernelArgsFinalize");
+    rt.aclrtLaunchKernelWithConfig = Sym<decltype(rt.aclrtLaunchKernelWithConfig)>("aclrtLaunchKernelWithConfig");
 
     if (rt.aclrtSetDevice(deviceId) != 0) {
         throw std::runtime_error("aclrtSetDevice failed");
@@ -204,6 +253,30 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
             throw std::runtime_error(std::string("GetFunction ") + names[i] + " ret=" + std::to_string(ret));
         }
     }
+
+    // v2 AICPU kernel：json 描述符与 fatbin 同目录旁部署（kernel 构建产物同输出）。
+    // 缺失只降级 v2（warn + 置空函数指针），不影响 v1 链路——资源节点旧包无此文件。
+    const std::string::size_type slash = fatbinPath.find_last_of('/');
+    const std::string aicpuJson = (slash == std::string::npos ? std::string() : fatbinPath.substr(0, slash + 1)) +
+                                  "libcann_kvops_aicpu.json";
+    if (access(aicpuJson.c_str(), R_OK) == 0) {
+        BinOpt cpuOpt{};
+        cpuOpt.type = BINARY_LOAD_OPT_CPU_KERNEL_MODE;
+        cpuOpt.value.cpuKernelMode = 0;
+        BinOpts cpuOpts{&cpuOpt, 1};
+        ret = rt.aclrtBinaryLoadFromFile(aicpuJson.c_str(), &cpuOpts, &g_binaryAicpu);
+        if (ret != 0 || g_binaryAicpu == nullptr) {
+            throw std::runtime_error("AICPU BinaryLoadFromFile ret=" + std::to_string(ret) + " path=" + aicpuJson);
+        }
+        ret = rt.aclrtBinaryGetFunction(g_binaryAicpu, "DsaGatherRmtV2", &g_fnDsaGatherRmtV2);
+        if (ret != 0 || g_fnDsaGatherRmtV2 == nullptr) {
+            throw std::runtime_error(std::string("AICPU GetFunction DsaGatherRmtV2 ret=") + std::to_string(ret));
+        }
+        printf("[kvops] AICPU kernel loaded: %s\n", aicpuJson.c_str());
+    } else {
+        printf("[kvops][WARN] AICPU json not found (%s), npu_dsa_gather_rmt_v2 unavailable\n", aicpuJson.c_str());
+    }
+
     g_inited = true;
     g_deviceId = deviceId;
     g_fatbinPath = fatbinPath;
@@ -506,8 +579,101 @@ void kv_dsa_gather_rmt(uint64_t residentKv, uint64_t residentRope, uint64_t resi
     LaunchCommon(g_fnDsaGatherRmt, &args, sizeof(args), blockDim, stream);
 }
 
+// ── dsa_gather_rmt_v2（AICPU 搬运，Hcomm device-RoCE 数据面，A3 路径）────────────────
+// 语义/寻址/错误码与 kv_dsa_gather_rmt 完全一致；差异：
+//   数据面 = 自研 AICPU kernel 内经 Hcomm*OnThread（libccl_kernel.so）单边读；
+//   channel 入参仍是块→ChannelHandle 表（device 内存），thread 由注册表提供（单实例共享）；
+//   同步算子：launch 后 SynchronizeStream，返回 status word0 低 32bit rc（0=成功）。
+void kv_register_rmt_thread(uint64_t channel, uint64_t thread)
+{
+    EnsureInited();
+    if (channel == 0 || thread == 0) {
+        throw std::runtime_error("register_rmt_thread: channel/thread must be non-zero");
+    }
+    g_rmtThreads[channel] = thread;
+}
+
+int64_t kv_dsa_gather_rmt_v2(uint64_t residentKv, uint64_t residentRope, uint64_t residentBlockTable,
+                             uint64_t hostBlockTable, uint64_t requestPoolIndices, uint64_t topkTokenPositions,
+                             uint64_t residentSlots, uint64_t missMask, uint64_t rmtChannel, uint64_t rmtKvAddr,
+                             uint64_t rmtRopeAddr, uint64_t status, uint32_t numRequests, uint32_t queryCount,
+                             uint32_t blockSize, uint32_t kvDim, uint32_t ropeDim, uint32_t kvElemSize,
+                             uint32_t ropeElemSize, uint32_t hostPoolCapacity, uint32_t hostTableWidth,
+                             uint32_t residentTableWidth, uint32_t hostBlkNum, uint32_t residentBlkNum,
+                             uint64_t stream)
+{
+    EnsureInited();
+    if (g_fnDsaGatherRmtV2 == nullptr) {
+        throw std::runtime_error(
+            "dsa_gather_rmt_v2: AICPU kernel not loaded (libcann_kvops_aicpu.json missing next to fatbin?)");
+    }
+    if (g_rmtThreads.empty()) {
+        throw std::runtime_error("dsa_gather_rmt_v2: no rmt thread registered (EmsPool roce 建链后须 register)");
+    }
+    if (blockSize == 0 || queryCount == 0 || numRequests == 0) {
+        throw std::runtime_error("dsa_gather_rmt_v2: blockSize/queryCount/numRequests must be positive");
+    }
+    if (kvElemSize == 0 || ropeElemSize == 0 || kvElemSize > 2 || ropeElemSize > 2) {
+        throw std::runtime_error("dsa_gather_rmt_v2: elem size must be 1 (int8) or 2 (fp16/bf16)");
+    }
+    if (kvDim * kvElemSize % 32 != 0 || ropeDim * ropeElemSize % 32 != 0) {
+        throw std::runtime_error("dsa_gather_rmt_v2: kv/rope record bytes must be 32B aligned");
+    }
+    DsaGatherRmtV2Args args{};
+    args.thread = g_rmtThreads.begin()->second;  // 单实例：全部通道共享一个 AICPU_TS thread
+    args.residentKv = residentKv;
+    args.residentRope = residentRope;
+    args.residentBlockTable = residentBlockTable;
+    args.hostBlockTable = hostBlockTable;
+    args.requestPoolIndices = requestPoolIndices;
+    args.topkTokenPositions = topkTokenPositions;
+    args.residentSlots = residentSlots;
+    args.missMask = missMask;
+    args.rmtChannel = rmtChannel;
+    args.rmtKvAddr = rmtKvAddr;
+    args.rmtRopeAddr = rmtRopeAddr;
+    args.status = status;
+    args.numRequests = numRequests;
+    args.queryCount = queryCount;
+    args.blockSize = blockSize;
+    args.kvDim = kvDim;
+    args.ropeDim = ropeDim;
+    args.kvElemSize = kvElemSize;
+    args.ropeElemSize = ropeElemSize;
+    args.hostPoolCapacity = hostPoolCapacity;
+    args.hostTableWidth = hostTableWidth;
+    args.residentTableWidth = residentTableWidth;
+    args.hostBlkNum = hostBlkNum;
+    args.residentBlkNum = residentBlkNum;
+    if (rt.aclrtMemset(reinterpret_cast<void *>(status), 64, 0, 64) != 0) {
+        throw std::runtime_error("dsa_gather_rmt_v2: status memset failed, status=" + std::to_string(status));
+    }
+    {
+        py::gil_scoped_release release;
+        LaunchAicpu(g_fnDsaGatherRmtV2, &args, sizeof(args), stream);
+        const int32_t sret = rt.aclrtSynchronizeStream(reinterpret_cast<void *>(stream));
+        if (sret != 0) {
+            throw std::runtime_error("dsa_gather_rmt_v2: SynchronizeStream ret=" + std::to_string(sret));
+        }
+    }
+    uint64_t word0 = 0;
+    if (rt.aclrtMemcpy(&word0, 8, reinterpret_cast<const void *>(status), 8, 3 /*D2O*/) != 0) {
+        throw std::runtime_error("dsa_gather_rmt_v2: peek status memcpy failed");
+    }
+    if ((word0 >> 32) != 1) {
+        return -0x3000;  // kernel 未完成即返回（超时 attr 触发或异常退出）：终态缺失
+    }
+    return static_cast<int64_t>(word0 & 0xFFFFFFFFULL);
+}
+
 void kv_close()
 {
+    g_rmtThreads.clear();
+    g_fnDsaGatherRmtV2 = nullptr;
+    if (g_binaryAicpu != nullptr) {
+        (void)rt.aclrtBinaryUnLoad(g_binaryAicpu);
+        g_binaryAicpu = nullptr;
+    }
     if (g_binary != nullptr) {
         (void)rt.aclrtBinaryUnLoad(g_binary);
         g_binary = nullptr;
@@ -565,5 +731,14 @@ PYBIND11_MODULE(_kvops, m)
           py::arg("host_pool_capacity"), py::arg("host_table_width"), py::arg("resident_table_width"),
           py::arg("host_blk_num"), py::arg("resident_blk_num"), py::arg("stream") = 0,
           py::arg("block_dim") = 1);
+    m.def("register_rmt_thread", &kv_register_rmt_thread, py::arg("channel"), py::arg("thread"));
+    m.def("dsa_gather_rmt_v2", &kv_dsa_gather_rmt_v2, py::arg("resident_kv"), py::arg("resident_rope"),
+          py::arg("resident_block_table"), py::arg("host_block_table"), py::arg("request_pool_indices"),
+          py::arg("topk_token_positions"), py::arg("resident_slots"), py::arg("miss_mask"),
+          py::arg("rmt_channel"), py::arg("rmt_kv_addr"), py::arg("rmt_rope_addr"), py::arg("status"),
+          py::arg("num_requests"), py::arg("query_count"), py::arg("block_size"), py::arg("kv_dim"),
+          py::arg("rope_dim"), py::arg("kv_elem_size"), py::arg("rope_elem_size"),
+          py::arg("host_pool_capacity"), py::arg("host_table_width"), py::arg("resident_table_width"),
+          py::arg("host_blk_num"), py::arg("resident_blk_num"), py::arg("stream") = 0);
     m.def("close", &kv_close);
 }

@@ -1,0 +1,9 @@
+{
+    "DsaGatherRmtV2": {
+        "opInfo": {
+            "functionName": "DsaGatherRmtV2",
+            "kernelSo": "libcann_kvops_aicpu.so",
+            "opKernelLib": "AICPUKernel"
+        }
+    }
+}

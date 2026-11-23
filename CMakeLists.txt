@@ -81,4 +81,71 @@ ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/dsa_gather_rmt.cpp
             ${ASC_DEVKIT_ROOT}/include
         )
     endif()
+
+    # AICPU 搬运 kernel（v2 / Hcomm device-RoCE 数据面，MemFabric hybm 同款构建法）：
+    #   aarch64 交叉 g++ 直编 .so + json 描述符，产物与 kvc_kernel.o 同目录输出
+    #   （ascendc_fatbin_library 的 fatbin 默认落在 <build>/kvc_kernel.o）；
+    #   kvops.init 按 fatbin 路径旁加载 json（libcann_kvops_aicpu.json 缺失仅降级 v2）。
+    # 部署提示：三个文件必须一起拷（kvc_kernel.o + libcann_kvops_aicpu.so +
+    #   libcann_kvops_aicpu.json），构建 kvops_aicpu_kernel 后有回显提示。
+    set(KVOPS_AICPU_CXX "$ENV{ASCEND_HOME_PATH}/toolkit/toolchain/hcc/bin/aarch64-target-linux-gnu-g++")
+    set(KVOPS_AICPU_SO ${CMAKE_CURRENT_BINARY_DIR}/libcann_kvops_aicpu.so)
+    set(KVOPS_AICPU_JSON ${CMAKE_CURRENT_BINARY_DIR}/libcann_kvops_aicpu.json)
+    if(EXISTS ${KVOPS_AICPU_CXX})
+        add_custom_command(
+            OUTPUT ${KVOPS_AICPU_SO}
+            COMMAND ${KVOPS_AICPU_CXX} -shared -O2 -std=c++17 -fPIC
+                    -I${CMAKE_CURRENT_SOURCE_DIR}/kvops/aicpu_kernel
+                    -o ${KVOPS_AICPU_SO}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/kvops/aicpu_kernel/dsa_gather_rmt_v2.cc
+                    -ldl
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kvops/aicpu_kernel/dsa_gather_rmt_v2.cc
+                    ${CMAKE_CURRENT_SOURCE_DIR}/kvops/aicpu_kernel/dsa_gather_rmt_v2.h
+            COMMENT "Compiling AICPU kernel libcann_kvops_aicpu.so (aarch64 cross)")
+        add_custom_command(
+            OUTPUT ${KVOPS_AICPU_JSON}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${CMAKE_CURRENT_SOURCE_DIR}/kvops/aicpu_kernel/libcann_kvops_aicpu.json
+                    ${KVOPS_AICPU_JSON}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kvops/aicpu_kernel/libcann_kvops_aicpu.json)
+        add_custom_target(kvops_aicpu_kernel ALL DEPENDS ${KVOPS_AICPU_SO} ${KVOPS_AICPU_JSON})
+        # 部署提醒：fatbin 与 AICPU 产物必须同目录部署（kvops.init 按 fatbin 旁路加载 json）
+        add_custom_command(TARGET kvops_aicpu_kernel POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E echo
+                    "[kvops] deploy together: kvc_kernel.o + libcann_kvops_aicpu.so + libcann_kvops_aicpu.json")
+        # 自动部署：构建完成即把 kernel 三件套拷到部署目录（fatbin 与 AICPU 产物同目录，
+        # kvops.init 按 fatbin 旁路加载 json）。目录可用 -DKVOPS_KERNEL_DEPLOY_DIR=... 覆盖。
+        set(KVOPS_KERNEL_DEPLOY_DIR "/usr/local/fatbin/kvc_kernel" CACHE PATH
+            "kernel deploy dir (kvc_kernel.o + AICPU artifacts)")
+        # fatbin 由 ascendc_fatbin_library 的 ExternalProject（kvc_kernel_precompile）产出，
+        # 顶层 Makefile 无 kvc_kernel.o 的生成规则，不能挂文件级依赖——依赖 target 排序，
+        # 拷贝前再判一次文件是否存在（不存在仅告警，不阻断构建）。
+        set(KVOPS_FATBIN_O ${CMAKE_CURRENT_BINARY_DIR}/kvc_kernel.o)
+        set(KVOPS_DEPLOY_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/kvops_deploy.cmake)
+        file(WRITE ${KVOPS_DEPLOY_SCRIPT}
+"if(EXISTS \"${KVOPS_FATBIN_O}\")
+  file(COPY \"${KVOPS_FATBIN_O}\" DESTINATION \"${KVOPS_KERNEL_DEPLOY_DIR}\")
+else()
+  message(WARNING \"fatbin not found: ${KVOPS_FATBIN_O}, skipped deploy of kvc_kernel.o\")
+endif()
+file(COPY \"${KVOPS_AICPU_SO}\" \"${KVOPS_AICPU_JSON}\" DESTINATION \"${KVOPS_KERNEL_DEPLOY_DIR}\")
+message(STATUS \"kernel artifacts deployed to ${KVOPS_KERNEL_DEPLOY_DIR}\")
+")
+        add_custom_target(kvops_kernel_deploy ALL
+            COMMAND ${CMAKE_COMMAND} -D__unused=1 -P ${KVOPS_DEPLOY_SCRIPT}
+            DEPENDS kvops_aicpu_kernel
+            COMMENT "Deploying kernel artifacts to ${KVOPS_KERNEL_DEPLOY_DIR}")
+        if(TARGET kvc_kernel_precompile)
+            add_dependencies(kvops_kernel_deploy kvc_kernel_precompile)
+        elseif(TARGET kvc_kernel)
+            add_dependencies(kvops_kernel_deploy kvc_kernel)
+        endif()
+        # ascendc_fatbin_library 在部分 CANN 版本不产出同名 target——存在才绑排序依赖，
+        # 不存在无妨：kvops_aicpu_kernel 为 ALL 目标，默认构建即覆盖
+        if(TARGET kvc_kernel)
+            add_dependencies(kvc_kernel kvops_aicpu_kernel)
+        endif()
+    else()
+        message(WARNING "AICPU cross compiler not found: ${KVOPS_AICPU_CXX}; v2 kernel skipped")
+    endif()
 endif()

@@ -42,6 +42,8 @@ struct EmsdConfig {
     std::string rootinfoPath = "/etc/hccl_rootinfo.json";  // device 模式：EID 按 device_id==phyId 匹配
     bool hostLoc = false;             // loc 模式：false=device（当前包，卡到卡）；true=host（待跨模式包）
     std::string hostAddr;             // host 模式：endpoint IPv6（ipourma host 地址，app 手填）
+    bool roce = false;                // v2（A3 + AICPU 数据面）：endpoint 用 NPU RoCE IP，server 通道 AICPU 引擎
+    std::string devIp;                  // roce 模式：本 NPU RoCE 参数面 IP（--dev-ip / KV_EMSD_DEV_IP）
     std::string aclLib = "libascendcl.so";
     std::string hcommLib = "libhcomm.so";
     uint64_t poolSizeBytes = 8ULL << 30;  // 本节点可提供的池容量上限（u64：支持 >4GB 池）

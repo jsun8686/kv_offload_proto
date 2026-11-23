@@ -46,12 +46,14 @@ void Usage(const char *bin)
 {
     printf("usage: %s --role master|worker --ip <localIp> --port <ctrlPort>\n"
            "  [--loc device|host] [--device N] [--host-addr <ipv6>] [--rootinfo <path>]\n"
-           "  [--acl-lib <path>] [--hcomm-lib <path>] [--pool-size-gb N]\n"
+           "  [--roce] [--dev-ip <NPU RoCE IPv4>] [--acl-lib <path>] [--hcomm-lib <path>] [--pool-size-gb N]\n"
            "  master: --members ip1:port1:hcommPort1[,ip2:port2:hcommPort2...]\n"
-           "  loc device（默认，当前包）: EID 自动按 rootinfo 匹配 device_id==phyId（卡到卡）\n"
+           "  loc device（默认，当前包）: EID 自动按 rootinfo 匹配 device_id==phyId（卡到卡，UBC_CTP+AIV）\n"
            "  loc host（待跨模式包）: --host-addr 必填（ipourma host IPv6，V6 即 EID 载体）\n"
+           "  --roce（v2，A3 + AICPU 数据面）: endpoint 地址改用 NPU RoCE IP，server 通道 AICPU 引擎；\n"
+           "      --dev-ip 必填（本 NPU 参数面 IP，与对端 init_roce devIp 同平面）\n"
            "  段内存取自 --device 卡 HBM（AIV 通道 mem key 交换要求 DVA 域，PoC 实证组合）\n"
-           "env: KV_EMSD_HCOMM_LIB 覆盖 libhcomm 路径\n",
+           "env: KV_EMSD_HCOMM_LIB 覆盖 libhcomm 路径；KV_EMSD_DEV_IP 覆盖 --dev-ip\n",
            bin);
 }
 
@@ -96,6 +98,10 @@ int main(int argc, char **argv)
             deviceId = atoi(next().c_str());
         } else if (k == "--host-addr") {
             cfg.hostAddr = next();
+        } else if (k == "--roce") {
+            cfg.roce = true;
+        } else if (k == "--dev-ip") {
+            cfg.devIp = next();
         } else if (k == "--rootinfo") {
             cfg.rootinfoPath = next();
         } else if (k == "--acl-lib") {
@@ -113,6 +119,15 @@ int main(int argc, char **argv)
     }
     if (const char *env = getenv("KV_EMSD_HCOMM_LIB"); env != nullptr && cfg.hcommLib == "libhcomm.so") {
         cfg.hcommLib = env;
+    }
+    if (cfg.devIp.empty()) {
+        if (const char *env = getenv("KV_EMSD_DEV_IP"); env != nullptr) {
+            cfg.devIp = env;
+        }
+    }
+    if (cfg.roce && cfg.hostLoc) {
+        printf("[emsd][ERROR] --roce 与 --loc host 互斥（roce 为 device 侧 endpoint）\n");
+        return 1;
     }
     cfg.isMaster = (role == "master");
     cfg.poolSizeBytes = static_cast<uint64_t>(poolGb) << 30;
@@ -166,10 +181,11 @@ int main(int argc, char **argv)
         cfg.members.push_back(self);  // worker 自身段表仅一条
     }
 
-    printf("[emsd] starting, role=%s ip=%s port=%u loc=%s device=%d hostAddr=%s rootinfo=%s poolSizeBytes=%llu "
-           "aclLib=%s hcommLib=%s\n",
+    printf("[emsd] starting, role=%s ip=%s port=%u loc=%s roce=%d devIp=%s device=%d hostAddr=%s rootinfo=%s "
+           "poolSizeBytes=%llu aclLib=%s hcommLib=%s\n",
            cfg.isMaster ? "master" : "worker", cfg.localIp.c_str(), cfg.listenPort, cfg.hostLoc ? "host" : "device",
-           cfg.deviceId, cfg.hostAddr.empty() ? "-" : cfg.hostAddr.c_str(), cfg.rootinfoPath.c_str(),
+           cfg.roce ? 1 : 0, cfg.devIp.empty() ? "-" : cfg.devIp.c_str(), cfg.deviceId,
+           cfg.hostAddr.empty() ? "-" : cfg.hostAddr.c_str(), cfg.rootinfoPath.c_str(),
            (unsigned long long)cfg.poolSizeBytes, cfg.aclLib.c_str(), cfg.hcommLib.c_str());
     EmsdCtrlServer server(cfg);
     return server.Run();

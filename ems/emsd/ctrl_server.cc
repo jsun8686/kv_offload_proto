@@ -126,7 +126,8 @@ int EmsdCtrlServer::SendResp(int fd, uint16_t cmd, const void *payload, uint32_t
 
 int EmsdCtrlServer::Run()
 {
-    if (hcomm_.Init(cfg_.hcommLib, cfg_.aclLib, cfg_.deviceId, cfg_.rootinfoPath, cfg_.hostLoc, cfg_.hostAddr) != 0) {
+    if (hcomm_.Init(cfg_.hcommLib, cfg_.aclLib, cfg_.deviceId, cfg_.rootinfoPath, cfg_.hostLoc, cfg_.hostAddr,
+                    cfg_.roce, cfg_.devIp) != 0) {
         return -1;
     }
     hcommInited_ = true;

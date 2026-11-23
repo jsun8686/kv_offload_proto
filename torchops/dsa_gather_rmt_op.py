@@ -1,11 +1,15 @@
 # coding=utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
-"""npu_dsa_gather_rmt 的 torch 层实现（13 参张量 → 26 参 pybind 适配）。
+"""npu_dsa_gather_rmt / npu_dsa_gather_rmt_v2 的 torch 层实现（13 参张量 → pybind 适配）。
 
 语义/约束/错误码与 doc/dsa_gather_rmt.md §3 一致；原地写，返回 (kv, rope) alias
-（对齐原版 dsa_gather 调用形态）。同步算子（poll 至全部核完成）。
-维度全推导：调用方只传 attr 两项（block_size/num_requests），其余从张量 shape 取。
+（对齐原版 dsa_gather 调用形态）。维度全推导：调用方只传 attr 两项
+（block_size/num_requests），其余从张量 shape 取。
+
+v1（npu_dsa_gather_rmt）：AIV + UBC_CTP，poll 至全部核完成（同步）。
+v2（npu_dsa_gather_rmt_v2）：AICPU 搬运 kernel + Hcomm device-RoCE 数据面（A3 路径），
+block_dim 恒 1；kvops 内同步（SynchronizeStream）并返回 status rc，非 0 抛错。
 """
 
 import torch
@@ -23,19 +27,15 @@ def _elem_size(dt):
     return 1 if dt == torch.int8 else 2
 
 
-def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_table,
-                       host_block_table, request_pool_indices, topk_token_positions,
-                       resident_slots, miss_mask, block_size, num_requests,
-                       host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
-    """miss 记录按需回源（远端 EMS 池 → resident HBM 池，原地写）。
-
-    dtype 配对：fp16/fp16、bf16/bf16、int8+bf16；record 字节须 32B 对齐；
-    resident 池须在 cli mem_reg 注册范围（ReadNbi dst，由池管理器保证）。
-    """
+def _validate_gather_rmt_args(resident_kv_cache, resident_rope_cache, resident_block_table,
+                              host_block_table, request_pool_indices, topk_token_positions,
+                              resident_slots, miss_mask, block_size, num_requests,
+                              host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr):
+    """13 参公共校验（v1/v2 同约束），返回推导维度字典。"""
     bs = int(block_size)
     nreq = int(num_requests)
-    if bs <= 0 or nreq <= 0 or int(block_dim) <= 0:
-        raise ValueError("block_size/num_requests/block_dim must be positive")
+    if bs <= 0 or nreq <= 0:
+        raise ValueError("block_size/num_requests must be positive")
 
     # ── 池校验（4 维 [P, bs, 1, dim]，kv_heads 恒 1）──
     for t, name in ((resident_kv_cache, "resident_kv_cache"), (resident_rope_cache, "resident_rope_cache")):
@@ -95,6 +95,28 @@ def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_ta
     for t in tensors:
         if t.device != resident_kv_cache.device:
             raise ValueError("all tensors must be on %s, got %s" % (resident_kv_cache.device, t.device))
+    return {"bs": bs, "nreq": nreq, "kv_dim": kv_dim, "rope_dim": rope_dim, "kv_elem": kv_elem,
+            "rope_elem": rope_elem, "resident_blk_num": resident_blk_num, "host_blk_num": host_blk_num,
+            "host_pool_capacity": host_block_table.shape[0], "host_table_width": host_block_table.shape[1],
+            "resident_table_width": resident_block_table.shape[1],
+            "query_count": topk_token_positions.shape[1]}
+
+
+def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_table,
+                       host_block_table, request_pool_indices, topk_token_positions,
+                       resident_slots, miss_mask, block_size, num_requests,
+                       host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
+    """miss 记录按需回源（远端 EMS 池 → resident HBM 池，原地写）。
+
+    dtype 配对：fp16/fp16、bf16/bf16、int8+bf16；record 字节须 32B 对齐；
+    resident 池须在 cli mem_reg 注册范围（ReadNbi dst，由池管理器保证）。
+    """
+    if int(block_dim) <= 0:
+        raise ValueError("block_dim must be positive")
+    d = _validate_gather_rmt_args(resident_kv_cache, resident_rope_cache, resident_block_table,
+                                  host_block_table, request_pool_indices, topk_token_positions,
+                                  resident_slots, miss_mask, block_size, num_requests,
+                                  host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr)
 
     # ── 下发（26 参 pybind；维度从 shape 推导；stream=当前流） ──
     st = _kvops.alloc_status(int(block_dim))
@@ -103,10 +125,10 @@ def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_ta
         resident_kv_cache.data_ptr(), resident_rope_cache.data_ptr(), resident_block_table.data_ptr(),
         host_block_table.data_ptr(), request_pool_indices.data_ptr(), topk_token_positions.data_ptr(),
         resident_slots.data_ptr(), miss_mask.data_ptr(), host_rmt_channel.data_ptr(),
-        host_rmt_kv_addr.data_ptr(), host_rmt_rope_addr.data_ptr(), st, nreq,
-        topk_token_positions.shape[1], bs, kv_dim, rope_dim, kv_elem, rope_elem,
-        host_block_table.shape[0], host_block_table.shape[1], resident_block_table.shape[1],
-        host_blk_num, resident_blk_num, stream, int(block_dim))
+        host_rmt_kv_addr.data_ptr(), host_rmt_rope_addr.data_ptr(), st, d["nreq"],
+        d["query_count"], d["bs"], d["kv_dim"], d["rope_dim"], d["kv_elem"], d["rope_elem"],
+        d["host_pool_capacity"], d["host_table_width"], d["resident_table_width"],
+        d["host_blk_num"], d["resident_blk_num"], stream, int(block_dim))
     for i in range(int(block_dim)):  # 每核独立 64B 槽，全部完成才返回（同步语义）
         rc = _kvops.poll_status(st + i * 64, _POLL_TIMEOUT_US)
         if rc != 0:
@@ -114,8 +136,46 @@ def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_ta
     return resident_kv_cache, resident_rope_cache
 
 
+def npu_dsa_gather_rmt_v2(resident_kv_cache, resident_rope_cache, resident_block_table,
+                          host_block_table, request_pool_indices, topk_token_positions,
+                          resident_slots, miss_mask, block_size, num_requests,
+                          host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
+    """v2：AICPU 搬运 kernel（Hcomm device-RoCE 数据面，A3 路径），语义与 v1 完全一致。
+
+    前置：EmsPool(proto="roce") 建链并完成 register_rmt_thread；fatbin 同目录须有
+    libcann_kvops_aicpu.json/.so（kernel 构建产物，随 fatbin 一起部署）。
+    block_dim 恒 1（单 AICPU 实例）。同步算子：kvops 内 SynchronizeStream，
+    status rc 非 0 抛错（错误码语义同 v1：0x2xx/0x3xx=读失败，0x4xx/0x5xx=收尾）。
+    """
+    if int(block_dim) != 1:
+        raise ValueError("v2: block_dim must be 1 (single AICPU instance)")
+    d = _validate_gather_rmt_args(resident_kv_cache, resident_rope_cache, resident_block_table,
+                                  host_block_table, request_pool_indices, topk_token_positions,
+                                  resident_slots, miss_mask, block_size, num_requests,
+                                  host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr)
+
+    st = _kvops.alloc_status(1)
+    stream = torch.npu.current_stream().npu_stream
+    rc = _kvops.dsa_gather_rmt_v2(
+        resident_kv_cache.data_ptr(), resident_rope_cache.data_ptr(), resident_block_table.data_ptr(),
+        host_block_table.data_ptr(), request_pool_indices.data_ptr(), topk_token_positions.data_ptr(),
+        resident_slots.data_ptr(), miss_mask.data_ptr(), host_rmt_channel.data_ptr(),
+        host_rmt_kv_addr.data_ptr(), host_rmt_rope_addr.data_ptr(), st, d["nreq"],
+        d["query_count"], d["bs"], d["kv_dim"], d["rope_dim"], d["kv_elem"], d["rope_elem"],
+        d["host_pool_capacity"], d["host_table_width"], d["resident_table_width"],
+        d["host_blk_num"], d["resident_blk_num"], stream)
+    if rc != 0:
+        full = _kvops.peek_status(st)  # 诊断：word1=搬运 record 数
+        raise RuntimeError(
+            "npu_dsa_gather_rmt_v2 kernel failed rc=0x%x status=0x%x (word1=copied records)" % (
+                rc & 0xFFFFFFFF, full))
+    return resident_kv_cache, resident_rope_cache
+
+
 def load_dsa_gather_rmt_op():
     """幂等挂载到 torch_npu（对齐生产 custom_op_loader 属性挂载形态）。"""
     if not hasattr(torch_npu, "npu_dsa_gather_rmt"):
         torch_npu.npu_dsa_gather_rmt = npu_dsa_gather_rmt
+    if not hasattr(torch_npu, "npu_dsa_gather_rmt_v2"):
+        torch_npu.npu_dsa_gather_rmt_v2 = npu_dsa_gather_rmt_v2
     return torch_npu.npu_dsa_gather_rmt

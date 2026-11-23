@@ -1,0 +1,25 @@
+root@C01-A10-CPU6:/home/jsun/kv_offload_proto# python -m tests.test_torch_dsa_gather_rmt --device 0 --ems-master 141.61.49.195:27000 --perm --block-dim 2
+/home/jsun/kv_offload_proto/tests/test_dsa_gather_rmt.py:48: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:423.)
+  tok = torch.arange(flat.shape[0], dtype=torch.int32, device=flat.device).remainder(512)
+[cli] EID resolved, deviceId=0 phyId=0 eid=000000000000030000100000df150100
+[cli] topology: phyId=0 sdid=4290772992 serverIdx=5 superPodIdx=65535
+[cli] 18:46:49.043 ChannelCreate(client) enter, port=60001
+[cli] 18:46:49.049 ChannelCreate(client) ret=0, port=60001
+[cli] 18:46:49.049 status -99 -> 1, port=60001 waited=0.0s
+[cli] 18:46:57.183 status 1 -> 0, port=60001 waited=8.0s
+[cli] channel READY, port=60001 channel=0x12004f800000
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/jsun/kv_offload_proto/tests/test_torch_dsa_gather_rmt.py", line 98, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/jsun/kv_offload_proto/tests/test_torch_dsa_gather_rmt.py", line 90, in main
+    n = golden_check(host_kv, host_rope, res_kv, res_rope, pool_idx, topk, slots, mask)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jsun/kv_offload_proto/tests/test_dsa_gather_rmt.py", line 74, in golden_check
+    assert torch.equal(kv_flat.index_select(0, dev_idx).cpu(), kv_exp), "kv records mismatch"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: kv records mismatch
+[ERROR] 2026-11-17-18:46:58 (PID:6535, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+Bus error

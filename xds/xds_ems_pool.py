@@ -6,6 +6,7 @@
 # 行分配连续性契约：alloc 优先返回连续行区间（decode 追加行同段延伸），离散段 ≤ 4 兜底
 # —— 内核侧 src 行号 = req_host_base[req] + tokenPos 的公式依赖此契约。
 
+import os
 import time
 from typing import List, Optional
 
@@ -118,13 +119,17 @@ class EmsPool:
     def __init__(self, master_ip: str, master_port: int, device_id: int, layer_num: int, layer_rows: int,
                  row_bytes: int, stripe_rows: int = 1, acl_lib: str = "libascendcl.so",
                  hcomm_lib: str = "libhcomm.so", rootinfo_path: str = "/etc/hccl_rootinfo.json",
-                 timeout_sec: float = 120.0):
+                 timeout_sec: float = 120.0, proto: str = "ubc", dev_ip: Optional[str] = None):
         if layer_num < 1 or layer_rows < 1 or row_bytes <= 0 or row_bytes % 128 != 0:
             raise ValueError("invalid pool dims: L={} rows={} rowBytes={}".format(layer_num, layer_rows, row_bytes))
+        if proto not in ("ubc", "roce"):
+            raise ValueError("proto must be 'ubc' or 'roce', got {}".format(proto))
         if EmsClient is None:
             raise RuntimeError("ems_client package not installed (NPU host only)")
         self._ems = EmsClient(master_ip, master_port, timeout_sec)
         self.device_id = device_id
+        self.proto = proto  # ubc=UBC_CTP+AIV（默认）；roce=ROCE+AICPU（v2，A3 数据面）
+        self.dev_ip = dev_ip  # roce：本 NPU RoCE 参数面 IP（缺省回退 KV_CLI_DEV_IP 环境变量）
         self.rootinfo_path = rootinfo_path  # EID 自动：device→phyId→rootinfo 匹配（与 emsd 同链路）
         self.layer_num = layer_num
         self.layer_rows = layer_rows
@@ -143,7 +148,11 @@ class EmsPool:
     # ── 生命周期 ────────────────────────────────────────────────────────────
     def create_pool(self, hbm_pool_base: int, hbm_pool_size: int, fatbin_path: str,
                     ems_size_bytes: Optional[int] = None) -> None:
-        """EMS 建池（master 打散）→ NPU 侧注册 HBM 池 → 逐段 LINK_EXCHANGE + AIV 通道 → kvops.init。"""
+        """EMS 建池（master 打散）→ NPU 侧注册 HBM 池 → 逐段 LINK_EXCHANGE + 通道 → kvops.init。
+
+        proto=ubc：AIV 通道（UBC_CTP，卡到卡）；proto=roce：AICPU 通道（ROCE，v2 数据面，
+        emsd 须以 --roce --dev-ip 启动），建链后把 thread 登记进 kvops（register_rmt_thread）。
+        """
         if _cli is None or _kvops is None:
             raise RuntimeError("kvops_ext / ems_client native ext not installed (NPU host only)")
         self._ems.connect()
@@ -155,12 +164,17 @@ class EmsPool:
         self.node_num = self.pool.node_num
         self.per_layer_seg_rows = (self.layer_rows + self.node_num - 1) // self.node_num
 
-        _cli.init(self.device_id, self.rootinfo_path, self.acl_lib, self.hcomm_lib)
+        if self.proto == "roce":
+            dev_ip = self.dev_ip if self.dev_ip else os.environ.get("KV_CLI_DEV_IP", "")
+            _cli.init_roce(self.device_id, dev_ip, self.acl_lib, self.hcomm_lib)
+        else:
+            _cli.init(self.device_id, self.rootinfo_path, self.acl_lib, self.hcomm_lib)
         _cli.mem_reg(hbm_pool_base, hbm_pool_size, "kv_hbm")
         local_desc = _cli.local_desc()
         mem_desc = _cli.mem_desc()
 
         self.channels = []
+        rmt_threads = []  # roce：(channel, thread) 对，kvops.init 后统一登记
         for seg in self.pool.segments:
             status = self._ems.link_exchange(seg, local_desc, mem_desc)
             if status != 0:
@@ -175,10 +189,17 @@ class EmsPool:
             if not seg.ep_desc:
                 raise RuntimeError("seg {} has no endpoint desc (emsd too old?): ctrl={}:{}".format(
                     seg.node_id, seg.ctrl_ip, seg.ctrl_port))
-            handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port, seg.channel_tag, 60)
+            if self.proto == "roce":
+                handle, thread, _st = _cli.link_channel_aicpu(seg.ep_desc, seg.hcomm_listen_port,
+                                                              seg.channel_tag, 60)
+                rmt_threads.append((handle, thread))
+            else:
+                handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port, seg.channel_tag, 60)
             self.channels.append(handle)
 
         _kvops.init(self.device_id, fatbin_path)
+        for handle, thread in rmt_threads:
+            _kvops.register_rmt_thread(handle, thread)
         self._status_count = 8 * self.node_num
         self._status_base = _kvops.alloc_status(self._status_count)
 

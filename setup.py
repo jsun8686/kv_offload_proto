@@ -29,8 +29,9 @@ setup(
         Pybind11Extension(
             "kvops_ext._kvops",
             sources=[os.path.join("kvops", "kvops_ext", "kvops_ext.cpp")],
-            # include 形如 "kvc_args.h"（无前缀）→ kernel 目录
-            include_dirs=[os.path.join(ROOT, "kvops", "kernel")],
+            # include 形如 "kvc_args.h"/"dsa_gather_rmt_v2.h"（无前缀）→ kernel + aicpu_kernel 目录
+            include_dirs=[os.path.join(ROOT, "kvops", "kernel"),
+                          os.path.join(ROOT, "kvops", "aicpu_kernel")],
             cxx_std=17,
         ),
     ],

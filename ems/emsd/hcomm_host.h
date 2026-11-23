@@ -2,7 +2,9 @@
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * KV offload prototype is licensed under Mulan PSL v2.
  * emsd host 侧 HCOMM 建链封装：dlsym libhcomm（noDevice 基线构建），Endpoint(HOST, UB_CTP) +
- * MemReg(host 大块) + Export；server 通道在 LINK_EXCHANGE 时按段创建（AIV 引擎）。
+ * MemReg(host 大块) + Export；server 通道在 LINK_EXCHANGE 时按段创建。
+ * 数据面双模：UBC 路径 AIV 引擎；RoCE 路径（v2，A3 + AICPU）AICPU 引擎，endpoint 地址改
+ * 用 NPU RoCE IP（--roce --dev-ip，不再依赖 rootinfo EID）。
  */
 
 #ifndef EMSD_HCOMM_HOST_H
@@ -56,16 +58,20 @@ public:
     //     → EndpointCreate(DEVICE, UB_CTP, COMM_ADDR_TYPE_EID)——PoC 卡到卡同构
     //   host（待跨模式/noDevice 构建包）：commAddr = IP_V6(hostAddr)（app 手填，noDevice 仓
     //     rank_graph 标准填法，V6 即 EID 载体）→ EndpointCreate(HOST, UB_CTP, IP_V6)
-    // 两种模式段内存均恒 host DRAM（mmap）+ COMM_MEM_TYPE_HOST 注册——MemFabric 生产实证组合
-    //   （device_urma ToHcommMem 默认 HOST；HVA 无 DVA 回退注册有先例）
+    // 三种模式（hostLoc/roce 互斥，roce 优先）：
+    //   device（默认）：EID 按 rootinfo 匹配（UBC_CTP，卡到卡）
+    //   host：commAddr=IP_V6(hostAddr)（noDevice 仓 rank_graph 标准填法）
+    //   roce（v2，A3 + AICPU 数据面）：仍挂 device 上下文取 phyId，但 endpoint 地址改用
+    //     NPU RoCE 参数面 IP（devIp，hccn_tool 配置），server 通道引擎 = COMM_ENGINE_AICPU
     int Init(const std::string &hcommLib, const std::string &aclLib, int32_t deviceId,
-             const std::string &rootinfoPath, bool hostLoc, const std::string &hostAddr);
+             const std::string &rootinfoPath, bool hostLoc, const std::string &hostAddr, bool roce = false,
+             const std::string &devIp = "");
     void Close();
 
     // 大块注册+导出（base 由 pool_mgr 分配）；memDesc 供 LINK_EXCHANGE 前经 master 转给框架侧
     int SegRegister(uint32_t segIndex, uint32_t poolId, void *base, uint64_t size, uint16_t hcommListenPort,
                     const std::string &channelTag);
-    // LINK_EXCHANGE：导入对端（框架/NPU 侧）desc/memDesc，创建本段 AIV server 通道并等待 READY
+    // LINK_EXCHANGE：导入对端（框架/NPU 侧）desc/memDesc，创建本段 server 通道（UBC→AIV / ROCE→AICPU）
     int LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t peerDescLen, const uint8_t *peerMemDesc,
                    uint32_t peerMemDescLen, uint32_t readyTimeoutSec);
     int SegRelease(uint32_t segIndex, bool destroyChannel);
@@ -93,6 +99,8 @@ private:
     int32_t (*rtGetDeviceInfoFn_)(uint32_t, int32_t, int32_t, int64_t *) = nullptr;  // 内部接口，可能缺失
     int32_t deviceId_ = -1;
     bool hostLoc_ = true;
+    bool roce_ = false;     // v2：AICPU 数据面 + RoCE endpoint（与 hostLoc_ 互斥）
+    std::string devIp_;     // v2：本 NPU RoCE 参数面 IP（--dev-ip / KV_EMSD_DEV_IP）
 };
 
 #endif  // EMSD_HCOMM_HOST_H
