@@ -286,43 +286,47 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     }
     seg.remoteImported = true;
     seg.peerMemDesc.assign(peerMemDesc, peerMemDesc + peerMemDescLen);
-    // D2a per-core channels (client 声明): create nChannels server channels, port = base+i, same tag.
+    // D2a per-core channels (client 声明), 官方批量姿势：一次 HcommChannelCreate 传 descs[N]（port=base+i）。
+    // 实测教训：逐条独立调用 N 次 (num=1) 时第 2 条在 SocketMgr::GetSocket 的 inUse 自旋等 110s 超时
+    // （HCCL_CONNECT_TIMEOUT 120s - 10s，与前条 SocketConfig 撞等且前条未释放）；批量是官方文档明示的
+    // 多通道用法（channelDescs 数组 + channelNum [1,1048576]）。
     // Each core submits WQE on its own channel only — concurrent SQ writers on one channel lose WQEs (D2c proven).
     seg.segChannels = nChannels;
     const uint32_t nCh = seg.segChannels;
-    printf("[emsd] %s LinkServer ChannelCreate(server) enter, segIndex=%u portBase=%u nChannels=%u\n", TsNow(),
-           segIndex, seg.hcommListenPort, nCh);
+    std::array<HcommChannelDesc, KV_MAX_SEG_CHANNELS> descs{};
+    if (HcommChannelDescInit(descs.data(), nCh) != 0) {  // 连续初始化 nCh 个 desc（官方批量语义）
+        return KV_ERR_HCOMM;
+    }
     for (uint32_t ch = 0; ch < nCh; ++ch) {
-        HcommChannelDesc chDesc;
-        if (HcommChannelDescInit(&chDesc, 1) != 0) {
-            return KV_ERR_HCOMM;
+        descs[ch].remoteEndpoint = *reinterpret_cast<const EndpointDesc *>(peerDesc);
+        descs[ch].notifyNum = 1;
+        descs[ch].exchangeAllMems = true;  // 每段单内存
+        descs[ch].role = HCOMM_SOCKET_ROLE_SERVER;
+        descs[ch].port = static_cast<uint16_t>(seg.hcommListenPort + ch);
+        descs[ch].qos = 0;
+        descs[ch].channelName = const_cast<char *>(seg.channelTag.c_str());
+    }
+    printf("[emsd] %s LinkServer ChannelCreate(server,batch) enter, segIndex=%u portBase=%u nChannels=%u\n", TsNow(),
+           segIndex, seg.hcommListenPort, nCh);
+    // 端口复用重试：上一 run 的 server 通道刚 ChannelDestroy 时，driver 侧监听 socket 可能尚未完全释放，
+    // 立刻同端口重建可能失败；退避重试 3 次（attempt 打日志便于区分是端口残留还是真失败）。
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        seg.channels.fill(0);
+        ret = api_.HcommChannelCreate(endpoint_, COMM_ENGINE_AIV, descs.data(), nCh, seg.channels.data());
+        printf("[emsd] %s LinkServer ChannelCreate(server,batch) ret=%d, segIndex=%u nChannels=%u attempt=%d\n",
+               TsNow(), ret, segIndex, nCh, attempt);
+        if (ret == 0) {
+            break;
         }
-        chDesc.remoteEndpoint = *reinterpret_cast<const EndpointDesc *>(peerDesc);
-        chDesc.notifyNum = 1;
-        chDesc.exchangeAllMems = true;  // 每段单内存
-        chDesc.role = HCOMM_SOCKET_ROLE_SERVER;
-        chDesc.port = static_cast<uint16_t>(seg.hcommListenPort + ch);
-        chDesc.qos = 0;
-        chDesc.channelName = const_cast<char *>(seg.channelTag.c_str());
-        // 端口复用重试：上一 run 的 server 通道刚 ChannelDestroy 时，driver 侧监听 socket 可能尚未完全释放，
-        // 立刻同端口重建可能失败；退避重试 3 次（attempt 打日志便于区分是端口残留还是真失败）。
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            seg.channels[ch] = 0;
-            ret = api_.HcommChannelCreate(endpoint_, COMM_ENGINE_AIV, &chDesc, 1, &seg.channels[ch]);
-            printf("[emsd] %s LinkServer ChannelCreate(server) ret=%d, segIndex=%u ch=%u/%u port=%u attempt=%d\n",
-                   TsNow(), ret, segIndex, ch + 1, nCh, chDesc.port, attempt);
-            if (ret == 0 && seg.channels[ch] != 0) {
-                break;
-            }
-            if (attempt < 2) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
+        if (attempt < 2) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
-        if (ret != 0 || seg.channels[ch] == 0) {
-            printf("[emsd][ERROR] ChannelCreate(AIV,server) failed, poolId=%u segIndex=%u ch=%u/%u port=%u ret=%d\n",
-                   seg.poolId, segIndex, ch + 1, nCh, chDesc.port, ret);
-            return KV_ERR_HCOMM;
-        }
+    }
+    if (ret != 0) {
+        printf("[emsd][ERROR] ChannelCreate(AIV,server,batch) failed, poolId=%u segIndex=%u portBase=%u nChannels=%u "
+               "ret=%d\n",
+               seg.poolId, segIndex, seg.hcommListenPort, nCh, ret);
+        return KV_ERR_HCOMM;
     }
     // 创建即返回：server 侧 READY 依赖框架侧 client 通道建链完成后由 hcomm 内部交换推进，
     // 此处阻塞轮询会与 client 侧建链互等（client 需先收到本响应才会发起 ChannelCreate）。

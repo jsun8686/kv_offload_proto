@@ -181,11 +181,9 @@ class EmsPool:
                 if not seg.ep_desc:
                     raise RuntimeError("seg {} has no endpoint desc (emsd too old?): ctrl={}:{}".format(
                         seg.node_id, seg.ctrl_ip, seg.ctrl_port))
-                # D2a per-core channels (client 声明，emsd 按需开通): server listens on [base, base+n_channels)
-                seg_chs = []
-                for ch_idx in range(n_channels):
-                    handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port + ch_idx, seg.channel_tag, 60)
-                    seg_chs.append(handle)
+                # D2a per-core channels (client 声明，emsd 按需开通): 官方批量姿势——一次 HcommChannelCreate
+                # 建 n_channels 条（server 监听 [base, base+n_channels)），逐条独立调用实测第 2 条必卡死。
+                seg_chs = _cli.link_channels(seg.ep_desc, seg.hcomm_listen_port, seg.channel_tag, n_channels, 60)
                 self.channel_matrix.append(seg_chs)
                 self.channels.append(seg_chs[0])
 

@@ -268,6 +268,112 @@ py::tuple cli_link_channel(const std::string &peerDescBytes, uint16_t hcommPort,
                              std::to_string(hcommPort));
 }
 
+// D2a 批量 client 通道（官方姿势）：一次 HcommChannelCreate 传 descs[count]（port=base+i），
+// HcommChannelGetStatus 数组轮询推动建链状态机至全部 READY。实测教训：逐条独立调用 N 次
+// HcommChannelCreate(num=1) 时第 2 条在 SocketMgr::GetSocket 的 inUse 等待自旋 110s 超时
+// （SocketConfig 撞等 + 前条未释放），批量是官方文档明示的多通道用法（channelNum [1,1048576]）。
+std::vector<uint64_t> cli_link_channels(const std::string &peerDescBytes, uint16_t hcommPort,
+                                        const std::string &channelTag, uint32_t count, uint32_t readyTimeoutSec)
+{
+    if (!g_inited) {
+        throw std::runtime_error("not inited");
+    }
+    if (peerDescBytes.size() != sizeof(EndpointDesc)) {
+        throw std::runtime_error("peer desc size mismatch");
+    }
+    if (count == 0 || count > 48) {
+        throw std::runtime_error("channel count must be in [1,48], got " + std::to_string(count));
+    }
+    std::vector<HcommChannelDesc> descs(count);
+    if (HcommChannelDescInit(descs.data(), count) != 0) {  // 连续初始化 count 个 desc（官方批量语义）
+        throw std::runtime_error("HcommChannelDescInit failed");
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        descs[i].remoteEndpoint = *reinterpret_cast<const EndpointDesc *>(peerDescBytes.data());
+        descs[i].notifyNum = 1;
+        descs[i].exchangeAllMems = true;
+        descs[i].role = HCOMM_SOCKET_ROLE_CLIENT;
+        descs[i].port = static_cast<uint16_t>(hcommPort + i);  // 对端（资源节点）监听端口 base+i
+        descs[i].qos = 0;
+        descs[i].channelName = const_cast<char *>(channelTag.c_str());
+    }
+    std::vector<ChannelHandle> channels(count, 0);
+    printf("[cli] %s ChannelCreate(client,batch) enter, portBase=%u count=%u\n", TsNow(), hcommPort, count);
+    HcommResult ret = g_api.HcommChannelCreate(g_endpoint, COMM_ENGINE_AIV, descs.data(), count, channels.data());
+    printf("[cli] %s ChannelCreate(client,batch) ret=%d, portBase=%u count=%u\n", TsNow(), ret, hcommPort, count);
+    if (ret != 0) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (channels[i] != 0) {
+                (void)g_api.HcommChannelDestroy(&channels[i], 1);
+            }
+        }
+        throw std::runtime_error("ChannelCreate(client,batch) ret=" + std::to_string(ret) + " portBase=" +
+                                 std::to_string(hcommPort));
+    }
+    // GetStatus 是建链状态机的推进器（官方 API 文档）：数组轮询直至全部 READY
+    std::vector<int32_t> statuses(count, -1);
+    std::vector<int32_t> lastStatuses(count, -99);
+    for (uint32_t waited = 0; waited < readyTimeoutSec * 10U; waited++) {
+        ret = g_api.HcommChannelGetStatus(channels.data(), count, statuses.data());
+        if (ret != 0) {
+            for (uint32_t i = 0; i < count; ++i) {
+                (void)g_api.HcommChannelDestroy(&channels[i], 1);
+            }
+            throw std::runtime_error("ChannelGetStatus(batch) ret=" + std::to_string(ret));
+        }
+        bool allReady = true;
+        bool anyTerminal = false;
+        bool anyFlip = false;
+        int32_t terminalIdx = -1;
+        int32_t terminalStatus = -1;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (statuses[i] != lastStatuses[i]) {
+                anyFlip = true;
+                lastStatuses[i] = statuses[i];
+            }
+            if (statuses[i] != 0) {
+                allReady = false;
+            }
+            if (statuses[i] == 2 || statuses[i] == 3) {
+                anyTerminal = true;
+                terminalIdx = static_cast<int32_t>(i);
+                terminalStatus = statuses[i];
+            }
+        }
+        if (anyFlip) {
+            printf("[cli] %s status(batch) portBase=%u waited=%u.%us:", TsNow(), hcommPort, waited / 10U,
+                   (waited % 10U) * 100U);
+            for (uint32_t i = 0; i < count; ++i) {
+                printf(" [%u]=%d", i, statuses[i]);
+            }
+            printf("\n");
+        }
+        if (allReady) {
+            printf("[cli] channels READY(batch), portBase=%u count=%u\n", hcommPort, count);
+            std::vector<uint64_t> handles;
+            handles.reserve(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                handles.push_back(static_cast<uint64_t>(channels[i]));
+            }
+            return handles;
+        }
+        if (anyTerminal) {  // 任一 FAILED/TIMEOUT：终态，销毁整批并报出
+            for (uint32_t i = 0; i < count; ++i) {
+                (void)g_api.HcommChannelDestroy(&channels[i], 1);
+            }
+            throw std::runtime_error("channel[" + std::to_string(terminalIdx) + "] handshake " +
+                                     (terminalStatus == 2 ? "FAILED" : "TIMEOUT") + ", portBase=" +
+                                     std::to_string(hcommPort));
+        }
+        usleep(100 * 1000);
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        (void)g_api.HcommChannelDestroy(&channels[i], 1);
+    }
+    throw std::runtime_error("channels(batch) not ready in " + std::to_string(readyTimeoutSec) + "s, portBase=" +
+                             std::to_string(hcommPort));
+}
+
 void cli_channel_destroy(uint64_t channel)
 {
     ChannelHandle h = static_cast<ChannelHandle>(channel);
@@ -298,6 +404,8 @@ PYBIND11_MODULE(_cli, m)
     m.def("mem_import", &cli_mem_import, py::arg("mem_desc"));
     m.def("link_channel", &cli_link_channel, py::arg("peer_desc"), py::arg("hcomm_port"), py::arg("channel_tag"),
           py::arg("ready_timeout_sec") = 60);
+    m.def("link_channels", &cli_link_channels, py::arg("peer_desc"), py::arg("hcomm_port"), py::arg("channel_tag"),
+          py::arg("count"), py::arg("ready_timeout_sec") = 60);
     m.def("channel_destroy", &cli_channel_destroy, py::arg("channel"));
     m.def("close", &cli_close);
 }
