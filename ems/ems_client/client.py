@@ -78,8 +78,8 @@ class EmsClient:
             self._sock.settimeout(old)
 
     def link_exchange(self, seg: kp.SegmentInfo, endpoint_desc: bytes, mem_desc: bytes,
-                      sock=None) -> int:
-        """与某资源节点 emsd 交换 desc/memDesc（emsd 侧创建 server 通道）。
+                      sock=None, channel_count: int = 1) -> int:
+        """与某资源节点 emsd 交换 desc/memDesc（emsd 侧按 channel_count 创建 server 通道）。
 
         sock 可复用已有连接（每段独立连接也行）。返回 KV_OK=0 表示 emsd 侧通道已创建。
         """
@@ -87,7 +87,7 @@ class EmsClient:
         s = sock if sock is not None else socket.create_connection((seg.ctrl_ip, seg.ctrl_port), timeout=self.timeout)
         try:
             s.settimeout(self.timeout)
-            kp.send_msg(s, kp.CMD_LINK_EXCHANGE, kp.encode_link_frame(endpoint_desc, mem_desc))
+            kp.send_msg(s, kp.CMD_LINK_EXCHANGE, kp.encode_link_frame(endpoint_desc, mem_desc, channel_count))
             cmd, resp = kp.recv_msg(s)
             if cmd != kp.CMD_LINK_EXCHANGE:
                 raise EmsError(kp.KV_ERR_PROTO, "unexpected link resp cmd={}".format(cmd))

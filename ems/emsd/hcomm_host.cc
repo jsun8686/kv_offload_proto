@@ -250,16 +250,22 @@ int EmsdHcomm::SegRegister(uint32_t segIndex, uint32_t poolId, void *base, uint6
     seg.size = size;
     seg.hcommListenPort = hcommListenPort;
     seg.channelTag = channelTag;
-    printf("[emsd] SegRegister ok, poolId=%u segIndex=%u base=%p size=%llu memDescLen=%u\n", poolId, segIndex, base,
-           (unsigned long long)size, descLen);
+    printf("[emsd] SegRegister ok, poolId=%u segIndex=%u base=%p size=%llu memDescLen=%u\n", poolId,
+           segIndex, base, (unsigned long long)size, descLen);
     return KV_OK;
 }
 
 int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t peerDescLen,
-                          const uint8_t *peerMemDesc, uint32_t peerMemDescLen, uint32_t readyTimeoutSec)
+                          const uint8_t *peerMemDesc, uint32_t peerMemDescLen, uint32_t readyTimeoutSec,
+                          uint32_t nChannels)
 {
     if (segIndex >= KV_MAX_SEG_NUM || !segs_[segIndex].used) {
         return KV_ERR_NOT_FOUND;
+    }
+    if (nChannels < 1 || nChannels > KV_MAX_SEG_CHANNELS) {
+        printf("[emsd][ERROR] LinkServer invalid nChannels=%u (valid 1..%u), segIndex=%u\n", nChannels,
+               KV_MAX_SEG_CHANNELS, segIndex);
+        return KV_ERR_PARAM;
     }
     EmsdSeg &seg = segs_[segIndex];
     if (seg.linked) {
@@ -280,48 +286,55 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     }
     seg.remoteImported = true;
     seg.peerMemDesc.assign(peerMemDesc, peerMemDesc + peerMemDescLen);
-    HcommChannelDesc chDesc;
-    if (HcommChannelDescInit(&chDesc, 1) != 0) {
-        return KV_ERR_HCOMM;
-    }
-    chDesc.remoteEndpoint = *reinterpret_cast<const EndpointDesc *>(peerDesc);
-    chDesc.notifyNum = 1;
-    chDesc.exchangeAllMems = true;  // 每段单内存
-    chDesc.role = HCOMM_SOCKET_ROLE_SERVER;
-    chDesc.port = seg.hcommListenPort;
-    chDesc.qos = 0;
-    chDesc.channelName = const_cast<char *>(seg.channelTag.c_str());
-    printf("[emsd] %s LinkServer ChannelCreate(server) enter, segIndex=%u port=%u\n", TsNow(), segIndex,
-           seg.hcommListenPort);
-    // 端口复用重试：上一 run 的 server 通道刚 ChannelDestroy 时，driver 侧监听 socket 可能尚未完全释放，
-    // 立刻同端口重建可能失败；退避重试 3 次（attempt 打日志便于区分是端口残留还是真失败）。
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        seg.channel = 0;
-        ret = api_.HcommChannelCreate(endpoint_, COMM_ENGINE_AIV, &chDesc, 1, &seg.channel);
-        printf("[emsd] %s LinkServer ChannelCreate(server) ret=%d, segIndex=%u attempt=%d\n", TsNow(), ret, segIndex,
-               attempt);
-        if (ret == 0 && seg.channel != 0) {
-            break;
+    // D2a per-core channels (client 声明): create nChannels server channels, port = base+i, same tag.
+    // Each core submits WQE on its own channel only — concurrent SQ writers on one channel lose WQEs (D2c proven).
+    seg.segChannels = nChannels;
+    const uint32_t nCh = seg.segChannels;
+    printf("[emsd] %s LinkServer ChannelCreate(server) enter, segIndex=%u portBase=%u nChannels=%u\n", TsNow(),
+           segIndex, seg.hcommListenPort, nCh);
+    for (uint32_t ch = 0; ch < nCh; ++ch) {
+        HcommChannelDesc chDesc;
+        if (HcommChannelDescInit(&chDesc, 1) != 0) {
+            return KV_ERR_HCOMM;
         }
-        if (attempt < 2) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        chDesc.remoteEndpoint = *reinterpret_cast<const EndpointDesc *>(peerDesc);
+        chDesc.notifyNum = 1;
+        chDesc.exchangeAllMems = true;  // 每段单内存
+        chDesc.role = HCOMM_SOCKET_ROLE_SERVER;
+        chDesc.port = static_cast<uint16_t>(seg.hcommListenPort + ch);
+        chDesc.qos = 0;
+        chDesc.channelName = const_cast<char *>(seg.channelTag.c_str());
+        // 端口复用重试：上一 run 的 server 通道刚 ChannelDestroy 时，driver 侧监听 socket 可能尚未完全释放，
+        // 立刻同端口重建可能失败；退避重试 3 次（attempt 打日志便于区分是端口残留还是真失败）。
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            seg.channels[ch] = 0;
+            ret = api_.HcommChannelCreate(endpoint_, COMM_ENGINE_AIV, &chDesc, 1, &seg.channels[ch]);
+            printf("[emsd] %s LinkServer ChannelCreate(server) ret=%d, segIndex=%u ch=%u/%u port=%u attempt=%d\n",
+                   TsNow(), ret, segIndex, ch + 1, nCh, chDesc.port, attempt);
+            if (ret == 0 && seg.channels[ch] != 0) {
+                break;
+            }
+            if (attempt < 2) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
         }
-    }
-    if (ret != 0 || seg.channel == 0) {
-        printf("[emsd][ERROR] ChannelCreate(AIV,server) failed, poolId=%u segIndex=%u port=%u ret=%d\n", seg.poolId,
-               segIndex, seg.hcommListenPort, ret);
-        return KV_ERR_HCOMM;
+        if (ret != 0 || seg.channels[ch] == 0) {
+            printf("[emsd][ERROR] ChannelCreate(AIV,server) failed, poolId=%u segIndex=%u ch=%u/%u port=%u ret=%d\n",
+                   seg.poolId, segIndex, ch + 1, nCh, chDesc.port, ret);
+            return KV_ERR_HCOMM;
+        }
     }
     // 创建即返回：server 侧 READY 依赖框架侧 client 通道建链完成后由 hcomm 内部交换推进，
     // 此处阻塞轮询会与 client 侧建链互等（client 需先收到本响应才会发起 ChannelCreate）。
     // READY 以框架侧 client 通道 GetStatus 为准。readyTimeoutSec 保留给联调期诊断开关。
     seg.linked = true;
-    printf("[emsd] LinkServer created, poolId=%u segIndex=%u channel=0x%llx\n", seg.poolId, segIndex,
-           (unsigned long long)seg.channel);
+    printf("[emsd] LinkServer created, poolId=%u segIndex=%u channels=%u ch0=0x%llx\n", seg.poolId, segIndex, nCh,
+           (unsigned long long)seg.channels[0]);
     // 诊断（联调期可回退）：后台轮询 server 侧通道状态，观察握手推进到哪一步。
     // 状态语义（对齐 MemFabric hcomm_api_wrapper）：READY=0 / IN_PROGRESS=1 / FAILED=2 / TIMEOUT=3。
     {
-        ChannelHandle ch = seg.channel;
+        // 诊断观察仅取 ch0（多通道下各通道握手进程基本同步，避免 N 条轮询日志刷屏）
+        ChannelHandle ch = seg.channels[0];
         const uint32_t poolId = seg.poolId, segIdx = segIndex;
         std::thread([this, ch, poolId, segIdx] {
             (void)BindDeviceCtx();  // GetStatus 依赖线程私有 device 上下文
@@ -372,8 +385,8 @@ int EmsdHcomm::SegRelease(uint32_t segIndex, bool destroyChannel)
         return KV_ERR_NOT_FOUND;
     }
     EmsdSeg &seg = segs_[segIndex];
-    printf("[emsd] SegRelease begin, poolId=%u segIndex=%u linked=%d ch=0x%llx\n", seg.poolId, segIndex,
-           seg.linked ? 1 : 0, (unsigned long long)seg.channel);
+    printf("[emsd] SegRelease begin, poolId=%u segIndex=%u linked=%d channels=%u ch0=0x%llx\n", seg.poolId, segIndex,
+           seg.linked ? 1 : 0, seg.segChannels, (unsigned long long)seg.channels[0]);
     // 释放对端 import：emsd 常驻，重复 import 同一张 client memDesc 会失败（重跑 -4 的根因）
     if (seg.remoteImported) {
         printf("[emsd] SegRelease HcommMemUnimport begin, segIndex=%u len=%u\n", segIndex,
@@ -382,10 +395,17 @@ int EmsdHcomm::SegRelease(uint32_t segIndex, bool destroyChannel)
                                     static_cast<uint32_t>(seg.peerMemDesc.size()));
         printf("[emsd] SegRelease HcommMemUnimport done, segIndex=%u\n", segIndex);
     }
-    if (destroyChannel && seg.linked && seg.channel != 0) {
-        printf("[emsd] SegRelease HcommChannelDestroy begin, segIndex=%u\n", segIndex);
-        (void)api_.HcommChannelDestroy(&seg.channel, 1);
-        printf("[emsd] SegRelease HcommChannelDestroy done, segIndex=%u\n", segIndex);
+    if (destroyChannel && seg.linked) {
+        for (uint32_t ch = 0; ch < seg.segChannels; ++ch) {
+            if (seg.channels[ch] == 0) {
+                continue;
+            }
+            printf("[emsd] SegRelease HcommChannelDestroy begin, segIndex=%u ch=%u/%u\n", segIndex, ch + 1,
+                   seg.segChannels);
+            (void)api_.HcommChannelDestroy(&seg.channels[ch], 1);
+            printf("[emsd] SegRelease HcommChannelDestroy done, segIndex=%u ch=%u/%u\n", segIndex, ch + 1,
+                   seg.segChannels);
+        }
     }
     if (seg.memHandle != nullptr) {
         printf("[emsd] SegRelease HcommMemUnreg begin, segIndex=%u\n", segIndex);

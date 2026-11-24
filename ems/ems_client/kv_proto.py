@@ -43,7 +43,7 @@ POOL_CREATE_REQ_FMT = "<QIIIII"
 # resp head: status i32, poolId u32, nodeNum u32, reserved u32
 POOL_CREATE_RESP_HEAD_FMT = "<iIII"
 # 段记录: nodeId u32, reserved u32, segBase u64, segSize u64, ctrlIp char[64], ctrlPort u16,
-#         hcommListenPort u16, channelTag char[64], memDescLen u32, reserved2 u32, memDesc u8[4096],
+#         hcommListenPort u16, channelTag char[64], memDescLen u32, channelCount u32, memDesc u8[4096],
 #         epDescLen u32, reserved3 u32, epDesc u8[160]（该节点 endpoint 描述，AIV client remoteEndpoint 用）
 SEG_INFO_FMT = "<IIQQ64sHH64sII{}sII{}s".format(MAX_MEM_DESC, EP_DESC_BUF)
 SEG_INFO_SIZE = struct.calcsize(SEG_INFO_FMT)
@@ -54,8 +54,8 @@ GENERIC_RESP_FMT = "<iI"
 SEG_ALLOC_REQ_FMT = "<IIQHH64s64s"
 SEG_ALLOC_RESP_FMT = "<iiQII{}sII{}s".format(MAX_MEM_DESC, EP_DESC_BUF)
 
-# LINK 帧: descLen u32, desc[160], memDescLen u32, memDesc[4096]
-LINK_FRAME_FMT = "<I{}sI{}s".format(EP_DESC_BUF, MAX_MEM_DESC)
+# LINK 帧: descLen u32, desc[160], memDescLen u32, memDesc[4096], channelCount u32（D2a 按需开通）
+LINK_FRAME_FMT = "<I{}sI{}sI".format(EP_DESC_BUF, MAX_MEM_DESC)
 LINK_FRAME_SIZE = struct.calcsize(LINK_FRAME_FMT)
 
 
@@ -135,13 +135,15 @@ def decode_pool_create_resp(payload: bytes) -> tuple:
     return status, pool
 
 
-def encode_link_frame(endpoint_desc: bytes, mem_desc: bytes) -> bytes:
-    # struct 's' 对超长 bytes 静默截断——显式拒绝，避免线上出现 descLen 与内容不一致的半帧
+def encode_link_frame(endpoint_desc: bytes, mem_desc: bytes, channel_count: int = 1) -> bytes:
+    # struct 's' 对超长 bytes 默认截断；显式拒绝比静默截断的包错对不上更安全
     if len(endpoint_desc) > EP_DESC_BUF:
         raise ValueError("endpoint_desc too long: {} > {}".format(len(endpoint_desc), EP_DESC_BUF))
     if len(mem_desc) > MAX_MEM_DESC:
         raise ValueError("mem_desc too long: {} > {}".format(len(mem_desc), MAX_MEM_DESC))
-    return struct.pack(LINK_FRAME_FMT, len(endpoint_desc), endpoint_desc, len(mem_desc), mem_desc)
+    if channel_count < 1 or channel_count > 48:
+        raise ValueError("channel_count must be in [1,48], got {}".format(channel_count))
+    return struct.pack(LINK_FRAME_FMT, len(endpoint_desc), endpoint_desc, len(mem_desc), mem_desc, channel_count)
 
 
 def encode_pool_destroy_req(pool_id: int) -> bytes:

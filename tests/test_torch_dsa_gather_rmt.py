@@ -63,9 +63,10 @@ def main():
     res_rope.fill_(SENTINEL)
 
     pool = EmsPool(ip, int(port), args.device, layer_num=1, layer_rows=POOL_ROWS, row_bytes=KV_DIM * 2)
-    pool.create_pool(hbm.data_ptr(), hbm.numel() * 2, fatbin)
+    pool.create_pool(hbm.data_ptr(), hbm.numel() * 2, fatbin, n_channels=args.block_dim)
     perm = torch.randperm(HOST_BLK_NUM) if args.perm else None
-    rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(host_kv, host_rope, BLOCK_SIZE, KV_DIM, ROPE_DIM, perm)
+    rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(host_kv, host_rope, BLOCK_SIZE, KV_DIM, ROPE_DIM, perm,
+                                                         n_core=args.block_dim)
 
     host_tbl = torch.arange(HOST_BLK_NUM, dtype=torch.int32, device=dev).view(BS, KEY_LEN // BLOCK_SIZE)
     res_tbl = torch.arange(RES_BLK_NUM, dtype=torch.int32, device=dev).view(BS, -1)

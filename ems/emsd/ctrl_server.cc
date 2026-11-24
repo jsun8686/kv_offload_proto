@@ -488,7 +488,8 @@ int EmsdCtrlServer::OnLinkExchange(const std::vector<uint8_t> &payload, int fd)
     }
     const KvLinkFrame *frame = reinterpret_cast<const KvLinkFrame *>(payload.data());
     if (frame->descLen == 0 || frame->descLen > KV_EP_DESC_BUF || frame->memDescLen == 0 ||
-        frame->memDescLen > KV_MAX_MEM_DESC) {
+        frame->memDescLen > KV_MAX_MEM_DESC || frame->channelCount < 1 ||
+        frame->channelCount > KV_MAX_SEG_CHANNELS) {
         KvGenericResp resp{KV_ERR_PROTO, 0};
         return SendResp(fd, KV_CMD_LINK_EXCHANGE, &resp, sizeof(resp));
     }
@@ -503,7 +504,7 @@ int EmsdCtrlServer::OnLinkExchange(const std::vector<uint8_t> &payload, int fd)
     int status = KV_ERR_STATE;
     if (segIndex < KV_MAX_SEG_NUM) {
         status = hcomm_.LinkServer(segIndex, frame->endpointDesc, frame->descLen, frame->memDesc, frame->memDescLen,
-                                   cfg_.readyTimeoutSec);
+                                   cfg_.readyTimeoutSec, frame->channelCount);
     }
     KvGenericResp resp{status, 0};
     return SendResp(fd, KV_CMD_LINK_EXCHANGE, &resp, sizeof(resp));

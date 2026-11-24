@@ -42,10 +42,11 @@ struct EmsdSeg {
     std::vector<uint8_t> memDesc;
     uint16_t hcommListenPort = 0;
     std::string channelTag;
-    bool linked = false;      // LINK_EXCHANGE 完成（server 通道已建）
-    ChannelHandle channel = 0;
-    bool remoteImported = false;       // LINK_EXCHANGE 导入的对端 mem 是否未释放（重跑前必须 Unimport）
-    std::vector<uint8_t> peerMemDesc;  // 对端 memDesc 副本：供 SegRelease 精确 Unimport（重复 import 同 desc 会失败 -4）
+    bool linked = false;      // LINK_EXCHANGE done (server channels created)
+    uint32_t segChannels = 1;                                   // D2a: per-core channels, port = base+i
+    std::array<ChannelHandle, KV_MAX_SEG_CHANNELS> channels{};  // D2a: channel[0] keeps legacy single-channel role
+    bool remoteImported = false;       // remote mem imported at LINK_EXCHANGE (Unimport before release)
+    std::vector<uint8_t> peerMemDesc;  // peer memDesc copy (SegRelease Unimport; re-import same desc fails -4)
 };
 
 class EmsdHcomm {
@@ -65,9 +66,10 @@ public:
     // 大块注册+导出（base 由 pool_mgr 分配）；memDesc 供 LINK_EXCHANGE 前经 master 转给框架侧
     int SegRegister(uint32_t segIndex, uint32_t poolId, void *base, uint64_t size, uint16_t hcommListenPort,
                     const std::string &channelTag);
-    // LINK_EXCHANGE：导入对端（框架/NPU 侧）desc/memDesc，创建本段 AIV server 通道并等待 READY
+    // LINK_EXCHANGE：导入对端（框架/NPU 侧）desc/memDesc，按 client 声明的 nChannels 创建 per-core
+    // AIV server 通道（port = base+i）并等待 READY；nChannels 校验 [1, KV_MAX_SEG_CHANNELS]
     int LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t peerDescLen, const uint8_t *peerMemDesc,
-                   uint32_t peerMemDescLen, uint32_t readyTimeoutSec);
+                   uint32_t peerMemDescLen, uint32_t readyTimeoutSec, uint32_t nChannels);
     int SegRelease(uint32_t segIndex, bool destroyChannel);
 
     // 设备上下文线程私有：aclrtSetDevice 仅在 Init 所在线程生效，每连接一个线程后

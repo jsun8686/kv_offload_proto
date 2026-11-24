@@ -57,12 +57,12 @@ def _elem_size(dt):
 
 def _validate(resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
               request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size,
-              num_requests, host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr):
+              num_requests, host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
     """全量校验（submit 与同步组合共用）；返回 launch 所需推导量。"""
     bs = int(block_size)
     nreq = int(num_requests)
-    if bs <= 0 or nreq <= 0:
-        raise ValueError("block_size/num_requests must be positive")
+    if bs <= 0 or nreq <= 0 or int(block_dim) <= 0:
+        raise ValueError("block_size/num_requests/block_dim must be positive")
     for t, name in ((resident_kv_cache, "resident_kv_cache"), (resident_rope_cache, "resident_rope_cache")):
         if t.dim() != 4 or t.shape[2] != 1:
             raise ValueError("%s: shape must be [P, block_size, 1, dim], got %s" % (name, tuple(t.shape)))
@@ -106,10 +106,14 @@ def _validate(resident_kv_cache, resident_rope_cache, resident_block_table, host
         raise ValueError("num_requests=%d inconsistent: pool_indices=%s, resident_table=%s, topk rows=%d" % (
             nreq, tuple(request_pool_indices.shape), tuple(resident_block_table.shape),
             topk_token_positions.shape[0]))
-    host_blk_num = host_rmt_channel.shape[0]
-    if host_rmt_kv_addr.shape[0] != host_blk_num or host_rmt_rope_addr.shape[0] != host_blk_num:
-        raise ValueError("host_rmt_* tables length %d/%d/%d inconsistent" % (
-            host_blk_num, host_rmt_kv_addr.shape[0], host_rmt_rope_addr.shape[0]))
+    # D2a 每核独立通道：addr 表长度 = host 块数（内核 hostBlkNum 锚），channel 表平铺 [host_blk_num × block_dim]
+    host_blk_num = host_rmt_kv_addr.shape[0]
+    if host_rmt_rope_addr.shape[0] != host_blk_num:
+        raise ValueError("host_rmt_kv/rope_addr tables length %d/%d inconsistent" % (
+            host_blk_num, host_rmt_rope_addr.shape[0]))
+    if host_rmt_channel.shape[0] != host_blk_num * int(block_dim):
+        raise ValueError("host_rmt_channel length %d != host_blk_num %d x block_dim %d (re-export pool with "
+                         "n_core=block_dim)" % (host_rmt_channel.shape[0], host_blk_num, int(block_dim)))
     tensors = (resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
                request_pool_indices, topk_token_positions, resident_slots, miss_mask,
                host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr)
@@ -131,9 +135,7 @@ def npu_dsa_gather_rmt_submit(resident_kv_cache, resident_rope_cache, resident_b
     bs, nreq, kv_dim, rope_dim, kv_elem, rope_elem, res_blk, host_blk = _validate(
         resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
         request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size, num_requests,
-        host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr)
-    if int(block_dim) <= 0:
-        raise ValueError("block_dim must be positive")
+        host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=int(block_dim))
     st = _acquire_status(resident_kv_cache.device, int(block_dim))
     stream = torch.npu.current_stream().npu_stream
     _kvops.dsa_gather_rmt(

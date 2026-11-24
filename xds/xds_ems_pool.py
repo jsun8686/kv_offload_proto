@@ -135,17 +135,21 @@ class EmsPool:
         self.pool = None
         self.node_num = 0
         self.per_layer_seg_rows = 0
-        self.channels = []
+        self.channels = []          # per segment: channels[s][0] (legacy single-channel view)
+        self.channel_matrix = []    # D2a: channel_matrix[s] = [handle × channel_count] (per-core channels)
         self._status_base = 0
         self._status_count = 0
         self._status_cursor = 0
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
     def create_pool(self, hbm_pool_base: int, hbm_pool_size: int, fatbin_path: str,
-                    ems_size_bytes: Optional[int] = None) -> None:
-        """EMS 建池（master 打散）→ NPU 侧注册 HBM 池 → 逐段 LINK_EXCHANGE + AIV 通道 → kvops.init。"""
+                    ems_size_bytes: Optional[int] = None, n_channels: int = 1) -> None:
+        """EMS 建池（master 打散）→ NPU 侧注册 HBM 池 → 逐段 LINK_EXCHANGE（声明 n_channels 条
+        per-core 通道，emsd 按需开通）→ AIV 通道 → kvops.init。"""
         if _cli is None or _kvops is None:
             raise RuntimeError("kvops_ext / ems_client native ext not installed (NPU host only)")
+        if n_channels < 1 or n_channels > 48:
+            raise ValueError("n_channels must be in [1,48], got %d" % n_channels)
         self._ems.connect()
         self._ems.ping()  # 建池前连通性自检（失败含 master 地址，便于定位）
         if ems_size_bytes is None:
@@ -161,6 +165,7 @@ class EmsPool:
         mem_desc = _cli.mem_desc()
 
         self.channels = []
+        self.channel_matrix = []
         for seg in self.pool.segments:
             status = self._ems.link_exchange(seg, local_desc, mem_desc)
             if status != 0:
@@ -175,8 +180,13 @@ class EmsPool:
             if not seg.ep_desc:
                 raise RuntimeError("seg {} has no endpoint desc (emsd too old?): ctrl={}:{}".format(
                     seg.node_id, seg.ctrl_ip, seg.ctrl_port))
-            handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port, seg.channel_tag, 60)
-            self.channels.append(handle)
+            # D2a per-core channels (client 声明，emsd 按需开通): server listens on [base, base+n_channels)
+            seg_chs = []
+            for ch_idx in range(n_channels):
+                handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port + ch_idx, seg.channel_tag, 60)
+                seg_chs.append(handle)
+            self.channel_matrix.append(seg_chs)
+            self.channels.append(seg_chs[0])
 
         _kvops.init(self.device_id, fatbin_path)
         self._status_count = 8 * self.node_num
@@ -202,7 +212,8 @@ class EmsPool:
             return time.time() - t0
 
         if _cli is not None:
-            for h in self.channels:
+            all_handles = [h for seg_chs in self.channel_matrix for h in seg_chs] or self.channels
+            for h in all_handles:
                 try:
                     print("[pool] channel_destroy 0x%x begin (+%.1fs)" % (int(h), _elap()))
                     _cli.channel_destroy(h)
@@ -283,7 +294,7 @@ class EmsPool:
     # 内核寻址约定（gather_selection_rmt）：块内 kv 连续 / 块内 rope 连续，addr 表给每块基址。
     # perm[q] = 块 q 的全局槽位（None 恒等：段 q//per_node、槽 q%per_node）。
     def export_full_rmt_pool(self, full_kv, full_rope, block_size: int, kv_dim: int, rope_dim: int,
-                             perm=None, stream: int = 0):
+                             perm=None, stream: int = 0, n_core: int = 1):
         if self.pool is None or not self.channels:
             raise RuntimeError("pool not created")
         n = self.node_num
@@ -342,14 +353,20 @@ class EmsPool:
         self.wait(st)
 
         # 三表：段内字节偏移（kv 区满容量偏移对齐 rope 区，与段内容构造一致）
+        # D2a 每核独立通道：rmt_channel 平铺为 [f_blk × n_core]（块 q 的核 c → chn_matrix[q][c]），
+        # kv/rope addr 表长度不变（地址与通道无关）；n_core=1 时与旧布局逐字节一致（向后兼容）。
         blk_kv_bytes = block_size * kv_dim * 2
         blk_rope_bytes = block_size * rope_dim * 2
         rope_region_off = kv_rows_full * self.row_bytes
         seg_base = torch.tensor([s.seg_base for s in self.pool.segments[:n]], dtype=torch.int64, device=dev)
-        chn = torch.tensor([int(c) for c in self.channels[:n]], dtype=torch.int64, device=dev)
+        if any(len(chs) < n_core for chs in self.channel_matrix[:n]):
+            raise ValueError("n_core={} exceeds linked channels (re-create pool with larger n_channels)".format(
+                n_core))
+        chn_matrix = torch.tensor([[int(c) for c in chs[:n_core]] for chs in self.channel_matrix[:n]],
+                                  dtype=torch.int64, device=dev)  # [n, n_core]
         route = route.to(dev)
         slot = slot.to(dev)
-        rmt_channel = chn[route]
+        rmt_channel = chn_matrix[route].reshape(f_blk * n_core)  # [q*n_core + c]
         rmt_kv_addr = seg_base[route] + slot * blk_kv_bytes
         rmt_rope_addr = seg_base[route] + rope_region_off + slot * blk_rope_bytes
         return rmt_channel, rmt_kv_addr, rmt_rope_addr

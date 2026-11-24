@@ -108,11 +108,12 @@ def main():
     res_rope.fill_(SENTINEL)
 
     pool = EmsPool(ip, int(port), args.device, layer_num=1, layer_rows=POOL_ROWS, row_bytes=KV_DIM * 2)
-    pool.create_pool(hbm.data_ptr(), hbm.numel() * 2, fatbin)
+    pool.create_pool(hbm.data_ptr(), hbm.numel() * 2, fatbin, n_channels=args.block_dim)
     perm = torch.randperm(HOST_BLK_NUM) if args.perm else None
-    rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(host_kv, host_rope, BLOCK_SIZE, KV_DIM, ROPE_DIM, perm)
-    print("[test] rmt tables: ch=0x%x kv[0]=0x%x rope[0]=0x%x perm=%s" % (
-        int(rmt_ch[0]), int(rmt_kv[0]), int(rmt_rope[0]), "on" if args.perm else "off"))
+    rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(host_kv, host_rope, BLOCK_SIZE, KV_DIM, ROPE_DIM, perm,
+                                                         n_core=args.block_dim)
+    print("[test] rmt tables: ch=0x%x kv[0]=0x%x rope[0]=0x%x perm=%s n_core=%d" % (
+        int(rmt_ch[0]), int(rmt_kv[0]), int(rmt_rope[0]), "on" if args.perm else "off", args.block_dim))
 
     # 索引元数据（语义对齐原版 test.py 构造）
     host_tbl = torch.arange(HOST_BLK_NUM, dtype=torch.int32, device=dev).view(BS, HOST_BLK_PER_REQ)

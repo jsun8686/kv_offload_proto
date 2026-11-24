@@ -39,6 +39,9 @@ enum KvStatus : int32_t {
 constexpr uint32_t KV_MAX_MEM_DESC = 4096;
 constexpr uint32_t KV_CHANNEL_HANDLE_SIZE = 256;  // ChannelEntity ABI（opaque，透传 AIV 内核）
 constexpr uint32_t KV_MAX_SEG_NUM = 8;
+// D2a 每核独立通道：每段最多 48 条 AIV server 通道（port = hcommListenPort + i），
+// 数量经 KvSegInfoRec.reserved2 下发（1=单通道向后兼容）
+constexpr uint32_t KV_MAX_SEG_CHANNELS = 48;
 // EndpointDesc 实测 sizeof=160（CommProtocol 4 + CommAddr 40 + EndpointLoc 64 + raws 52，
 // 见 hcomm_res_defs.h；hcomm_host.cc 有 static_assert 锚定），128 装不下会导致
 // LINK_EXCHANGE 被 KV_ERR_PROTO 拒绝（descLen > KV_EP_DESC_BUF）且 Python 侧 128s 静默截断
@@ -134,6 +137,8 @@ struct KvLinkFrame {
     uint8_t endpointDesc[KV_EP_DESC_BUF];
     uint32_t memDescLen;
     uint8_t memDesc[KV_MAX_MEM_DESC];
+    uint32_t channelCount;  // D2a: client 声明所需每段通道数（=blockDim，1..KV_MAX_SEG_CHANNELS），
+                            // emsd 按需开通（server port = base+i），应答通过即开通完毕
 };
 #pragma pack(pop)
 

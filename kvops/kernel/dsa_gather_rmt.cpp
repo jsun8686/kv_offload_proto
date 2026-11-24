@@ -121,7 +121,8 @@ extern "C" __global__ __aicore__ void dsa_gather_rmt(
                                 (static_cast<uint64_t>(dstBlk) * bs + dstOff) * kvRecBytes;
                             const uint64_t dstRopeOff =
                                 (static_cast<uint64_t>(dstBlk) * bs + dstOff) * ropeRecBytes;
-                            const int64_t ch = chTbl[srcBlk];
+                            // D2a 每核独立通道：chTbl 平铺 [hostBlkNum × coreCount]，块 q 核 c → chTbl[q*coreCount+c]
+                            const int64_t ch = chTbl[static_cast<uint64_t>(srcBlk) * coreCount + coreId];
                             if (!hcommInited) {
                                 int32_t ret = hcomm.Init(ws, KVC_HCOMM_WS_SIZE);
                                 if (ret != 0) {
