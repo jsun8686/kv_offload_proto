@@ -340,34 +340,61 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     seg.linked = true;
     printf("[emsd] LinkServer created, poolId=%u segIndex=%u channels=%u ch0=0x%llx\n", seg.poolId, segIndex, nCh,
            (unsigned long long)seg.channels[0]);
-    // 诊断（联调期可回退）：后台轮询 server 侧通道状态，观察握手推进到哪一步。
+    // server 侧状态机驱动线程（非纯诊断）：HcommChannelGetStatus 是建链状态机的推进器
+    // （官方 API 文档语义；socket 层 connect 异步结果收割/GetOneSocket 配对均由其触发）。
+    // D2a 实测教训：只轮 ch0 时 ch1 的 server 侧 connect 无人收割——tag 永不发给对端，
+    // 配对永不发生（client[1] 永远 IN_PROGRESS）。故必须数组轮询全部 N 条直至 READY。
     // 状态语义（对齐 MemFabric hcomm_api_wrapper）：READY=0 / IN_PROGRESS=1 / FAILED=2 / TIMEOUT=3。
     {
-        // 诊断观察仅取 ch0（多通道下各通道握手进程基本同步，避免 N 条轮询日志刷屏）
-        ChannelHandle ch = seg.channels[0];
-        const uint32_t poolId = seg.poolId, segIdx = segIndex;
-        std::thread([this, ch, poolId, segIdx] {
+        const uint32_t poolId = seg.poolId, segIdx = segIndex, nChs = nCh;
+        std::thread([this, poolId, segIdx, nChs] {
             (void)BindDeviceCtx();  // GetStatus 依赖线程私有 device 上下文
-            int32_t lastStatus = -99;
-            for (int i = 0; i < 120; ++i) {  // 120s 窗口 @1s：覆盖 35s 握手全程，翻转即打时间戳
-                if (this->GetSeg(segIdx) == nullptr) {  // 段已 SegRelease：勿再查已销毁句柄（r=4 噪声）
+            std::array<ChannelHandle, KV_MAX_SEG_CHANNELS> chs{};
+            std::array<int32_t, KV_MAX_SEG_CHANNELS> statuses{};
+            std::array<int32_t, KV_MAX_SEG_CHANNELS> lastStatuses{};
+            lastStatuses.fill(-99);
+            for (int i = 0; i < 120; ++i) {  // 120s 窗口 @1s：覆盖握手全程，翻转即打时间戳
+                const EmsdSeg *seg = this->GetSeg(segIdx);  // 段已 SegRelease：勿再查已销毁句柄（r=4 噪声）
+                if (seg == nullptr) {
                     printf("[emsd] %s chStatus poolId=%u segIndex=%u seg released, stop poll\n", TsNow(), poolId,
                            segIdx);
                     break;
                 }
-                int32_t status = -1;
-                const int r = api_.HcommChannelGetStatus(&ch, 1, &status);
-                if (status != lastStatus || i % 10 == 0) {
-                    printf("[emsd] %s chStatus poolId=%u segIndex=%u r=%d status=%d (0=READY 1=IN_PROGRESS 2=FAILED "
-                           "3=TIMEOUT)%s\n",
-                           TsNow(), poolId, segIdx, r, status, status != lastStatus ? " FLIP" : "");
-                    lastStatus = status;
+                const uint32_t n = seg->segChannels < nChs ? seg->segChannels : nChs;
+                if (n == 0 || n > KV_MAX_SEG_CHANNELS) {
+                    break;
                 }
-                if (status == 0) {
+                (void)memcpy(chs.data(), seg->channels.data(), n * sizeof(ChannelHandle));
+                const int r = api_.HcommChannelGetStatus(chs.data(), n, statuses.data());
+                bool anyFlip = false;
+                bool allReady = true;
+                bool anyTerminal = false;
+                for (uint32_t c = 0; c < n; ++c) {
+                    if (statuses[c] != lastStatuses[c]) {
+                        anyFlip = true;
+                        lastStatuses[c] = statuses[c];
+                    }
+                    if (statuses[c] != 0) {
+                        allReady = false;
+                    }
+                    if (statuses[c] == 2 || statuses[c] == 3) {  // FAILED / TIMEOUT 终态
+                        anyTerminal = true;
+                    }
+                }
+                if (anyFlip || i % 10 == 0) {
+                    printf("[emsd] %s chStatus poolId=%u segIndex=%u r=%d (0=READY 1=IN_PROGRESS 2=FAILED "
+                           "3=TIMEOUT):",
+                           TsNow(), poolId, segIdx, r);
+                    for (uint32_t c = 0; c < n; ++c) {
+                        printf(" [%u]=%d", c, statuses[c]);
+                    }
+                    printf("%s\n", anyFlip ? " FLIP" : "");
+                }
+                if (allReady || anyTerminal) {
                     break;
                 }
                 fflush(stdout);
-                if (r != 0 || status == 0 || status == 2 || status == 3) {
+                if (r != 0) {
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(1));
