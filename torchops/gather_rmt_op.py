@@ -116,9 +116,8 @@ def _validate(selection_k_rope, selection_kv_cache, selection_kv_block_table, se
     if full_rmt_kv_addr.shape[0] != f_blk_num or full_rmt_rope_addr.shape[0] != f_blk_num:
         raise ValueError("full_rmt_* tables length %d/%d/%d != F_BLOCK_NUM %d" % (
             full_rmt_channel.shape[0], full_rmt_kv_addr.shape[0], full_rmt_rope_addr.shape[0], f_blk_num))
-    has_local = bool((full_rmt_channel == 0).any().item()) if f_blk_num > 0 else False
-    if full_empty and has_local:
-        raise ValueError("full pools empty but channel table has local(0) entries")
+    # 注：不做值相关校验（如 channel 含 0 互斥）——.item() 是 D2H 同步，capture 区间非法（EE1016）；
+    # 该检查挪到同步组合（eager）路径执行，图模式由调用方保证 channel 全非 0
     tensors = (selection_k_rope, selection_kv_cache, selection_kv_block_table,
                selection_kv_block_status, selection_topk_indices, full_kv_block_table,
                full_kv_actual_seq, full_q_actual_seq, full_rmt_channel, full_rmt_kv_addr,
@@ -189,6 +188,9 @@ def npu_gather_selection_kv_cache_rmt(selection_k_rope, selection_kv_cache, sele
                                       full_q_actual_seq, full_rmt_channel, full_rmt_kv_addr,
                                       full_rmt_rope_addr, selection_topk_block_size=1, block_size=8):
     """同步组合（eager 语义）：submit + wait，返回 selection_kv_actual_seq [B*S*H] int32。"""
+    full_empty = full_kv_cache.numel() == 0 or full_k_rope.numel() == 0
+    if full_empty and full_rmt_channel.numel() > 0 and bool((full_rmt_channel == 0).any().item()):
+        raise ValueError("full pools empty but channel table has local(0) entries")  # 值校验仅 eager 路径
     handle = npu_gather_selection_kv_cache_rmt_submit(
         selection_k_rope, selection_kv_cache, selection_kv_block_table, selection_kv_block_status,
         selection_topk_indices, full_k_rope, full_kv_cache, full_kv_block_table, full_kv_actual_seq,
