@@ -286,14 +286,19 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
     }
     seg.remoteImported = true;
     seg.peerMemDesc.assign(peerMemDesc, peerMemDesc + peerMemDescLen);
-    // D2a per-core channels (client 声明), 官方批量姿势：一次 HcommChannelCreate 传 descs[N]（port=base+i）。
-    // 实测教训：逐条独立调用 N 次 (num=1) 时第 2 条在 SocketMgr::GetSocket 的 inUse 自旋等 110s 超时
-    // （HCCL_CONNECT_TIMEOUT 120s - 10s，与前条 SocketConfig 撞等且前条未释放）；批量是官方文档明示的
-    // 多通道用法（channelDescs 数组 + channelNum [1,1048576]）。
+    // D2a per-core channels (client 声明), 官方批量姿势：一次 HcommChannelCreate 传 descs[N]。
+    // 配对规则（源码实证，两轮踩坑沉淀）：
+    //   1) listen 是 endpoint 级单端口（StartListen→HcommEndpointStartListen 幂等），port=base+i 会被
+    //      架空——ch2 永远等不到 60002 上的连接，ChannelCreate 内阻塞 110s 卡死 LINK_EXCHANGE 应答；
+    //      故所有通道 port 全部用 base。
+    //   2) 多通道的区分维度是 channelName（SocketConfig=(link, port, tag, role)，hccpTag=tag+ip+ip+port）：
+    //      每通道 tag 唯一化（tag_i，两端同规则）→ 各自独立 socketMap entry → 按 hccp tag 配对建链。
+    //   3) 逐条独立调用 N 次 (num=1) 时第 2 条在 SocketMgr::GetSocket 撞等自旋 110s——批量是官方姿势。
     // Each core submits WQE on its own channel only — concurrent SQ writers on one channel lose WQEs (D2c proven).
     seg.segChannels = nChannels;
     const uint32_t nCh = seg.segChannels;
     std::array<HcommChannelDesc, KV_MAX_SEG_CHANNELS> descs{};
+    std::array<std::string, KV_MAX_SEG_CHANNELS> chNames{};
     if (HcommChannelDescInit(descs.data(), nCh) != 0) {  // 连续初始化 nCh 个 desc（官方批量语义）
         return KV_ERR_HCOMM;
     }
@@ -302,9 +307,10 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
         descs[ch].notifyNum = 1;
         descs[ch].exchangeAllMems = true;  // 每段单内存
         descs[ch].role = HCOMM_SOCKET_ROLE_SERVER;
-        descs[ch].port = static_cast<uint16_t>(seg.hcommListenPort + ch);
+        descs[ch].port = seg.hcommListenPort;  // 全部用 base：listen 是 endpoint 级，非通道级
         descs[ch].qos = 0;
-        descs[ch].channelName = const_cast<char *>(seg.channelTag.c_str());
+        chNames[ch] = seg.channelTag + "_" + std::to_string(ch);  // tag 唯一化（配对键），持有所有权防悬垂
+        descs[ch].channelName = const_cast<char *>(chNames[ch].c_str());
     }
     printf("[emsd] %s LinkServer ChannelCreate(server,batch) enter, segIndex=%u portBase=%u nChannels=%u\n", TsNow(),
            segIndex, seg.hcommListenPort, nCh);

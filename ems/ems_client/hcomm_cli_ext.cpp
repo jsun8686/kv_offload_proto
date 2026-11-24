@@ -268,10 +268,10 @@ py::tuple cli_link_channel(const std::string &peerDescBytes, uint16_t hcommPort,
                              std::to_string(hcommPort));
 }
 
-// D2a 批量 client 通道（官方姿势）：一次 HcommChannelCreate 传 descs[count]（port=base+i），
-// HcommChannelGetStatus 数组轮询推动建链状态机至全部 READY。实测教训：逐条独立调用 N 次
-// HcommChannelCreate(num=1) 时第 2 条在 SocketMgr::GetSocket 的 inUse 等待自旋 110s 超时
-// （SocketConfig 撞等 + 前条未释放），批量是官方文档明示的多通道用法（channelNum [1,1048576]）。
+// D2a 批量 client 通道（官方姿势）：一次 HcommChannelCreate 传 descs[count]。
+// 配对规则（源码实证）：listen 是 endpoint 级单端口，所有通道 port 全部用 base；
+// 多通道区分维度是 channelName——每通道 tag 唯一化（tag_i，与 emsd 同规则）作 hccp 配对键。
+// 逐条独立调用 N 次 (num=1) 时第 2 条在 SocketMgr::GetSocket 撞等自旋 110s 超时，批量是官方姿势。
 std::vector<uint64_t> cli_link_channels(const std::string &peerDescBytes, uint16_t hcommPort,
                                         const std::string &channelTag, uint32_t count, uint32_t readyTimeoutSec)
 {
@@ -285,6 +285,7 @@ std::vector<uint64_t> cli_link_channels(const std::string &peerDescBytes, uint16
         throw std::runtime_error("channel count must be in [1,48], got " + std::to_string(count));
     }
     std::vector<HcommChannelDesc> descs(count);
+    std::vector<std::string> chNames(static_cast<size_t>(count));  // 持有所有权防悬垂
     if (HcommChannelDescInit(descs.data(), count) != 0) {  // 连续初始化 count 个 desc（官方批量语义）
         throw std::runtime_error("HcommChannelDescInit failed");
     }
@@ -293,9 +294,10 @@ std::vector<uint64_t> cli_link_channels(const std::string &peerDescBytes, uint16
         descs[i].notifyNum = 1;
         descs[i].exchangeAllMems = true;
         descs[i].role = HCOMM_SOCKET_ROLE_CLIENT;
-        descs[i].port = static_cast<uint16_t>(hcommPort + i);  // 对端（资源节点）监听端口 base+i
+        descs[i].port = hcommPort;  // 全部用 base：listen 是 endpoint 级，非通道级
         descs[i].qos = 0;
-        descs[i].channelName = const_cast<char *>(channelTag.c_str());
+        chNames[i] = channelTag + "_" + std::to_string(i);  // tag 唯一化（配对键），与 emsd 同规则
+        descs[i].channelName = const_cast<char *>(chNames[i].c_str());
     }
     std::vector<ChannelHandle> channels(count, 0);
     printf("[cli] %s ChannelCreate(client,batch) enter, portBase=%u count=%u\n", TsNow(), hcommPort, count);
