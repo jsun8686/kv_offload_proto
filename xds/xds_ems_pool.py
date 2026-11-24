@@ -182,9 +182,14 @@ class EmsPool:
                     raise RuntimeError("seg {} has no endpoint desc (emsd too old?): ctrl={}:{}".format(
                         seg.node_id, seg.ctrl_ip, seg.ctrl_port))
                 # D2a per-core channels (client 声明，emsd 按需开通): server listens on [base, base+n_channels)
+                # channelName 必须逐通道唯一：hcomm 9.1.0 AIV_URMA 的 socket key = (endpoint对地址, channelName)，
+                # desc.port 不进 key（v9.1.0 aiv_urma_channel.cc BuildSocket 实证）；同 tag 的第二条通道会在
+                # SocketMgr::GetSocket 等第一条的 socket 释放，互等 110s 后 ret=9（dev7 双侧实测+源码实锤）。
+                # 双端按同一规则生成 ch_tag（tag_ch{i}），同序号通道的 HCCP 对账 tag 一致。
                 seg_chs = []
                 for ch_idx in range(n_channels):
-                    handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port + ch_idx, seg.channel_tag, 60)
+                    ch_tag = "{}_ch{}".format(seg.channel_tag, ch_idx)
+                    handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port + ch_idx, ch_tag, 60)
                     seg_chs.append(handle)
                 self.channel_matrix.append(seg_chs)
                 self.channels.append(seg_chs[0])

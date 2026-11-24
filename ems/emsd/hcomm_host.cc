@@ -303,7 +303,10 @@ int EmsdHcomm::LinkServer(uint32_t segIndex, const uint8_t *peerDesc, uint32_t p
         chDesc.role = HCOMM_SOCKET_ROLE_SERVER;
         chDesc.port = static_cast<uint16_t>(seg.hcommListenPort + ch);
         chDesc.qos = 0;
-        chDesc.channelName = const_cast<char *>(seg.channelTag.c_str());
+        // channelName 逐通道唯一（hcomm 9.1.0 socket key 维度，与 xds 侧同规则：tag_ch{i}，
+        // 同序号 client/server 通道对账 tag 一致）；chTag 生命周期覆盖本次同步调用即可
+        std::string chTag = seg.channelTag + "_ch" + std::to_string(ch);
+        chDesc.channelName = const_cast<char *>(chTag.c_str());
         // 端口复用重试：上一 run 的 server 通道刚 ChannelDestroy 时，driver 侧监听 socket 可能尚未完全释放，
         // 立刻同端口重建可能失败；退避重试 3 次（attempt 打日志便于区分是端口残留还是真失败）。
         for (int attempt = 0; attempt < 3; ++attempt) {
