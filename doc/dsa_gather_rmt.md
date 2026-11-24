@@ -1,6 +1,7 @@
 ﻿# 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
 
-> 状态：**D1.0 / D1.1 / D1.2(图模式) 已验收**（远端 golden + torch e2e + NPUGraph 捕获回放全绿，2026-11-24）
+> 状态：**D1.0 / D1.1 / D1.2(图模式) / D2a(多核) 已验收**（远端 golden + torch e2e + NPUGraph + 
+> block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
 > H2D 透明搬运）；golden 基准 = 其 `golden.py`（miss_mask 唯一闸门 + sentinel 零搬运对拍）
 > 姊妹篇：`npu_gather_selection_kv_cache_rmt.md`（rmt 系工程范式/实证沉淀，本文复用其基建）
@@ -59,16 +60,29 @@ attr、resident 侧、pool entry 间接层、mask/校验语义**全部不变**�
 - 字节寻址参数化（kvElemSize/ropeElemSize ∈ {1,2}）支持 INT8+BF16 dtype 配对（V1 测试跑 fp16）
 - residentInit 预留（恒 0=dense decode 布局；紧凑初始化布局 V1.1）
 
-## 4. 并行策略（D2，三级递进）
+## 4. 并行策略（D2，三级递进——已收官）
 
-| 级 | 方案 | 说明 |
+| 级 | 方案 | 结论 |
 |---|---|---|
-| D1 | blockDim=1 单核 | golden 闭环 + 性能基线（原版 910_93 基线：164 miss 记录 98.78μs） |
-| D2c | **直接多核共享 channel**（blockDim {2,4,8} 矩阵） | 最便宜的根因实验：稳 → 原生 pair 均分即成品 |
-| D2a | 每核专属 channel | 不稳时切换：emsd 每段建 N channel + 内核通道池选择，只改通道获取一处 |
+| D2c | 直接多核共享 channel（blockDim=2） | ✗ **复现丢 WQE**：golden mismatch 且 rc=0 假完成（V0 结论坐实：同 channel 并发提交静默丢 WQE，非 9.2.1 特有） |
+| D2a | 每核专属 channel（通道表平铺 + 批量建链） | ✅ **全绿收官**：block-dim {1,2,4,8} × {恒等, perm, graph} 全 PASS；建链 7~8s 全 READY；多核×图模式首验通过 |
 
-D2c 一轮矩阵同时回答 V0 遗留问题（多核共享 channel 并发提交是否丢 WQE）——dsa_gather 是理想
-试验场（pair 独立 + sentinel 零搬运严格校验）。结论对 gather_selection_rmt 多核化同样适用。
+### D2a 多通道机制（四轮实证踩坑沉淀，后续算子多核化直接复用）
+
+1. **官方批量姿势**：一次 `HcommChannelCreate(descs[N], N, channels)` 数组调用。逐条独立调用
+   N 次 (num=1) 时第 2 条在 `SocketMgr::GetSocket` 的 inUse 自旋等 `HCCL_CONNECT_TIMEOUT(120s)-10s`
+   超时（SocketConfig 撞等前条未释放）——批量是官方文档明示的多通道用法（channelNum [1,1048576]）。
+2. **配对维度是 channelName（tag）非 port**：listen 是 **endpoint 级单端口**（`StartListen→HcommEndpointStartListen`
+   幂等），port=base+i 被架空。正确姿势：全部通道同 base port + **tag 唯一化**（`tag_i`，两端同规则）。
+3. **GetStatus 是建链状态机推进器（功能件非查询件）**：connect 异步结果的收割（`RaGetAsyncReqResult`）、
+   tag 发送、`GetOneSocket` 配对全部由其触发——**两侧都必须数组轮询全部 N 条**。emsd 侧"诊断线程"
+   实为 server 侧驱动线程（只轮 ch0 时 ch1 成为孤儿通道：connect 无人收割 → 配对永不发生）。
+4. **协议**：client 在 LINK_EXCHANGE 帧尾声明 channelCount（+4B），emsd 按需批量开通——通道数随
+   `--block-dim` 单一事实源流动（协议零配置）。三表平铺 `[F_BLK × n_core]`（kv/rope addr 表不变），
+   内核 `chTbl[q*coreCount+coreId]`，n_core=1 时与旧布局逐字节兼容。
+
+建链形态：批量 Create 秒回（server/client 两侧）→ 两侧驱动轮询 → 7~8s 全 READY → N 条独立
+数据面通道（每核独占 SQ → 无并发提交竞态，根治丢 WQE）。
 
 ## 5. golden 对拍（tests/test_dsa_gather_rmt.py）
 
@@ -89,7 +103,7 @@ D2c 一轮矩阵同时回答 V0 遗留问题（多核共享 channel 并发提交
 | **D1.0** | 文档 + 内核（多核结构、纯远端）+ args/launch/pybind + golden 测试 | ✅ 单核远端 golden PASS（恒等+perm，records=256） |
 | **D1.1** | torch 壳 `torchops/dsa_gather_rmt_op.py` → `torch_npu.npu_dsa_gather_rmt` + e2e | ✅ e2e PASS（恒等+perm） |
 | **D1.2 图模式** | 两层 API（submit/wait 拆分 + status 槽池化）+ `--graph` 用例 | ✅ dsa(恒等+perm) + gather_selection 图 e2e PASS（`tests/test_graph_probe.py` 实证 HostArgs 可捕获；EE1016 值校验陷阱已修，见 §7） |
-| **D2** | block-dim 矩阵实测（D2c → 依结果 D2a） | 多核 golden + 性能报告 + 丢 WQE 根因结论 |
+| **D2** | block-dim 矩阵实测（D2c → 依结果 D2a） | ✅ D2c 负结果（共享 channel 丢 WQE 复现）；D2a 全绿：bd {1,2,4,8}×{恒等,perm}+bd8 graph e2e PASS（多通道机制见 §4） |
 
 ## 7. 图模式（NPUGraph，两层 API）
 
@@ -119,5 +133,5 @@ eager 语义不变：`npu_dsa_gather_rmt` = submit + wait 一行组合（旧调�
 | 行坐标 | B*S*H query 行 + 账本/因果裁剪 | (req,query) pair + miss_mask |
 | 源寻址 | 一跳（batch 行页表） | 两跳（pool_entry 间接） |
 | 输出 | 热池 + 账本 + actual_seq | resident 池（原地，无账本） |
-| 并行 | 单核（多核挂账） | 原生多核结构（D2 实测） |
+| 并行 | 单核（多核化挂账：需 pair 均分改造） | 原生多核 pair 均分 + 每核专属通道（D2a 已验，机制链可复用） |
 | 远端布局/三表/收尾 | 同构（export_full_rmt_pool 复用） | 同左 |
