@@ -1,6 +1,6 @@
 ﻿# 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
 
-> 状态：**D1.0 已验收**（单核远端 golden 恒等+perm 双 PASS，2026-11-17）；D1.1 torch 层实施中
+> 状态：**D1.0 / D1.1 / D1.2(图模式) 已验收**（远端 golden + torch e2e + NPUGraph 捕获回放全绿，2026-11-24）
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
 > H2D 透明搬运）；golden 基准 = 其 `golden.py`（miss_mask 唯一闸门 + sentinel 零搬运对拍）
 > 姊妹篇：`npu_gather_selection_kv_cache_rmt.md`（rmt 系工程范式/实证沉淀，本文复用其基建）
@@ -88,7 +88,7 @@ D2c 一轮矩阵同时回答 V0 遗留问题（多核共享 channel 并发提交
 |---|---|---|
 | **D1.0** | 文档 + 内核（多核结构、纯远端）+ args/launch/pybind + golden 测试 | ✅ 单核远端 golden PASS（恒等+perm，records=256） |
 | **D1.1** | torch 壳 `torchops/dsa_gather_rmt_op.py` → `torch_npu.npu_dsa_gather_rmt` + e2e | ✅ e2e PASS（恒等+perm） |
-| **D1.2 图模式** | 两层 API（submit/wait 拆分 + status 槽池化）+ `--graph` 用例 | 实施中（Step1 捕获实验已 PASS：`tests/test_graph_probe.py`） |
+| **D1.2 图模式** | 两层 API（submit/wait 拆分 + status 槽池化）+ `--graph` 用例 | ✅ dsa(恒等+perm) + gather_selection 图 e2e PASS（`tests/test_graph_probe.py` 实证 HostArgs 可捕获；EE1016 值校验陷阱已修，见 §7） |
 | **D2** | block-dim 矩阵实测（D2c → 依结果 D2a） | 多核 golden + 性能报告 + 丢 WQE 根因结论 |
 
 ## 7. 图模式（NPUGraph，两层 API）
