@@ -19,7 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import kvops_ext._kvops as _kvops  # noqa: E402
 from tests.test_gather_selection_rmt import B, S, H, TOPK, golden  # noqa: E402
-from torchops import load_gather_rmt_op  # noqa: E402
+from torchops import (  # noqa: E402
+    load_gather_rmt_op,
+    npu_gather_selection_kv_cache_rmt_submit as submit_op,
+)
 
 FATBIN_CANDIDATES = [
     "/usr/local/fatbin/kvc_kernel/kvc_kernel.o",
@@ -74,6 +77,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--ems-master", type=str, default="141.61.49.198:27000")
+    ap.add_argument("--graph", action="store_true", help="远端路径追加 NPUGraph 捕获回放（warmup+replay×N）")
+    ap.add_argument("--replays", type=int, default=2)
     args = ap.parse_args()
 
     torch.manual_seed(42)
@@ -126,6 +131,30 @@ def main():
     g2 = golden(topk_idx2.view(B * S * H, TOPK), full_tbl, kv_seq2, q_seq2, full_kv2.cpu(), full_rope2.cpu(),
                 sel_tbl2.cpu(), bs=BLOCK_SIZE, topk_bs=TOPK_BS, kv_dim=KV_DIM, rope_dim=ROPE_DIM)
     check(g2, sel_kv2, sel_rope2, sel_tbl2, status2, actual2, "remote")
+
+    if args.graph:
+        # 图模式（作用于远端路径）：warmup(eager 已跑) → capture(submit) → replay×N + golden
+        empty2 = empty  # 引用持有（张量须存活至最后回放）
+        actual_out = torch.zeros(B * S * H, dtype=torch.int32, device=dev)  # 输出预分配（地址固定）
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, auto_dispatch_capture=True):
+            submit_op(selection_k_rope=sel_rope2, selection_kv_cache=sel_kv2,
+                      selection_kv_block_table=sel_tbl2, selection_kv_block_status=status2,
+                      selection_topk_indices=topk_idx2, full_k_rope=empty2, full_kv_cache=empty2,
+                      full_kv_block_table=full_tbl, full_kv_actual_seq=kv_seq2, full_q_actual_seq=q_seq2,
+                      full_rmt_channel=rmt_ch, full_rmt_kv_addr=rmt_kv, full_rmt_rope_addr=rmt_rope,
+                      selection_topk_block_size=TOPK_BS, block_size=BLOCK_SIZE, actual_seq_out=actual_out)
+        for i in range(args.replays):
+            sel_kv2.zero_()
+            sel_rope2.zero_()
+            status2.fill_(-77)
+            actual_out.zero_()
+            graph.replay()
+            torch.npu.synchronize()
+            check(g2, sel_kv2, sel_rope2, sel_tbl2, status2, actual_out, "graph-rp%d" % i)
+            print("[test] graph replay#%d golden PASS" % i)
+        print("[test] torch-op graph mode PASS (replays=%d)" % args.replays)
+
     pool.destroy()
     print("[test] torch-op remote path PASS (empty-full convention)")
     print("[test] torch_npu.npu_gather_selection_kv_cache_rmt e2e PASS")

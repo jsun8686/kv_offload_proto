@@ -3,10 +3,19 @@
 # KV offload prototype is licensed under Mulan PSL v2.
 """npu_dsa_gather_rmt 的 torch 层实现（13 参张量 → 26 参 pybind 适配）。
 
-语义/约束/错误码与 doc/dsa_gather_rmt.md §3 一致；原地写，返回 (kv, rope) alias
-（对齐原版 dsa_gather 调用形态）。同步算子（poll 至全部核完成）。
-维度全推导：调用方只传 attr 两项（block_size/num_requests），其余从张量 shape 取。
+两层 API（图友好，对齐 MemFabric 提交/等待分离模式）：
+  submit：纯提交（校验 → 池化 status 槽 → launch），立即返回——capture 天然安全（无 host
+          阻塞/无 malloc），NPUGraph 捕获区间内调用本层即可（姿势：torch.npu.graph(
+          auto_dispatch_capture=True)，Step1 实证 HostArgs launch 可被记录）。
+  wait_and_check：逐核槽 poll + 错误码校验——图外任意时刻调用（回放后 synchronize 再查）。
+  npu_dsa_gather_rmt（同步组合）：submit + wait 一行拼装，eager 调用方零感知。
+
+图模式纪律（用例参照 tests/test_graph_probe.py）：
+  ① warmup 图外 eager 首跑（内核 hcomm.Init 首执行不得在 capture 中）；
+  ② 捕获区间只调 submit；③ 回放前重置输出 sentinel；④ 三表/池张量引用持有至最后回放。
 """
+
+from typing import NamedTuple
 
 import torch
 import torch_npu
@@ -14,30 +23,46 @@ import torch_npu
 import kvops_ext._kvops as _kvops
 
 _POLL_TIMEOUT_US = 30_000_000
+_STATUS_POOL_SLOTS = 8  # 每 device 池化槽数（64B/槽，block_dim≤8 时单次最多全占）
 
 _DTYPE_PAIRS = {(torch.float16, torch.float16), (torch.bfloat16, torch.bfloat16),
                 (torch.int8, torch.bfloat16)}
+
+# status 槽池：device index -> [base_addr, cursor]；图外首次分配后地址终身固定（复用不释放）
+_STATUS_POOL = {}
+
+
+def _acquire_status(device, block_dim):
+    key = device.index if device.index is not None else torch.npu.current_device()
+    pool = _STATUS_POOL.get(key)
+    if pool is None:
+        pool = [_kvops.alloc_status(_STATUS_POOL_SLOTS), 0]
+        _STATUS_POOL[key] = pool
+    if pool[1] + block_dim > _STATUS_POOL_SLOTS:
+        pool[1] = 0  # 环形回卷（内核 KvcStatusInit 每次启动重置槽，回卷安全）
+    addr = pool[0] + pool[1] * 64
+    pool[1] = (pool[1] + block_dim) % _STATUS_POOL_SLOTS
+    return addr
+
+
+class DsaGatherRmtStatus(NamedTuple):
+    """submit 返回的等待句柄：status 基址 + 核数（wait_and_check 入参）。"""
+    status_addr: int
+    block_dim: int
 
 
 def _elem_size(dt):
     return 1 if dt == torch.int8 else 2
 
 
-def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_table,
-                       host_block_table, request_pool_indices, topk_token_positions,
-                       resident_slots, miss_mask, block_size, num_requests,
-                       host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
-    """miss 记录按需回源（远端 EMS 池 → resident HBM 池，原地写）。
-
-    dtype 配对：fp16/fp16、bf16/bf16、int8+bf16；record 字节须 32B 对齐；
-    resident 池须在 cli mem_reg 注册范围（ReadNbi dst，由池管理器保证）。
-    """
+def _validate(resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
+              request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size,
+              num_requests, host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr):
+    """全量校验（submit 与同步组合共用）；返回 launch 所需推导量。"""
     bs = int(block_size)
     nreq = int(num_requests)
-    if bs <= 0 or nreq <= 0 or int(block_dim) <= 0:
-        raise ValueError("block_size/num_requests/block_dim must be positive")
-
-    # ── 池校验（4 维 [P, bs, 1, dim]，kv_heads 恒 1）──
+    if bs <= 0 or nreq <= 0:
+        raise ValueError("block_size/num_requests must be positive")
     for t, name in ((resident_kv_cache, "resident_kv_cache"), (resident_rope_cache, "resident_rope_cache")):
         if t.dim() != 4 or t.shape[2] != 1:
             raise ValueError("%s: shape must be [P, block_size, 1, dim], got %s" % (name, tuple(t.shape)))
@@ -58,12 +83,10 @@ def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_ta
     if resident_rope_cache.shape[0] != resident_blk_num:
         raise ValueError("resident pools block num mismatch: %d vs %d" % (
             resident_blk_num, resident_rope_cache.shape[0]))
-
-    # ── 表校验 ──
     for t, name in ((resident_block_table, "resident_block_table"), (host_block_table, "host_block_table"),
-                    (request_pool_indices, "request_pool_indices"), (topk_token_positions,
-                                                                    "topk_token_positions"),
-                    (resident_slots, "resident_slots"), (miss_mask, "miss_mask")):
+                    (request_pool_indices, "request_pool_indices"),
+                    (topk_token_positions, "topk_token_positions"), (resident_slots, "resident_slots"),
+                    (miss_mask, "miss_mask")):
         if t.dtype != torch.int32:
             raise TypeError("%s: dtype must be int32, got %s" % (name, t.dtype))
         if not t.is_contiguous():
@@ -87,17 +110,31 @@ def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_ta
     if host_rmt_kv_addr.shape[0] != host_blk_num or host_rmt_rope_addr.shape[0] != host_blk_num:
         raise ValueError("host_rmt_* tables length %d/%d/%d inconsistent" % (
             host_blk_num, host_rmt_kv_addr.shape[0], host_rmt_rope_addr.shape[0]))
-
-    # ── 设备一致性 ──
     tensors = (resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
                request_pool_indices, topk_token_positions, resident_slots, miss_mask,
                host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr)
     for t in tensors:
         if t.device != resident_kv_cache.device:
             raise ValueError("all tensors must be on %s, got %s" % (resident_kv_cache.device, t.device))
+    return bs, nreq, kv_dim, rope_dim, kv_elem, rope_elem, resident_blk_num, host_blk_num
 
-    # ── 下发（26 参 pybind；维度从 shape 推导；stream=当前流） ──
-    st = _kvops.alloc_status(int(block_dim))
+
+def npu_dsa_gather_rmt_submit(resident_kv_cache, resident_rope_cache, resident_block_table,
+                              host_block_table, request_pool_indices, topk_token_positions,
+                              resident_slots, miss_mask, block_size, num_requests,
+                              host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
+    """纯提交层：launch 到当前流（capture 中即记录到 capture stream），返回等待句柄。
+
+    NPUGraph 捕获区间内调用本函数（不调 wait）；回放后由调用方 synchronize，
+    错误检查用 wait_and_check（图外）或 golden 对拍兜底。
+    """
+    bs, nreq, kv_dim, rope_dim, kv_elem, rope_elem, res_blk, host_blk = _validate(
+        resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
+        request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size, num_requests,
+        host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr)
+    if int(block_dim) <= 0:
+        raise ValueError("block_dim must be positive")
+    st = _acquire_status(resident_kv_cache.device, int(block_dim))
     stream = torch.npu.current_stream().npu_stream
     _kvops.dsa_gather_rmt(
         resident_kv_cache.data_ptr(), resident_rope_cache.data_ptr(), resident_block_table.data_ptr(),
@@ -106,11 +143,28 @@ def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_ta
         host_rmt_kv_addr.data_ptr(), host_rmt_rope_addr.data_ptr(), st, nreq,
         topk_token_positions.shape[1], bs, kv_dim, rope_dim, kv_elem, rope_elem,
         host_block_table.shape[0], host_block_table.shape[1], resident_block_table.shape[1],
-        host_blk_num, resident_blk_num, stream, int(block_dim))
-    for i in range(int(block_dim)):  # 每核独立 64B 槽，全部完成才返回（同步语义）
-        rc = _kvops.poll_status(st + i * 64, _POLL_TIMEOUT_US)
+        host_blk, res_blk, stream, int(block_dim))
+    return DsaGatherRmtStatus(st, int(block_dim))
+
+
+def wait_and_check(handle, timeout_us=_POLL_TIMEOUT_US):
+    """等待层：逐核槽 poll 至终态并校验错误码（图外任意时刻调用；eager/图回放后通用）。"""
+    for i in range(handle.block_dim):
+        rc = _kvops.poll_status(handle.status_addr + i * 64, timeout_us)
         if rc != 0:
             raise RuntimeError("npu_dsa_gather_rmt kernel failed (core %d) rc=0x%x" % (i, rc & 0xFFFFFFFF))
+
+
+def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_table,
+                       host_block_table, request_pool_indices, topk_token_positions,
+                       resident_slots, miss_mask, block_size, num_requests,
+                       host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
+    """同步组合（eager 语义）：submit + wait；原地写，返回 (kv, rope) alias。"""
+    handle = npu_dsa_gather_rmt_submit(
+        resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
+        request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size, num_requests,
+        host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=block_dim)
+    wait_and_check(handle)
     return resident_kv_cache, resident_rope_cache
 
 

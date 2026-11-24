@@ -163,6 +163,11 @@ python -m tests.test_gather_selection_rmt_rmt --device 7 --ems-master <ip>:27000
 底层 27 参 pybind，`stream=当前流`、`blockDim=1`。校验：dtype/shape/连续性/设备一致、
 空 full×channel 全非 0 互斥、head==1、整除约束。
 
+**图模式（两层 API，D1.2）**：`npu_gather_selection_kv_cache_rmt_submit(...)`（纯提交，capture
+区间内调用；`actual_seq_out` 传入预分配张量保证输出地址固定）+ `wait_and_check(handle)`（图外
+校验）；同步函数 = 两者组合，eager 零感知。捕获姿势与纪律同 dsa_gather_rmt（见其 §7）：
+`torch.npu.graph(auto_dispatch_capture=True)`、warmup 图外、张量引用持有至最后回放。
+
 **GLM 5.2 调用点改造**（`modeling_glm.py` gather 调用处，+3 参）：
 
 ```python

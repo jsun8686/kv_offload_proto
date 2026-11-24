@@ -12,8 +12,21 @@
 调用前需完成 kvops init（EmsPool.create_pool 或 kvops_ext._kvops.init）。
 """
 
-from torchops.gather_rmt_op import load_gather_rmt_op, npu_gather_selection_kv_cache_rmt
-from torchops.dsa_gather_rmt_op import load_dsa_gather_rmt_op, npu_dsa_gather_rmt
+from torchops.gather_rmt_op import (
+    load_gather_rmt_op,
+    npu_gather_selection_kv_cache_rmt,
+    npu_gather_selection_kv_cache_rmt_submit,
+    wait_and_check as wait_gather_selection,
+)
+from torchops.dsa_gather_rmt_op import (
+    load_dsa_gather_rmt_op,
+    npu_dsa_gather_rmt,
+    npu_dsa_gather_rmt_submit,
+    wait_and_check as wait_dsa_gather,
+)
 
-__all__ = ["load_gather_rmt_op", "npu_gather_selection_kv_cache_rmt",
-           "load_dsa_gather_rmt_op", "npu_dsa_gather_rmt"]
+__all__ = [
+    "load_gather_rmt_op", "npu_gather_selection_kv_cache_rmt", "npu_gather_selection_kv_cache_rmt_submit",
+    "wait_gather_selection", "load_dsa_gather_rmt_op", "npu_dsa_gather_rmt", "npu_dsa_gather_rmt_submit",
+    "wait_dsa_gather",
+]

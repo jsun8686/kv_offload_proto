@@ -1,4 +1,4 @@
-# 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
+﻿# 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
 
 > 状态：**D1.0 已验收**（单核远端 golden 恒等+perm 双 PASS，2026-11-17）；D1.1 torch 层实施中
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
@@ -87,10 +87,31 @@ D2c 一轮矩阵同时回答 V0 遗留问题（多核共享 channel 并发提交
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **D1.0** | 文档 + 内核（多核结构、纯远端）+ args/launch/pybind + golden 测试 | ✅ 单核远端 golden PASS（恒等+perm，records=256） |
-| **D1.1** | torch 壳 `torchops/dsa_gather_rmt_op.py` → `torch_npu.npu_dsa_gather_rmt` + e2e | 实施中（`tests/test_torch_dsa_gather_rmt.py`） |
+| **D1.1** | torch 壳 `torchops/dsa_gather_rmt_op.py` → `torch_npu.npu_dsa_gather_rmt` + e2e | ✅ e2e PASS（恒等+perm） |
+| **D1.2 图模式** | 两层 API（submit/wait 拆分 + status 槽池化）+ `--graph` 用例 | 实施中（Step1 捕获实验已 PASS：`tests/test_graph_probe.py`） |
 | **D2** | block-dim 矩阵实测（D2c → 依结果 D2a） | 多核 golden + 性能报告 + 丢 WQE 根因结论 |
 
-## 7. 与 gather_selection_rmt 的关系
+## 7. 图模式（NPUGraph，两层 API）
+
+**Step1 实证**：`LaunchKernelWithHostArgs`+attrs 可被 NPUGraph 记录，远端 ReadNbi 数据面随图
+重放正确（姿势 `torch.npu.graph(auto_dispatch_capture=True)`，对齐 sglang-0730 `NPUGraphRunner`）。
+
+```python
+h = npu_dsa_gather_rmt_submit(...)   # 纯提交（capture 区间内调用；launch 层零改造）
+graph = torch.npu.NPUGraph()
+with torch.npu.graph(graph, auto_dispatch_capture=True):
+    h = npu_dsa_gather_rmt_submit(...)
+for _ in range(N):
+    reset_outputs()                   # 图外 sentinel 重置
+    graph.replay(); torch.npu.synchronize()
+    wait_and_check(h)                 # 可选：图外错误码校验（golden 对拍亦兜底）
+```
+
+纪律（对齐 MemFabric 用例14）：warmup 图外 eager 首跑（内核 hcomm.Init 首执行不得在 capture 中）；
+三表/页表/输出张量引用持有至最后回放；status 槽模块级池化复用（地址固定）。
+eager 语义不变：`npu_dsa_gather_rmt` = submit + wait 一行组合（旧调用方零感知）。
+
+## 8. 与 gather_selection_rmt 的关系
 
 | | gather_selection_rmt | dsa_gather_rmt |
 |---|---|---|

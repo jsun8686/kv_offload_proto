@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_dsa_gather_rmt import (  # noqa: E402
     BS, QUERY_COUNT, KEY_LEN, BLOCK_SIZE, KV_DIM, ROPE_DIM, HOST_BLK_NUM, RES_BLK_NUM, POOL_ROWS, SENTINEL,
     fill_staging, golden_check)
-from torchops import load_dsa_gather_rmt_op  # noqa: E402
+from torchops import load_dsa_gather_rmt_op, npu_dsa_gather_rmt_submit as submit_op  # noqa: E402
 from xds.xds_ems_pool import EmsPool  # noqa: E402
 
 FATBIN_CANDIDATES = [
@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--ems-master", type=str, default="141.61.49.195:27000")
     ap.add_argument("--perm", action="store_true")
     ap.add_argument("--block-dim", type=int, default=1)
+    ap.add_argument("--graph", action="store_true", help="NPUGraph 捕获回放模式（warmup+capture+replay×N）")
+    ap.add_argument("--replays", type=int, default=2, help="图回放轮数（--graph 生效）")
     args = ap.parse_args()
 
     torch.manual_seed(42)
@@ -78,11 +80,35 @@ def main():
     miss[torch.arange(64, dtype=torch.int64) * QUERY_COUNT // 64] = 1
     mask = miss.view(1, -1).repeat(BS, 1).to(dev)
 
-    # torch 层调用：13 参张量版（原地写，返回 alias）
-    kv_alias, rope_alias = op(
-        res_kv.view(RES_BLK_NUM, BLOCK_SIZE, 1, KV_DIM), res_rope.view(RES_BLK_NUM, BLOCK_SIZE, 1, ROPE_DIM),
-        res_tbl, host_tbl, pool_idx, topk, slots, mask, BLOCK_SIZE, BS,
-        rmt_ch, rmt_kv, rmt_rope, block_dim=args.block_dim)
+    kv4 = res_kv.view(RES_BLK_NUM, BLOCK_SIZE, 1, KV_DIM)
+    rope4 = res_rope.view(RES_BLK_NUM, BLOCK_SIZE, 1, ROPE_DIM)
+
+    if args.graph:
+        # 图模式（Step1 实证姿势）：warmup(eager) → capture(submit) → replay×N + golden
+        kv_alias, rope_alias = op(kv4, rope4, res_tbl, host_tbl, pool_idx, topk, slots, mask, BLOCK_SIZE, BS,
+                                  rmt_ch, rmt_kv, rmt_rope, block_dim=args.block_dim)
+        torch.npu.synchronize()
+        golden_check(host_kv, host_rope, res_kv, res_rope, pool_idx, topk, slots, mask)  # warmup 校验
+        print("[test] graph warmup(eager) golden PASS")
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, auto_dispatch_capture=True):
+            submit_op(kv4, rope4, res_tbl, host_tbl, pool_idx, topk, slots, mask, BLOCK_SIZE, BS,
+                      rmt_ch, rmt_kv, rmt_rope, block_dim=args.block_dim)
+        for i in range(args.replays):
+            res_kv.fill_(SENTINEL)
+            res_rope.fill_(SENTINEL)
+            graph.replay()
+            torch.npu.synchronize()
+            golden_check(host_kv, host_rope, res_kv, res_rope, pool_idx, topk, slots, mask)
+            print("[test] graph replay#%d golden PASS" % i)
+        pool.destroy()
+        print("[test] torch_npu.npu_dsa_gather_rmt graph e2e PASS (replays=%d blockDim=%d perm=%s)" % (
+            args.replays, args.block_dim, "on" if args.perm else "off"))
+        return 0
+
+    # eager 路径：13 参张量版（原地写，返回 alias）
+    kv_alias, rope_alias = op(kv4, rope4, res_tbl, host_tbl, pool_idx, topk, slots, mask, BLOCK_SIZE, BS,
+                              rmt_ch, rmt_kv, rmt_rope, block_dim=args.block_dim)
     torch.npu.synchronize()
     assert kv_alias.data_ptr() == res_kv.data_ptr() and rope_alias.data_ptr() == res_rope.data_ptr(), \
         "in-place alias broken"
