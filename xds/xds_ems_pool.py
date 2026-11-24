@@ -166,31 +166,42 @@ class EmsPool:
 
         self.channels = []
         self.channel_matrix = []
-        for seg in self.pool.segments:
-            status = self._ems.link_exchange(seg, local_desc, mem_desc)
-            if status != 0:
-                raise RuntimeError("link_exchange failed on node {} {}: status={}".format(
-                    seg.node_id, seg.ctrl_ip, status))
-            remote_addr, _size, _t = _cli.mem_import(seg.mem_desc)
-            if remote_addr != seg.seg_base:
-                raise RuntimeError("seg base mismatch, node {}: ems={} import={}".format(
-                    seg.node_id, seg.seg_base, remote_addr))
-            # remoteEndpoint 必须是该资源节点（server 侧）的 endpoint 描述——
-            # 传本端 local_desc 会让 client 向自己发起建链，channel 永远 READY 不了
-            if not seg.ep_desc:
-                raise RuntimeError("seg {} has no endpoint desc (emsd too old?): ctrl={}:{}".format(
-                    seg.node_id, seg.ctrl_ip, seg.ctrl_port))
-            # D2a per-core channels (client 声明，emsd 按需开通): server listens on [base, base+n_channels)
-            seg_chs = []
-            for ch_idx in range(n_channels):
-                handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port + ch_idx, seg.channel_tag, 60)
-                seg_chs.append(handle)
-            self.channel_matrix.append(seg_chs)
-            self.channels.append(seg_chs[0])
+        try:
+            for seg in self.pool.segments:
+                status = self._ems.link_exchange(seg, local_desc, mem_desc, channel_count=n_channels)
+                if status != 0:
+                    raise RuntimeError("link_exchange failed on node {} {}: status={}".format(
+                        seg.node_id, seg.ctrl_ip, status))
+                remote_addr, _size, _t = _cli.mem_import(seg.mem_desc)
+                if remote_addr != seg.seg_base:
+                    raise RuntimeError("seg base mismatch, node {}: ems={} import={}".format(
+                        seg.node_id, seg.seg_base, remote_addr))
+                # remoteEndpoint 必须是该资源节点（server 侧）的 endpoint 描述——
+                # 传本端 local_desc 会让 client 向自己发起建链，channel 永远 READY 不了
+                if not seg.ep_desc:
+                    raise RuntimeError("seg {} has no endpoint desc (emsd too old?): ctrl={}:{}".format(
+                        seg.node_id, seg.ctrl_ip, seg.ctrl_port))
+                # D2a per-core channels (client 声明，emsd 按需开通): server listens on [base, base+n_channels)
+                seg_chs = []
+                for ch_idx in range(n_channels):
+                    handle, _st = _cli.link_channel(seg.ep_desc, seg.hcomm_listen_port + ch_idx, seg.channel_tag, 60)
+                    seg_chs.append(handle)
+                self.channel_matrix.append(seg_chs)
+                self.channels.append(seg_chs[0])
 
-        _kvops.init(self.device_id, fatbin_path)
-        self._status_count = 8 * self.node_num
-        self._status_base = _kvops.alloc_status(self._status_count)
+            _kvops.init(self.device_id, fatbin_path)
+            self._status_count = 8 * self.node_num
+            self._status_base = _kvops.alloc_status(self._status_count)
+        except Exception:
+            # 失败回滚：销毁本次已建立的通道——否则进程退出阶段 libhcomm 带活通道清理会 Bus error
+            for h in [c for chs in self.channel_matrix for c in chs]:
+                try:
+                    _cli.channel_destroy(h)
+                except Exception as de:  # noqa: BLE001
+                    print("[pool] warn: rollback channel_destroy 0x%x failed: %s" % (int(h), de))
+            self.channels = []
+            self.channel_matrix = []
+            raise
 
     def next_status(self, slots: int = 1) -> int:
         # 每 block 占 64B 槽（与内核 KvcStatusInit 的 blockIdx*64、KvcStatusFlush 整页 64B 刷写一致）；
