@@ -1,19 +1,19 @@
 ﻿# coding=utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
-"""npu_dsa_gather_rmt 的 torch 层实现（13 参张量 → 26 参 pybind 适配）。
+"""dsa_gather_rmt 的 torch 层实现（13 参张量 → 26 参 pybind 适配）。
 
-三件套（torch_npu 属性挂载，地位对等）：
+两件套原语（torch_npu 属性挂载，地位对等）：
   submit：纯提交（校验 → 池化 status 槽 → launch），立即返回——capture 天然安全（无 host
           阻塞/无 malloc），NPUGraph 捕获区间内调用本层即可（姿势：torch.npu.graph(
           auto_dispatch_capture=True)，Step1 实证 HostArgs launch 可被记录）。
   result：纯读（零等待零同步——调用方须已 torch.npu.synchronize()）：逐核 peek status，
           完成位契约校验（未同步的误用在此显性报错）+ 错误码校验。
-  npu_dsa_gather_rmt（eager 同步组合）：submit + synchronize + result 一行拼装。
 
-图模式纪律：
-  ① warmup 图外 eager 首跑（内核 hcomm.Init 首执行不得在 capture 中）；
-  ② 捕获区间只调 submit；③ 回放后 synchronize → result 校验；④ 输出张量引用持有至最后回放。
+调用纪律：
+  eager 语义 = 调用方显式三件组合：h = submit(...) → torch.npu.synchronize() → result(h)；
+  图模式：① warmup 图外首跑（内核 hcomm.Init 首执行不得在 capture 中）；② 捕获区间只调
+  submit；③ 回放后 synchronize → result 校验；④ 输出张量引用持有至最后回放。
 """
 
 from typing import NamedTuple
@@ -166,31 +166,15 @@ def npu_dsa_gather_rmt_result(handle):
             raise RuntimeError("npu_dsa_gather_rmt kernel failed (core %d) rc=0x%x" % (i, rc))
 
 
-def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_table,
-                       host_block_table, request_pool_indices, topk_token_positions,
-                       resident_slots, miss_mask, block_size, num_requests,
-                       host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
-    """同步组合（eager 语义）：submit + synchronize + result；原地写，返回 (kv, rope) alias。"""
-    h = npu_dsa_gather_rmt_submit(
-        resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
-        request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size, num_requests,
-        host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=block_dim)
-    torch.npu.synchronize()
-    npu_dsa_gather_rmt_result(h)
-    return resident_kv_cache, resident_rope_cache
-
-
 def load_dsa_gather_rmt_op():
-    """幂等挂载三件套到 torch_npu（对齐生产 custom_op_loader 属性挂载形态）。
+    """幂等挂载两件套原语到 torch_npu（对齐生产 custom_op_loader 属性挂载形态）。
 
-    npu_dsa_gather_rmt（eager 同步）/ npu_dsa_gather_rmt_submit（图捕获区间纯提交）/
-    npu_dsa_gather_rmt_result（图外错误码校验，调用方先 synchronize）地位对等——graph runner
-    集成形态下 capture/replay 两侧调用方只 import torch_npu。返回 eager 主算子（兼容旧调用方）。
+    npu_dsa_gather_rmt_submit（纯提交，图捕获区间/eager 通用）/
+    npu_dsa_gather_rmt_result（错误码校验，调用方先 synchronize）——graph runner 集成
+    形态下 capture/replay 两侧调用方只 import torch_npu。返回 submit 原语。
     """
-    if not hasattr(torch_npu, "npu_dsa_gather_rmt"):
-        torch_npu.npu_dsa_gather_rmt = npu_dsa_gather_rmt
     if not hasattr(torch_npu, "npu_dsa_gather_rmt_submit"):
         torch_npu.npu_dsa_gather_rmt_submit = npu_dsa_gather_rmt_submit
     if not hasattr(torch_npu, "npu_dsa_gather_rmt_result"):
         torch_npu.npu_dsa_gather_rmt_result = npu_dsa_gather_rmt_result
-    return torch_npu.npu_dsa_gather_rmt
+    return torch_npu.npu_dsa_gather_rmt_submit

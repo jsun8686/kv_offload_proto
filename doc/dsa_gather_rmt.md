@@ -20,7 +20,7 @@ stream 与 hit SFA 重叠（原版实测 98%+ 区间重叠）。
 ## 2. 接口（10 tensor + 2 attr → 9 tensor + 2 attr）
 
 ```python
-torch_npu.npu_dsa_gather_rmt(
+h = torch_npu.npu_dsa_gather_rmt_submit(     # 纯提交原语（图捕获区间 / eager 通用）
     resident_kv_cache,         # [P_dst, BS, 1, kvDim] 原地写
     resident_rope_cache,       # [P_dst, BS, 1, ropeDim] 原地写
     resident_block_table,      # [numReq, W_dst] int32 batch 行→目标物理块
@@ -31,10 +31,13 @@ torch_npu.npu_dsa_gather_rmt(
     miss_mask,                 # [numReq, queryCount] int32 唯一搬运开关（1=miss 才搬）
     block_size, num_requests,  # attr（原样）
     # ★ 新增三表（源物理块坐标系 [P_src] int64，src_blk 查表，无 0 语义）
-    host_rmt_channel,          # 块→ChannelHandle（真实值）
+    host_rmt_channel,          # 块×核平铺→ChannelHandle（真实值，[P_src × blockDim]）
     host_rmt_kv_addr,          # 块→远端 kv 区基址（块内 [BS, kvDim] 连续）
     host_rmt_rope_addr,        # 块→远端 rope 区基址（块内连续）
 )
+torch.npu.synchronize()                       # 完成判定（stream 同步归调用方）
+torch_npu.npu_dsa_gather_rmt_result(h)        # 结果校验原语（错误码）
+# eager 语义 = 上述三行显式组合（原地写，返回前数据已就绪）
 ```
 
 **变化**：删 `host_kv_cache/host_rope_cache`（源恒远端）；增三表（`EmsPool.export_full_rmt_pool`
@@ -123,13 +126,14 @@ for _ in range(N):
 
 纪律（对齐 MemFabric 用例14）：warmup 图外 eager 首跑（内核 hcomm.Init 首执行不得在 capture 中）；
 三表/页表/输出张量引用持有至最后回放；status 槽模块级池化复用（地址固定）。
-eager 语义不变：`npu_dsa_gather_rmt` = submit + synchronize + result 一行组合（旧调用方零感知）。
+eager 语义 = 外层显式三件组合（submit → synchronize → result），旧调用方按此拼装。
 完成判定归 stream 同步（synchronize/Event）；result 只读结果——完成位契约校验（未同步误用显性报错）
 + 错误码校验（图回放下拿到内核错误码的唯一通道）。
 
 ## 8. 性能摸底（tests/test_dsa_gather_rmt.py，唯一测试）
 
-**接口面**：仅 `torch_npu` 三件套（`load_dsa_gather_rmt_op` 挂载 eager/submit/result）。
+**接口面**：仅 `torch_npu` 两件套原语（`load_dsa_gather_rmt_op` 挂载 submit/result；
+eager = 外层显式组合三件）。
 **流程**：每 (blockDim, mode) 点 = 建池(n_channels=bd) → 导出（`--perm` 可选打散布局）→
 eager warmup 首跑 + **golden 对拍一次（PASS 行，不计入计时）** → `torch.npu.Event` 计时
 （warmup×3 + repeat 中位）→ markdown 报表（time_us / records / moved_MB / BW_GB/s / vs bd1）。

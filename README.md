@@ -1,6 +1,6 @@
 ﻿# kv_offload_proto — dsa_gather_rmt：DSA miss 记录 AIV 直驱远端回源原型
 
-EMS（external memory server）池上的 `npu_dsa_gather_rmt` 原型：DSA（DeepSeek Sparse Attention）
+EMS（external memory server）池上的 `npu_dsa_gather_rmt_submit` 原型：DSA（DeepSeek Sparse Attention）
 decode 流水 miss 记录回源，源为远端 emsd 段 HBM，AIV 内核 URMA `ReadNbi` 直写 resident 池
 （纯远端：无本地分支、无 0 哨兵、无 UB staging）。
 
@@ -23,7 +23,7 @@ ems/      emsd（池服务，master/worker，HBM 段 + AIV server 通道）
 kvops/    dsa_gather_rmt.cpp（AIV 内核）+ kvc_scatter_rows_alllayer.cpp（导出链）
           kvops_ext（fatbin 显式加载 + WithHostArgs launch）
 xds/      EmsPool（建池/批量导出/三表 [channel×n_core, kv_addr, rope_addr]）
-torchops/ torch_npu 三件套挂载（npu_dsa_gather_rmt / _submit / _result）
+torchops/ torch_npu 两件套原语挂载（_submit / _result；eager=外层显式组合）
 tests/    test_dsa_gather_rmt（唯一测试：golden 对拍 + 性能矩阵）
 ```
 

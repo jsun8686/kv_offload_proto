@@ -1,12 +1,12 @@
 # coding=utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
-"""dsa_gather_rmt 唯一测试：torch_npu 三件套接口 + 正确性对拍 + 性能摸底矩阵。
+"""dsa_gather_rmt 唯一测试：torch_npu 两件套原语 + 正确性对拍 + 性能摸底矩阵。
 
-接口面：仅 torch_npu 属性（load 挂载三件套）——
-    torch_npu.npu_dsa_gather_rmt(...)          eager 同步（submit + synchronize + result）
-    torch_npu.npu_dsa_gather_rmt_submit(...)   纯提交（图捕获区间 / 性能计时）
+接口面：仅 torch_npu 属性（load 挂载两件套原语）——
+    torch_npu.npu_dsa_gather_rmt_submit(...)   纯提交（图捕获区间 / 性能计时通用）
     torch_npu.npu_dsa_gather_rmt_result(h)     结果校验（调用方须已 synchronize）
+eager 语义 = 显式三件组合：submit → torch.npu.synchronize() → result。
 
 流程（每 (blockDim, mode) 点）：建池(n_channels=bd) → 导出三表 → eager warmup 首跑
     → golden 对拍一次（PASS 行，不计入计时）→ Event 计时（warmup×3 + repeat 中位）
@@ -156,10 +156,10 @@ def run_bd(bd, case, ip, port, device, fatbin, mode, repeat):
             kv4, rope4, case["res_tbl"], case["host_tbl"], case["pool_idx"], case["topk"],
             case["slots"], case["mask"], BLOCK_SIZE, bs, rmt_ch, rmt_kv, rmt_rope, block_dim=bd)
 
-    # eager warmup 首跑（hcomm.Init 图外纪律）+ 正确性对拍（不计入计时）
-    torch_npu.npu_dsa_gather_rmt(kv4, rope4, case["res_tbl"], case["host_tbl"], case["pool_idx"],
-                                 case["topk"], case["slots"], case["mask"], BLOCK_SIZE, bs,
-                                 rmt_ch, rmt_kv, rmt_rope, block_dim=bd)
+    # eager warmup 首跑（hcomm.Init 图外纪律）：显式三件组合 + 正确性对拍（不计入计时）
+    h = submit()
+    torch.npu.synchronize()
+    torch_npu.npu_dsa_gather_rmt_result(h)
     n = golden_check(case["host_kv"], case["host_rope"], case["res_kv"], case["res_rope"],
                      case["pool_idx"], case["topk"], case["slots"], case["mask"], case["ctx"])
     print("[test] golden PASS (bd=%d records=%d perm=%s)" % (bd, n, "on" if case["perm"] is not None else "off"))
