@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_dsa_gather_rmt import (  # noqa: E402
     BS, QUERY_COUNT, KEY_LEN, BLOCK_SIZE, KV_DIM, ROPE_DIM, HOST_BLK_NUM, RES_BLK_NUM, POOL_ROWS, SENTINEL,
     fill_staging, golden_check)
-from torchops import load_dsa_gather_rmt_op, npu_dsa_gather_rmt_submit as submit_op  # noqa: E402
+from torchops import load_dsa_gather_rmt_op  # noqa: E402
 from xds.xds_ems_pool import EmsPool  # noqa: E402
 
 FATBIN_CANDIDATES = [
@@ -93,8 +93,9 @@ def main():
         print("[test] graph warmup(eager) golden PASS")
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph, auto_dispatch_capture=True):
-            submit_op(kv4, rope4, res_tbl, host_tbl, pool_idx, topk, slots, mask, BLOCK_SIZE, BS,
-                      rmt_ch, rmt_kv, rmt_rope, block_dim=args.block_dim)
+            torch_npu.npu_dsa_gather_rmt_submit(kv4, rope4, res_tbl, host_tbl, pool_idx, topk, slots, mask,
+                                                 BLOCK_SIZE, BS, rmt_ch, rmt_kv, rmt_rope,
+                                                 block_dim=args.block_dim)
         for i in range(args.replays):
             res_kv.fill_(SENTINEL)
             res_rope.fill_(SENTINEL)

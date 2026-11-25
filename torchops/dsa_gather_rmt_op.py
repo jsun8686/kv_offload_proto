@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
 """npu_dsa_gather_rmt 的 torch 层实现（13 参张量 → 26 参 pybind 适配）。
@@ -7,7 +7,7 @@
   submit：纯提交（校验 → 池化 status 槽 → launch），立即返回——capture 天然安全（无 host
           阻塞/无 malloc），NPUGraph 捕获区间内调用本层即可（姿势：torch.npu.graph(
           auto_dispatch_capture=True)，Step1 实证 HostArgs launch 可被记录）。
-  wait_and_check：逐核槽 poll + 错误码校验——图外任意时刻调用（回放后 synchronize 再查）。
+  npu_dsa_gather_rmt_wait：逐核槽 poll + 错误码校验——图外任意时刻调用（回放后 synchronize 再查）。
   npu_dsa_gather_rmt（同步组合）：submit + wait 一行拼装，eager 调用方零感知。
 
 图模式纪律（用例参照 tests/test_graph_probe.py）：
@@ -46,7 +46,7 @@ def _acquire_status(device, block_dim):
 
 
 class DsaGatherRmtStatus(NamedTuple):
-    """submit 返回的等待句柄：status 基址 + 核数（wait_and_check 入参）。"""
+    """submit 返回的等待句柄：status 基址 + 核数（npu_dsa_gather_rmt_wait 入参）。"""
     status_addr: int
     block_dim: int
 
@@ -130,7 +130,7 @@ def npu_dsa_gather_rmt_submit(resident_kv_cache, resident_rope_cache, resident_b
     """纯提交层：launch 到当前流（capture 中即记录到 capture stream），返回等待句柄。
 
     NPUGraph 捕获区间内调用本函数（不调 wait）；回放后由调用方 synchronize，
-    错误检查用 wait_and_check（图外）或 golden 对拍兜底。
+    错误检查用 npu_dsa_gather_rmt_wait（图外）或 golden 对拍兜底。
     """
     bs, nreq, kv_dim, rope_dim, kv_elem, rope_elem, res_blk, host_blk = _validate(
         resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
@@ -149,7 +149,7 @@ def npu_dsa_gather_rmt_submit(resident_kv_cache, resident_rope_cache, resident_b
     return DsaGatherRmtStatus(st, int(block_dim))
 
 
-def wait_and_check(handle, timeout_us=_POLL_TIMEOUT_US):
+def npu_dsa_gather_rmt_wait(handle, timeout_us=_POLL_TIMEOUT_US):
     """等待层：逐核槽 poll 至终态并校验错误码（图外任意时刻调用；eager/图回放后通用）。"""
     for i in range(handle.block_dim):
         rc = _kvops.poll_status(handle.status_addr + i * 64, timeout_us)
@@ -166,12 +166,21 @@ def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_ta
         resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
         request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size, num_requests,
         host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=block_dim)
-    wait_and_check(handle)
+    npu_dsa_gather_rmt_wait(handle)
     return resident_kv_cache, resident_rope_cache
 
 
 def load_dsa_gather_rmt_op():
-    """幂等挂载到 torch_npu（对齐生产 custom_op_loader 属性挂载形态）。"""
+    """幂等挂载三件套到 torch_npu（对齐生产 custom_op_loader 属性挂载形态）。
+
+    npu_dsa_gather_rmt（eager 同步）/ npu_dsa_gather_rmt_submit（图捕获区间纯提交）/
+    npu_dsa_gather_rmt_wait（图外等待与错误码校验）地位对等——graph runner 集成形态下
+    capture/replay 两侧调用方只 import torch_npu。返回 eager 主算子（兼容旧调用方）。
+    """
     if not hasattr(torch_npu, "npu_dsa_gather_rmt"):
         torch_npu.npu_dsa_gather_rmt = npu_dsa_gather_rmt
+    if not hasattr(torch_npu, "npu_dsa_gather_rmt_submit"):
+        torch_npu.npu_dsa_gather_rmt_submit = npu_dsa_gather_rmt_submit
+    if not hasattr(torch_npu, "npu_dsa_gather_rmt_wait"):
+        torch_npu.npu_dsa_gather_rmt_wait = npu_dsa_gather_rmt_wait
     return torch_npu.npu_dsa_gather_rmt

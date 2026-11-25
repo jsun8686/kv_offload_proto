@@ -1,4 +1,4 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
+﻿# Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
 # EmsPool（替换原 mempoolhost.py）：对 xds_offload 提供初始化池 / 行分配 / 批量读写接口。
 # 内部：EMS 控制面（建池+建链）+ kvops 批量算子（AIV 直驱，图捕获安全）。
@@ -33,80 +33,6 @@ def _ptr(x) -> int:
     if dp is None:
         raise TypeError("expect tensor or int address, got {}".format(type(x)))
     return dp()
-
-
-def next_pow2(v: int) -> int:
-    p = 1
-    while p < v:
-        p <<= 1
-    return p
-
-
-def compute_ht_size(padded_buffer_size: int, top_k: int) -> int:
-    """哈希表容量：2 的幂且 ≥ 2×(padded+topK)（装载因子 ≤0.5，与 sglang-0730 host 派生一致）"""
-    p = 1024
-    while p < 2 * (padded_buffer_size + top_k):
-        p <<= 1
-    return p
-
-
-def align(v: int, a: int) -> int:
-    return (v + a - 1) // a * a
-
-
-class RowAllocator:
-    """框架侧行号分配器：连续区间优先（连续性契约），碎片化时拼接离散行（≤4 段由调用方保证容量）。"""
-
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self._free = [(0, capacity)]
-        self._used = 0
-
-    def alloc(self, n: int) -> List[int]:
-        if n <= 0:
-            raise ValueError("n must be > 0")
-        if n > self.free_rows():
-            raise MemoryError("allocator exhausted: free={} need={}".format(self.free_rows(), n))
-        for i, (s, e) in enumerate(self._free):
-            if e - s >= n:
-                del self._free[i]
-                if e - s > n:
-                    self._free.insert(i, (s + n, e))
-                self._used += n
-                return list(range(s, s + n))
-        rows: List[int] = []
-        while len(rows) < n:
-            s, e = self._free.pop(0)
-            take = min(e - s, n - len(rows))
-            rows.extend(range(s, s + take))
-            if e - s > take:
-                self._free.insert(0, (s + take, e))
-        self._free.sort()
-        self._used += n
-        return rows
-
-    def free(self, rows: List[int]) -> None:
-        if not rows:
-            return
-        for r in rows:
-            if r < 0 or r >= self.capacity:
-                raise ValueError("row out of range: {}".format(r))
-        self._free.extend([(r, r + 1) for r in rows])
-        self._free.sort()
-        merged = []
-        for s, e in self._free:
-            if merged and s <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            else:
-                merged.append((s, e))
-        self._free = merged
-        self._used -= len(rows)
-
-    def free_rows(self) -> int:
-        return sum(e - s for s, e in self._free)
-
-    def used_rows(self) -> int:
-        return self._used
 
 
 class EmsPool:
@@ -251,33 +177,6 @@ class EmsPool:
             self.pool = None
         self._ems.close()
 
-    def make_allocator(self) -> RowAllocator:
-        return RowAllocator(self.layer_rows)
-
-    # ── 批量读（decode miss 回取，稠密接口）：N 段 launch 共享 sieve 输出 ────
-    def batch_read(self, layer_id: int, topk_indices, req_pool_indices, req_host_base, topk_device_slots, is_miss,
-                   num_real, hot_row_base, max_num_reqs: int, top_k: int, stream: int = 0,
-                   block_dim: int = 1) -> int:
-        if self.pool is None:
-            raise RuntimeError("pool not created")
-        # stream=0（未指定）改用 torch_npu 当前流：与 torch 侧 fill_/copy_/to(dev) 同流有序
-        # （对齐 sglang hisparse_lru_host.cpp 的 get_npu_stream；stream 0 上内核会读到 torch 写入前的旧值）
-        if stream == 0:
-            stream = torch.npu.current_stream().npu_stream
-        status = self.next_status(self.node_num * block_dim)
-        layer_offset = layer_id * self.per_layer_seg_rows
-        for s in range(self.node_num):
-            seg = self.pool.segments[s]
-            # 每段独占槽区：内核按 blockIdx*64 相对各自基址写（wait 用 (s*block_dim+b)*64 寻址）。
-            # 传同一基址会让 N 段全部写 slot0——nodeNum>1 时段 s≥1 的槽全 0 超时（实测 dev3 导出）
-            seg_status = status + s * block_dim * 64
-            _kvops.import_seg(self.channels[s], seg.seg_base, layer_offset, self.per_layer_seg_rows,
-                              self.row_bytes, _ptr(topk_indices), _ptr(req_pool_indices), _ptr(req_host_base),
-                              _ptr(topk_device_slots), _ptr(is_miss), _ptr(num_real), _ptr(hot_row_base), top_k,
-                              max_num_reqs, self.stripe_rows, self.node_num, s, seg_status, stream, block_dim)
-        return status
-
-    # ── 批量写（prefill 全层连续区间导出）───────────────────────────────────
     def batch_write_alllayers(self, row_lo: int, row_cnt: int, src_layer0_base, src_layer_stride: int, stream: int = 0,
                               block_dim: int = 1) -> int:
         if self.pool is None:

@@ -1,13 +1,10 @@
-/*
+﻿/*
  * Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
  * KV offload prototype is licensed under Mulan PSL v2.
  * kvops_ext：AIV 算子 launch 封装（fatbin 显式加载链，PoC 方案 B）。
- *   内核：kvc_gather_rows（稠密导入）/ kvc_scatter_rows_alllayer（全层导出）
- *         hisp_sieve_update（SIEVE miss 识别，哈希-only）/ hisp_sieve_ht_init（哈希表构建）
+ *   内核：dsa_gather_rmt（DSA miss 记录回源，纯远端 ReadNbi）
+ *         kvc_scatter_rows_alllayer（全层导出，EmsPool.export_full_rmt_pool 数据链依赖）
  * launch 均不在内部同步/读 device 内存（图捕获安全）；status 槽由调用方管理。
- * sieve 派生公式与 sglang-0730 hisparse_lru_host.cpp 严格一致：
- *   htSize = 2 的幂 ≥ 2×(padded+topK)（装载因子 ≤0.5）
- *   reqsPerCore 对齐 64/gcd(topK,64)（每 block 输出段 64B cache line 对齐）
  */
 
 #include <pybind11/pybind11.h>
@@ -32,7 +29,6 @@ constexpr int32_t LAUNCH_ATTR_ENGINE_TYPE = 3;
 constexpr int32_t LAUNCH_ATTR_TIMEOUT_US = 8;
 constexpr int32_t BINARY_LOAD_OPT_LAZY_LOAD = 1;
 constexpr int32_t ENGINE_TYPE_AIV = 1;
-constexpr int64_t UB_BUDGET_BYTES = 176 * 1024;  // 192KB/核留余量
 
 union BinOptVal {
     uint32_t isLazyLoad;
@@ -76,11 +72,7 @@ struct RtApi {
 RtApi rt{};
 void *rtLib = nullptr;
 void *g_binary = nullptr;
-void *g_fnGather = nullptr;
 void *g_fnScatterAll = nullptr;
-void *g_fnSieveUpdate = nullptr;
-void *g_fnSieveHtInit = nullptr;
-void *g_fnGatherSelRmt = nullptr;
 void *g_fnDsaGatherRmt = nullptr;
 void *g_overflowBuf = nullptr;
 bool g_inited = false;
@@ -97,19 +89,9 @@ T Sym(const char *name)
     return fn;
 }
 
-int64_t Gcd(int64_t a, int64_t b)
-{
-    while (b != 0) {
-        int64_t t = a % b;
-        a = b;
-        b = t;
-    }
-    return a;
-}
-
 void LaunchCommon(void *fn, const void *argsStruct, size_t argsSize, uint32_t blockDim, uint64_t stream)
 {
-    uint8_t buf[512];  // GatherSelectionRmtArgs(160B)+尾槽 超出旧 160B 上限后扩容
+    uint8_t buf[512];
     // 尾槽（工具链为 kernel 恒追加的 8B device buffer 地址参数）按 8B 对齐放置：
     // 结构体 sizeof 非 8 倍数时（如 KvcScatterAllArgs=76B）直接接在末尾会把尾槽放到
     // 非对齐偏移，kernel 侧按对齐 ABI 读到的就是垃圾地址
@@ -194,11 +176,9 @@ void kv_init(int deviceId, const std::string &fatbinPath, const std::string &rtL
     if (ret != 0 || g_binary == nullptr) {
         throw std::runtime_error("BinaryLoadFromFile ret=" + std::to_string(ret) + " path=" + fatbinPath);
     }
-    const char *names[6] = {"kvc_gather_rows", "kvc_scatter_rows_alllayer", "hisp_sieve_update",
-                             "hisp_sieve_ht_init", "gather_selection_rmt", "dsa_gather_rmt"};
-    void **fns[6] = {&g_fnGather, &g_fnScatterAll, &g_fnSieveUpdate, &g_fnSieveHtInit, &g_fnGatherSelRmt,
-                     &g_fnDsaGatherRmt};
-    for (int i = 0; i < 6; i++) {
+    const char *names[2] = {"kvc_scatter_rows_alllayer", "dsa_gather_rmt"};
+    void **fns[2] = {&g_fnScatterAll, &g_fnDsaGatherRmt};
+    for (int i = 0; i < 2; i++) {
         ret = rt.aclrtBinaryGetFunction(g_binary, names[i], fns[i]);
         if (ret != 0 || *fns[i] == nullptr) {
             throw std::runtime_error(std::string("GetFunction ") + names[i] + " ret=" + std::to_string(ret));
@@ -258,45 +238,6 @@ uint64_t kv_peek_status(uint64_t statusAddr)
     return v;
 }
 
-// ── 批量导入（稠密）：N 段循环由 Python 侧逐段调用 ──
-void kv_import_seg(uint64_t channel, uint64_t segBase, uint32_t layerOffsetRows, uint32_t perLayerSegRows,
-                   uint32_t rowBytes, uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t reqHostBase,
-                   uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal, uint64_t hotRowBase,
-                   uint32_t topK, uint32_t maxNumReqs, uint32_t stripeRows, uint32_t nodeNum, uint32_t myNode,
-                   uint64_t status, uint64_t stream, uint32_t blockDim)
-{
-    EnsureInited();
-    if (blockDim > 8) {
-        throw std::runtime_error("import blockDim must be <= 8 (status slot layout)");
-    }
-    KvcGatherArgs args{};
-    args.channel = channel;
-    args.segBase = segBase;
-    args.topkIndices = topkIndices;
-    args.reqPoolIndices = reqPoolIndices;
-    args.reqHostBase = reqHostBase;
-    args.topKDeviceSlots = topKDeviceSlots;
-    args.isMiss = isMiss;
-    args.numReal = numReal;
-    args.hotRowBase = hotRowBase;
-    args.status = status;
-    args.layerOffsetRows = layerOffsetRows;
-    args.perLayerSegRows = perLayerSegRows;
-    args.rowBytes = rowBytes;
-    args.stripeRows = stripeRows;
-    args.nodeNum = nodeNum;
-    args.myNode = myNode;
-    args.topK = topK;
-    args.maxNumReqs = maxNumReqs;
-    const uint32_t totalPos = maxNumReqs * topK;
-    args.positionsPerCore = (totalPos + blockDim - 1) / blockDim;  // 对齐由 Python 侧校验（64 元素）
-    if (rt.aclrtMemset(reinterpret_cast<void *>(status), blockDim * 64, 0, blockDim * 64) != 0) {
-        throw std::runtime_error("import_seg status memset failed, status=" + std::to_string(status) +
-                                 " bytes=" + std::to_string(blockDim * 64));
-    }  // 每 block 独占 64B 槽
-    LaunchCommon(g_fnGather, &args, sizeof(args), blockDim, stream);
-}
-
 void kv_export_seg_alllayer(uint64_t channel, uint64_t segBase, uint32_t perLayerSegRows, uint32_t rowBytes,
                             uint32_t rowLo, uint32_t rowCnt, uint32_t layerNum, uint64_t srcLayer0Base,
                             uint64_t srcLayerStride, uint32_t stripeRows, uint32_t nodeNum, uint32_t myNode,
@@ -322,140 +263,6 @@ void kv_export_seg_alllayer(uint64_t channel, uint64_t segBase, uint32_t perLaye
                                  " bytes=" + std::to_string(blockDim * 64));
     }
     LaunchCommon(g_fnScatterAll, &args, sizeof(args), blockDim, stream);
-}
-
-// ── SIEVE 更新（哈希-only；htSize/reqsPerCore 由本侧派生，公式与 sglang-0730 一致） ──
-void kv_sieve_update(uint64_t topkIndices, uint64_t reqPoolIndices, uint64_t seqLens, uint64_t prefillLens,
-                     uint64_t deviceBufferTokens, uint64_t deviceBufferVisited, uint64_t deviceBufferHt,
-                     uint64_t sieveHand, uint64_t topKDeviceSlots, uint64_t isMiss, uint64_t numReal,
-                     uint32_t topK, uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t visitedStrideB,
-                     uint32_t maxNumReqs, uint32_t poolSize, uint64_t stream, uint32_t blockDim)
-{
-    EnsureInited();
-    if (paddedBufferSize % 16 != 0) {
-        throw std::runtime_error("sieve_update: padded_buffer_size must be a multiple of 16 (64-byte rows)");
-    }
-    if (paddedBufferSize > 65534) {
-        throw std::runtime_error("sieve_update: padded_buffer_size must be <= 65534 (uint16 hash slots)");
-    }
-    if (visitedStrideB % 64 != 0 || visitedStrideB < (paddedBufferSize + 7) / 8) {
-        throw std::runtime_error("sieve_update: visited bitmap stride must be 64B aligned and cover padded");
-    }
-    if (topK % 8 != 0) {
-        // 输出行（slots/is_miss 各 topK 个 int32）经 MTE DataCopy 回写，字节粒度须为 32B 倍数
-        throw std::runtime_error("sieve_update: topK must be a multiple of 8 (32B MTE write-back rows)");
-    }
-    int64_t htSize = 1024;
-    while (htSize < 2 * (static_cast<int64_t>(paddedBufferSize) + topK)) {
-        htSize <<= 1;
-    }
-    // UB 预算：tokens 行 + visited 位图行 + 哈希表 + 输出 staging（slots/is_miss 各 topK×4B）
-    // + hand 行（16×int32）——sieve 输出在 950 上必须走 MTE 回写（标量 store 对 host 不可见）
-    int64_t ubBytes = paddedBufferSize * 4 + visitedStrideB + htSize * 2 + topK * 4 * 2 + 16 * 4;
-    if (ubBytes > UB_BUDGET_BYTES) {
-        throw std::runtime_error("sieve_update: UB usage " + std::to_string(ubBytes) +
-                                 " bytes exceeds the 176KB budget");
-    }
-    int64_t rpcAlign = 64 / Gcd(topK, 64);
-    int64_t reqsPerCore = (maxNumReqs + blockDim - 1) / blockDim;
-    reqsPerCore = (reqsPerCore + rpcAlign - 1) / rpcAlign * rpcAlign;
-    if (reqsPerCore < 1) {
-        reqsPerCore = 1;
-    }
-
-    HispSieveUpdateArgs args{};
-    args.topkIndices = topkIndices;
-    args.reqPoolIndices = reqPoolIndices;
-    args.seqLens = seqLens;
-    args.prefillLens = prefillLens;
-    args.deviceBufferTokens = deviceBufferTokens;
-    args.deviceBufferVisited = deviceBufferVisited;
-    args.deviceBufferHt = deviceBufferHt;
-    args.sieveHand = sieveHand;
-    args.topKDeviceSlots = topKDeviceSlots;
-    args.isMiss = isMiss;
-    args.numReal = numReal;
-    args.status = 0;
-    args.topK = topK;
-    args.deviceBufferSize = deviceBufferSize;
-    args.paddedBufferSize = paddedBufferSize;
-    args.visitedStrideB = visitedStrideB;
-    args.maxNumReqs = maxNumReqs;
-    args.reqsPerCore = static_cast<uint32_t>(reqsPerCore);
-    args.htSize = static_cast<uint32_t>(htSize);
-    args.poolSize = poolSize;
-    LaunchCommon(g_fnSieveUpdate, &args, sizeof(args), blockDim, stream);
-}
-
-// ── SIEVE 哈希表构建（blockDim = layerNum × numReqs；htSize 传入须为 2 的幂 ≥2×(padded+topK)） ──
-void kv_sieve_ht_init(uint64_t deviceBufferTokens, uint64_t deviceBufferHt, uint64_t prefillLens,
-                      uint32_t reqStart, uint32_t numReqs, uint32_t layerNum, uint32_t poolSize,
-                      uint32_t deviceBufferSize, uint32_t paddedBufferSize, uint32_t htSize, uint64_t stream,
-                      uint32_t blockDim)
-{
-    EnsureInited();
-    HispSieveHtInitArgs args{};
-    args.deviceBufferTokens = deviceBufferTokens;
-    args.deviceBufferHt = deviceBufferHt;
-    args.prefillLens = prefillLens;
-    args.status = 0;
-    args.reqStart = reqStart;
-    args.numReqs = numReqs;
-    args.layerNum = layerNum;
-    args.poolSize = poolSize;
-    args.deviceBufferSize = deviceBufferSize;
-    args.paddedBufferSize = paddedBufferSize;
-    args.htSize = htSize;
-    LaunchCommon(g_fnSieveHtInit, &args, sizeof(args), blockDim, stream);
-}
-
-// gather_selection_kv_cache 远端池适配版（V2，doc/npu_gather_selection_kv_cache_rmt.md）。
-// channel==0 走本地 DataCopyPad（V1.0）；非 0 走 ReadNbi 回源（V1.1，需 EmsPool 建链与三表）。
-void kv_gather_selection_rmt(uint64_t selKRope, uint64_t selKvCache, uint64_t selBlockTable,
-                             uint64_t selBlockStatus, uint64_t topkIndices, uint64_t fullKRope,
-                             uint64_t fullKvCache, uint64_t fullBlockTable, uint64_t fullKvActualSeq,
-                             uint64_t fullQActualSeq, uint64_t rmtChannel, uint64_t rmtKvAddr,
-                             uint64_t rmtRopeAddr, uint64_t status, uint64_t actualSeq, uint32_t batch,
-                             uint32_t seq, uint32_t head, uint32_t topk, uint32_t blockSize,
-                             uint32_t fullMaxBlockNum, uint32_t selMaxBlockNum, uint32_t fullKvBlockNum,
-                             uint32_t selTopKBlockSize, uint32_t kvCacheDim, uint32_t kRopeDim,
-                             uint64_t stream, uint32_t blockDim)
-{
-    EnsureInited();
-    if (head != 1) {
-        throw std::runtime_error("gather_selection_rmt: head must be 1 (MLA shared KV)");
-    }
-    if (blockSize % selTopKBlockSize != 0) {
-        throw std::runtime_error("gather_selection_rmt: blockSize must be divisible by selTopKBlockSize");
-    }
-    GatherSelectionRmtArgs args{};
-    args.selKRope = selKRope;
-    args.selKvCache = selKvCache;
-    args.selBlockTable = selBlockTable;
-    args.selBlockStatus = selBlockStatus;
-    args.topkIndices = topkIndices;
-    args.fullKRope = fullKRope;
-    args.fullKvCache = fullKvCache;
-    args.fullBlockTable = fullBlockTable;
-    args.fullKvActualSeq = fullKvActualSeq;
-    args.fullQActualSeq = fullQActualSeq;
-    args.rmtChannel = rmtChannel;
-    args.rmtKvAddr = rmtKvAddr;
-    args.rmtRopeAddr = rmtRopeAddr;
-    args.status = status;
-    args.actualSeq = actualSeq;
-    args.batch = batch;
-    args.seq = seq;
-    args.head = head;
-    args.topk = topk;
-    args.blockSize = blockSize;
-    args.fullMaxBlockNum = fullMaxBlockNum;
-    args.selMaxBlockNum = selMaxBlockNum;
-    args.fullKvBlockNum = fullKvBlockNum;
-    args.selTopKBlockSize = selTopKBlockSize;
-    args.kvCacheDim = kvCacheDim;
-    args.kRopeDim = kRopeDim;
-    LaunchCommon(g_fnGatherSelRmt, &args, sizeof(args), blockDim, stream);
 }
 
 void kv_dsa_gather_rmt(uint64_t residentKv, uint64_t residentRope, uint64_t residentBlockTable,
@@ -526,36 +333,11 @@ PYBIND11_MODULE(_kvops, m)
     m.def("alloc_status", &kv_alloc_status, py::arg("count"));
     m.def("poll_status", &kv_poll_status, py::arg("status_addr"), py::arg("timeout_us") = -1);
     m.def("peek_status", &kv_peek_status, py::arg("status_addr"));
-    m.def("import_seg", &kv_import_seg, py::arg("channel"), py::arg("seg_base"), py::arg("layer_offset_rows"),
-          py::arg("per_layer_seg_rows"), py::arg("row_bytes"), py::arg("topk_indices"), py::arg("req_pool_indices"),
-          py::arg("req_host_base"), py::arg("topk_device_slots"), py::arg("is_miss"), py::arg("num_real"),
-          py::arg("hot_row_base"), py::arg("top_k"), py::arg("max_num_reqs"), py::arg("stripe_rows"),
-          py::arg("node_num"), py::arg("my_node"), py::arg("status"), py::arg("stream") = 0,
-          py::arg("block_dim") = 1);
     m.def("export_seg_alllayer", &kv_export_seg_alllayer, py::arg("channel"), py::arg("seg_base"),
           py::arg("per_layer_seg_rows"), py::arg("row_bytes"), py::arg("row_lo"), py::arg("row_cnt"),
           py::arg("layer_num"), py::arg("src_layer0_base"), py::arg("src_layer_stride"), py::arg("stripe_rows"),
           py::arg("node_num"), py::arg("my_node"), py::arg("status"), py::arg("stream") = 0,
           py::arg("block_dim") = 1);
-    m.def("sieve_update", &kv_sieve_update, py::arg("topk_indices"), py::arg("req_pool_indices"),
-          py::arg("seq_lens"), py::arg("prefill_lens"), py::arg("device_buffer_tokens"),
-          py::arg("device_buffer_visited"), py::arg("device_buffer_ht"), py::arg("sieve_hand"),
-          py::arg("topk_device_slots"), py::arg("is_miss"), py::arg("num_real"), py::arg("top_k"),
-          py::arg("device_buffer_size"), py::arg("padded_buffer_size"), py::arg("visited_stride_b"),
-          py::arg("max_num_reqs"), py::arg("pool_size"), py::arg("stream") = 0, py::arg("block_dim") = 8);
-    m.def("sieve_ht_init", &kv_sieve_ht_init, py::arg("device_buffer_tokens"), py::arg("device_buffer_ht"),
-          py::arg("prefill_lens"), py::arg("req_start"), py::arg("num_reqs"), py::arg("layer_num"),
-          py::arg("pool_size"), py::arg("device_buffer_size"), py::arg("padded_buffer_size"),
-          py::arg("ht_size"), py::arg("stream") = 0, py::arg("block_dim") = 0);
-    m.def("gather_selection_rmt", &kv_gather_selection_rmt, py::arg("sel_k_rope"), py::arg("sel_kv_cache"),
-          py::arg("sel_block_table"), py::arg("sel_block_status"), py::arg("topk_indices"),
-          py::arg("full_k_rope"), py::arg("full_kv_cache"), py::arg("full_block_table"),
-          py::arg("full_kv_actual_seq"), py::arg("full_q_actual_seq"), py::arg("rmt_channel"),
-          py::arg("rmt_kv_addr"), py::arg("rmt_rope_addr"), py::arg("status"), py::arg("actual_seq"),
-          py::arg("batch"), py::arg("seq"), py::arg("head"), py::arg("topk"), py::arg("block_size"),
-          py::arg("full_max_block_num"), py::arg("sel_max_block_num"), py::arg("full_kv_block_num"),
-          py::arg("sel_topk_block_size"), py::arg("kv_cache_dim"), py::arg("k_rope_dim"),
-          py::arg("stream") = 0, py::arg("block_dim") = 1);
     m.def("dsa_gather_rmt", &kv_dsa_gather_rmt, py::arg("resident_kv"), py::arg("resident_rope"),
           py::arg("resident_block_table"), py::arg("host_block_table"), py::arg("request_pool_indices"),
           py::arg("topk_token_positions"), py::arg("resident_slots"), py::arg("miss_mask"),

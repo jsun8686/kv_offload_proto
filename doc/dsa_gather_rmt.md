@@ -4,7 +4,7 @@
 > block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
 > H2D 透明搬运）；golden 基准 = 其 `golden.py`（miss_mask 唯一闸门 + sentinel 零搬运对拍）
-> 姊妹篇：`npu_gather_selection_kv_cache_rmt.md`（rmt 系工程范式/实证沉淀，本文复用其基建）
+> 本仓已简化为 dsa_gather_rmt 单算子形态（gather_selection 系列及 V0 流水已移除，git 历史可溯）
 
 ## 1. 背景与定位
 
@@ -118,20 +118,23 @@ with torch.npu.graph(graph, auto_dispatch_capture=True):
 for _ in range(N):
     reset_outputs()                   # 图外 sentinel 重置
     graph.replay(); torch.npu.synchronize()
-    wait_and_check(h)                 # 可选：图外错误码校验（golden 对拍亦兜底）
+    npu_dsa_gather_rmt_wait(h)        # 可选：图外错误码校验（golden 对拍亦兜底）
 ```
 
 纪律（对齐 MemFabric 用例14）：warmup 图外 eager 首跑（内核 hcomm.Init 首执行不得在 capture 中）；
 三表/页表/输出张量引用持有至最后回放；status 槽模块级池化复用（地址固定）。
 eager 语义不变：`npu_dsa_gather_rmt` = submit + wait 一行组合（旧调用方零感知）。
 
-## 8. 与 gather_selection_rmt 的关系
+## 8. 性能摸底（tests/test_bench_dsa_gather_rmt.py）
 
-| | gather_selection_rmt | dsa_gather_rmt |
-|---|---|---|
-| 源 | 本地张量（空 tensor 惯例）/ 远端，0 哨兵分流 | 仅远端，无哨兵 |
-| 行坐标 | B*S*H query 行 + 账本/因果裁剪 | (req,query) pair + miss_mask |
-| 源寻址 | 一跳（batch 行页表） | 两跳（pool_entry 间接） |
-| 输出 | 热池 + 账本 + actual_seq | resident 池（原地，无账本） |
-| 并行 | 单核（多核化挂账：需 pair 均分改造） | 原生多核 pair 均分 + 每核专属通道（D2a 已验，机制链可复用） |
-| 远端布局/三表/收尾 | 同构（export_full_rmt_pool 复用） | 同左 |
+矩阵：`--block-dims 1,2,4,8` × `--scale s1|s2|s3` × `--mode eager|graph|both`；
+计时 `torch.npu.Event` × warmup3 + repeat10 取中位；输出 `time_us / miss_records / moved_bytes /
+有效带宽 GB/s / vs bd1 加速比`（markdown 表）。规模档：
+
+| 档 | queryCount | keyLen | 说明 |
+|---|---|---|---|
+| s1 | 256 | 4096 | 正确性档（records≈256） |
+| s2 | 2048 | 32768 | 中档（records≈8K） |
+| s3 | 2048 | 131072 | 原版生产形状（对齐 vllm dsa_gather；staging≈67MB） |
+
+参照基线：原版 910_93 H2D 路径 164 miss 记录 98.78μs（dsa_gather 上游）。

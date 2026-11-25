@@ -62,12 +62,8 @@ if(_TARGET STREQUAL "kernel" OR _TARGET STREQUAL "all")
         message(FATAL_ERROR "${ASC_DEVKIT_ROOT}/include/adv_api/hcomm/hcomm.h not found, set -DASC_DEVKIT_ROOT")
     endif()
 
-    ascendc_fatbin_library(kvc_kernel
-        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/kvc_gather_rows.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/kvc_scatter_rows_alllayer.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/hisp_sieve_update.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/hisp_sieve_ht_init.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/gather_selection_rmt.cpp
+ascendc_fatbin_library(kvc_kernel
+${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/kvc_scatter_rows_alllayer.cpp
 ${CMAKE_CURRENT_SOURCE_DIR}/kvops/kernel/dsa_gather_rmt.cpp
     )
     if(COMMAND ascendc_include_directories)
