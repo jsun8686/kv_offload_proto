@@ -3,16 +3,17 @@
 # KV offload prototype is licensed under Mulan PSL v2.
 """npu_dsa_gather_rmt 的 torch 层实现（13 参张量 → 26 参 pybind 适配）。
 
-两层 API（图友好，对齐 MemFabric 提交/等待分离模式）：
+三件套（torch_npu 属性挂载，地位对等）：
   submit：纯提交（校验 → 池化 status 槽 → launch），立即返回——capture 天然安全（无 host
           阻塞/无 malloc），NPUGraph 捕获区间内调用本层即可（姿势：torch.npu.graph(
           auto_dispatch_capture=True)，Step1 实证 HostArgs launch 可被记录）。
-  npu_dsa_gather_rmt_wait：逐核槽 poll + 错误码校验——图外任意时刻调用（回放后 synchronize 再查）。
-  npu_dsa_gather_rmt（同步组合）：submit + wait 一行拼装，eager 调用方零感知。
+  result：纯读（零等待零同步——调用方须已 torch.npu.synchronize()）：逐核 peek status，
+          完成位契约校验（未同步的误用在此显性报错）+ 错误码校验。
+  npu_dsa_gather_rmt（eager 同步组合）：submit + synchronize + result 一行拼装。
 
-图模式纪律（用例参照 tests/test_graph_probe.py）：
+图模式纪律：
   ① warmup 图外 eager 首跑（内核 hcomm.Init 首执行不得在 capture 中）；
-  ② 捕获区间只调 submit；③ 回放前重置输出 sentinel；④ 三表/池张量引用持有至最后回放。
+  ② 捕获区间只调 submit；③ 回放后 synchronize → result 校验；④ 输出张量引用持有至最后回放。
 """
 
 from typing import NamedTuple
@@ -22,7 +23,6 @@ import torch_npu
 
 import kvops_ext._kvops as _kvops
 
-_POLL_TIMEOUT_US = 30_000_000
 _STATUS_POOL_SLOTS = 8  # 每 device 池化槽数（64B/槽，block_dim≤8 时单次最多全占）
 
 _DTYPE_PAIRS = {(torch.float16, torch.float16), (torch.bfloat16, torch.bfloat16),
@@ -46,7 +46,7 @@ def _acquire_status(device, block_dim):
 
 
 class DsaGatherRmtStatus(NamedTuple):
-    """submit 返回的等待句柄：status 基址 + 核数（npu_dsa_gather_rmt_wait 入参）。"""
+    """submit 返回的等待句柄：status 基址 + 核数（npu_dsa_gather_rmt_result 入参）。"""
     status_addr: int
     block_dim: int
 
@@ -130,7 +130,7 @@ def npu_dsa_gather_rmt_submit(resident_kv_cache, resident_rope_cache, resident_b
     """纯提交层：launch 到当前流（capture 中即记录到 capture stream），返回等待句柄。
 
     NPUGraph 捕获区间内调用本函数（不调 wait）；回放后由调用方 synchronize，
-    错误检查用 npu_dsa_gather_rmt_wait（图外）或 golden 对拍兜底。
+    错误检查用 npu_dsa_gather_rmt_result（图外）或 golden 对拍兜底。
     """
     bs, nreq, kv_dim, rope_dim, kv_elem, rope_elem, res_blk, host_blk = _validate(
         resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
@@ -149,24 +149,34 @@ def npu_dsa_gather_rmt_submit(resident_kv_cache, resident_rope_cache, resident_b
     return DsaGatherRmtStatus(st, int(block_dim))
 
 
-def npu_dsa_gather_rmt_wait(handle, timeout_us=_POLL_TIMEOUT_US):
-    """等待层：逐核槽 poll 至终态并校验错误码（图外任意时刻调用；eager/图回放后通用）。"""
+def npu_dsa_gather_rmt_result(handle):
+    """结果校验（纯读，零等待零同步——调用方须已 torch.npu.synchronize()）。
+
+    逐核 peek status 槽：完成位契约校验（外层未同步的误用在此显性报错，而非死等）
+    + 错误码校验（图回放下是拿到内核错误码的唯一通道——回放不会因内核内部错误失败）。
+    """
     for i in range(handle.block_dim):
-        rc = _kvops.poll_status(handle.status_addr + i * 64, timeout_us)
+        v = _kvops.peek_status(handle.status_addr + i * 64)
+        if v == 0xFFFFFFFFFFFFFFFF:
+            raise RuntimeError("npu_dsa_gather_rmt core %d peek status failed (memcpy error)" % i)
+        if (v >> 32) != 1:
+            raise RuntimeError("npu_dsa_gather_rmt core %d not finished (synchronize before result)" % i)
+        rc = v & 0xFFFFFFFF
         if rc != 0:
-            raise RuntimeError("npu_dsa_gather_rmt kernel failed (core %d) rc=0x%x" % (i, rc & 0xFFFFFFFF))
+            raise RuntimeError("npu_dsa_gather_rmt kernel failed (core %d) rc=0x%x" % (i, rc))
 
 
 def npu_dsa_gather_rmt(resident_kv_cache, resident_rope_cache, resident_block_table,
                        host_block_table, request_pool_indices, topk_token_positions,
                        resident_slots, miss_mask, block_size, num_requests,
                        host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=1):
-    """同步组合（eager 语义）：submit + wait；原地写，返回 (kv, rope) alias。"""
-    handle = npu_dsa_gather_rmt_submit(
+    """同步组合（eager 语义）：submit + synchronize + result；原地写，返回 (kv, rope) alias。"""
+    h = npu_dsa_gather_rmt_submit(
         resident_kv_cache, resident_rope_cache, resident_block_table, host_block_table,
         request_pool_indices, topk_token_positions, resident_slots, miss_mask, block_size, num_requests,
         host_rmt_channel, host_rmt_kv_addr, host_rmt_rope_addr, block_dim=block_dim)
-    npu_dsa_gather_rmt_wait(handle)
+    torch.npu.synchronize()
+    npu_dsa_gather_rmt_result(h)
     return resident_kv_cache, resident_rope_cache
 
 
@@ -174,13 +184,13 @@ def load_dsa_gather_rmt_op():
     """幂等挂载三件套到 torch_npu（对齐生产 custom_op_loader 属性挂载形态）。
 
     npu_dsa_gather_rmt（eager 同步）/ npu_dsa_gather_rmt_submit（图捕获区间纯提交）/
-    npu_dsa_gather_rmt_wait（图外等待与错误码校验）地位对等——graph runner 集成形态下
-    capture/replay 两侧调用方只 import torch_npu。返回 eager 主算子（兼容旧调用方）。
+    npu_dsa_gather_rmt_result（图外错误码校验，调用方先 synchronize）地位对等——graph runner
+    集成形态下 capture/replay 两侧调用方只 import torch_npu。返回 eager 主算子（兼容旧调用方）。
     """
     if not hasattr(torch_npu, "npu_dsa_gather_rmt"):
         torch_npu.npu_dsa_gather_rmt = npu_dsa_gather_rmt
     if not hasattr(torch_npu, "npu_dsa_gather_rmt_submit"):
         torch_npu.npu_dsa_gather_rmt_submit = npu_dsa_gather_rmt_submit
-    if not hasattr(torch_npu, "npu_dsa_gather_rmt_wait"):
-        torch_npu.npu_dsa_gather_rmt_wait = npu_dsa_gather_rmt_wait
+    if not hasattr(torch_npu, "npu_dsa_gather_rmt_result"):
+        torch_npu.npu_dsa_gather_rmt_result = npu_dsa_gather_rmt_result
     return torch_npu.npu_dsa_gather_rmt

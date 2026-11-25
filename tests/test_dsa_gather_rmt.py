@@ -1,12 +1,26 @@
 # coding=utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
-"""dsa_gather_rmt 远端 E2E golden 对拍（D1.0 验收，NPU 执行）。
+"""dsa_gather_rmt 唯一测试：torch_npu 三件套接口 + 正确性对拍 + 性能摸底矩阵。
 
-语义基准：vllm-ascend-csrc dsa_gather golden.py——miss_mask 唯一闸门 + pool_entry 两跳寻址
-+ sentinel 零搬运。源池 = staging 张量按公式填充 → export_full_rmt_pool 导出（三表）；
-resident 池与 staging 同一大 hbm 张量（ReadNbi dst 须在注册范围）。
-用法：python -m tests.test_dsa_gather_rmt --device 7 --ems-master <ip:27000> [--perm] [--block-dim N]
+接口面：仅 torch_npu 属性（load 挂载三件套）——
+    torch_npu.npu_dsa_gather_rmt(...)          eager 同步（submit + synchronize + result）
+    torch_npu.npu_dsa_gather_rmt_submit(...)   纯提交（图捕获区间 / 性能计时）
+    torch_npu.npu_dsa_gather_rmt_result(h)     结果校验（调用方须已 synchronize）
+
+流程（每 (blockDim, mode) 点）：建池(n_channels=bd) → 导出三表 → eager warmup 首跑
+    → golden 对拍一次（PASS 行，不计入计时）→ Event 计时（warmup×3 + repeat 中位）
+    → markdown 报表（time_us / records / moved_MB / BW_GB/s / vs bd1）。
+
+规模全参数化（对齐 vllm-ascend-csrc dsa_gather golden.py 命名）：
+    --bs（num_requests）--query-count（每请求 top-K query 槽位）
+    --key-len（每池行 KV 序列长度）--misses-per-req（每请求 miss 记录数，均匀散布）
+    --perm：远端块布局随机洗牌（验证查表寻址；多节点下即"打散"placement 策略，
+    任意 miss 局部性被平均摊到各段 → 带宽聚合）。
+
+用法：python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
+    [--bs 4 --query-count 256 --key-len 4096 --misses-per-req 64]
+    [--block-dims 1,2,4,8] [--mode eager|graph|both] [--repeat 10] [--perm]
 """
 
 import argparse
@@ -14,10 +28,11 @@ import os
 import sys
 
 import torch
+import torch_npu
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import kvops_ext._kvops as _kvops  # noqa: E402
+from torchops import load_dsa_gather_rmt_op  # noqa: E402
 from xds.xds_ems_pool import EmsPool  # noqa: E402
 
 FATBIN_CANDIDATES = [
@@ -25,42 +40,29 @@ FATBIN_CANDIDATES = [
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "build/kernel/kvc_kernel.o"),
 ]
 
-BS = 4                 # num_requests
-QUERY_COUNT = 256      # 每请求 topk 槽位
-KEY_LEN = 4096         # 每池行 token 数
 BLOCK_SIZE = 128
 KV_DIM, ROPE_DIM = 512, 64
-TOTAL_SLOTS = 2048     # resident 池总 slot
-MISSES_PER_REQ = 64    # miss 密度（golden.py 对齐：均匀散布）
 SENTINEL = -1000.0
-
-HOST_BLK_PER_REQ = KEY_LEN // BLOCK_SIZE              # 32
-HOST_BLK_NUM = BS * HOST_BLK_PER_REQ                  # 128
-RES_BLK_PER_REQ = (TOTAL_SLOTS + BLOCK_SIZE - 1) // BLOCK_SIZE  # 16
-RES_BLK_NUM = BS * RES_BLK_PER_REQ                    # 64
-HOST_SLOTS_PER_ENTRY = HOST_BLK_PER_REQ * BLOCK_SIZE  # 4096
-RES_SLOTS_PER_REQ = RES_BLK_PER_REQ * BLOCK_SIZE      # 2048
-POOL_ROWS = HOST_BLK_NUM * BLOCK_SIZE * (KV_DIM + ROPE_DIM) // KV_DIM
+REC_BYTES = (BLOCK_SIZE * KV_DIM + BLOCK_SIZE * ROPE_DIM) * 2  # fp16：每 miss 记录搬运字节
 
 
 def fill_staging(flat, offset):
     """按 golden.py 公式填充：value = (token % 512) + channel_idx + offset。"""
-    tok = torch.arange(flat.shape[0], dtype=torch.int32, device=flat.device).remainder(512)
-    base = tok.to(flat.dtype).view(-1, 1)
-    ch = torch.arange(flat.shape[1], dtype=flat.dtype, device=flat.device).view(1, -1)
-    flat.copy_(base)
-    flat.add_(ch)
+    tok = torch.arange(flat.shape[0], dtype=torch.int32).remainder(512)
+    flat.copy_(tok.view(-1, 1).to(flat.dtype))
+    flat.add_(torch.arange(flat.shape[1], dtype=flat.dtype, device=flat.device).view(1, -1))
     flat.add_(offset)
 
 
-def golden_check(host_kv, host_rope, res_kv, res_rope, pool_idx, topk, slots, mask):
-    """对拍 golden.py：written 集合数据 + sentinel untouched 精确一致。"""
+def golden_check(host_kv, host_rope, res_kv, res_rope, pool_idx, topk, slots, mask, ctx):
+    """对拍 golden.py：written 集合数据 + sentinel untouched 精确一致（CPU 标准答案）。"""
+    bs = ctx["bs"]
     active = mask.cpu().to(torch.bool)
-    batch_rows = torch.arange(BS, dtype=torch.int64).view(-1, 1).expand_as(active)
-    source_slots = (pool_idx.cpu().view(-1, 1).to(torch.int64) * HOST_SLOTS_PER_ENTRY +
+    batch_rows = torch.arange(bs, dtype=torch.int64).view(-1, 1).expand_as(active)
+    source_slots = (pool_idx.cpu().view(-1, 1).to(torch.int64) * ctx["host_slots_per_entry"] +
                     topk.cpu().to(torch.int64))[active]
-    dest_flat = (batch_rows * RES_SLOTS_PER_REQ + slots.cpu().to(torch.int64))[active]
-    expected_sources = torch.full((RES_BLK_NUM * BLOCK_SIZE,), -1, dtype=torch.int64)
+    dest_flat = (batch_rows * ctx["res_slots_per_req"] + slots.cpu().to(torch.int64))[active]
+    expected_sources = torch.full((ctx["res_blk_num"] * BLOCK_SIZE,), -1, dtype=torch.int64)
     expected_sources[dest_flat] = source_slots
     written = expected_sources.ge(0).nonzero(as_tuple=False).flatten()
     src = expected_sources.index_select(0, written)
@@ -78,72 +80,155 @@ def golden_check(host_kv, host_rope, res_kv, res_rope, pool_idx, topk, slots, ma
     return int(written.numel())
 
 
+def build_case(bs, query_count, key_len, misses_per_req, perm, dev):
+    """按参数构造张量组与索引元数据（推导量与 golden 语义对齐）。"""
+    host_blk_per_req = key_len // BLOCK_SIZE
+    host_blk_num = bs * host_blk_per_req
+    total_slots = query_count  # resident slot 容量 = 每请求 query 槽位（恒等分配）
+    res_blk_per_req = (total_slots + BLOCK_SIZE - 1) // BLOCK_SIZE
+    res_blk_num = bs * res_blk_per_req
+    pool_rows = host_blk_num * BLOCK_SIZE * (KV_DIM + ROPE_DIM) // KV_DIM
+    ctx = dict(bs=bs, host_slots_per_entry=host_blk_per_req * BLOCK_SIZE,
+               res_slots_per_req=res_blk_per_req * BLOCK_SIZE, res_blk_num=res_blk_num)
+
+    hbm_elems = (host_blk_num + res_blk_num) * BLOCK_SIZE * (KV_DIM + ROPE_DIM)
+    hbm = torch.empty(hbm_elems, dtype=torch.float16, device=dev)
+    h_num = host_blk_num * BLOCK_SIZE
+    host_kv = hbm[:h_num * KV_DIM].view(host_blk_num, BLOCK_SIZE, KV_DIM)
+    host_rope = hbm[h_num * KV_DIM:h_num * (KV_DIM + ROPE_DIM)].view(host_blk_num, BLOCK_SIZE, ROPE_DIM)
+    r_off = h_num * (KV_DIM + ROPE_DIM)
+    res_kv = hbm[r_off:r_off + res_blk_num * BLOCK_SIZE * KV_DIM].view(res_blk_num, BLOCK_SIZE, KV_DIM)
+    res_rope = hbm[r_off + res_blk_num * BLOCK_SIZE * KV_DIM:].view(res_blk_num, BLOCK_SIZE, ROPE_DIM)
+    fill_staging(host_kv.view(-1, KV_DIM), 0)
+    fill_staging(host_rope.view(-1, ROPE_DIM), 1024)
+    res_kv.fill_(SENTINEL)
+    res_rope.fill_(SENTINEL)
+
+    host_tbl = torch.arange(host_blk_num, dtype=torch.int32, device=dev).view(bs, host_blk_per_req)
+    res_tbl = torch.arange(res_blk_num, dtype=torch.int32, device=dev).view(bs, res_blk_per_req)
+    pool_idx = torch.roll(torch.arange(bs, dtype=torch.int32), shifts=1).to(dev)  # 两跳寻址验证
+    step = max(1, key_len // query_count)
+    topk = (torch.arange(query_count, dtype=torch.int32) * step).remainder(key_len).view(1, -1).repeat(bs, 1).to(dev)
+    slots = torch.arange(query_count, dtype=torch.int32).view(1, -1).repeat(bs, 1).to(dev)
+    miss_pos = torch.arange(misses_per_req, dtype=torch.int64) * query_count // max(misses_per_req, 1)
+    mask_row = torch.zeros(query_count, dtype=torch.int32)
+    mask_row[miss_pos] = 1
+    mask = mask_row.view(1, -1).repeat(bs, 1).to(dev)
+
+    records = int(mask.sum().item())
+    return dict(hbm=hbm, host_kv=host_kv, host_rope=host_rope, res_kv=res_kv, res_rope=res_rope,
+                host_tbl=host_tbl, res_tbl=res_tbl, pool_idx=pool_idx, topk=topk, slots=slots, mask=mask,
+                pool_rows=pool_rows, ctx=ctx, records=records,
+                perm=torch.randperm(host_blk_num) if perm else None)
+
+
+def median_us(launch, repeat):
+    """Event 计时中位数（μs）：量 stream 上内核数据面时间（submit→record，含 ReadNbi+Drain 收尾）。"""
+    for _ in range(3):  # warmup（hcomm.Init 首执行、fatbin lazy load 已由外层 eager 首跑覆盖）
+        launch()
+    torch.npu.synchronize()
+    ts = []
+    for _ in range(repeat):
+        s = torch.npu.Event(enable_timing=True)
+        e = torch.npu.Event(enable_timing=True)
+        s.record()
+        launch()
+        e.record()
+        torch.npu.synchronize()
+        ts.append(s.elapsed_time(e) * 1000.0)  # ms → us
+    ts.sort()
+    return ts[len(ts) // 2]
+
+
+def run_bd(bd, case, ip, port, device, fatbin, mode, repeat):
+    """单 bd 点：建池 → 导出 → eager warmup+对拍 → eager/graph 计时。"""
+    pool = EmsPool(ip, port, device, layer_num=1, layer_rows=case["pool_rows"], row_bytes=KV_DIM * 2)
+    pool.create_pool(case["hbm"].data_ptr(), case["hbm"].numel() * 2, fatbin, n_channels=bd)
+    rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(case["host_kv"], case["host_rope"],
+                                                         BLOCK_SIZE, KV_DIM, ROPE_DIM, case["perm"],
+                                                         n_core=bd)
+    kv4 = case["res_kv"].view(case["res_kv"].shape[0], BLOCK_SIZE, 1, KV_DIM)
+    rope4 = case["res_rope"].view(case["res_rope"].shape[0], BLOCK_SIZE, 1, ROPE_DIM)
+    bs = case["mask"].shape[0]
+
+    def submit():
+        return torch_npu.npu_dsa_gather_rmt_submit(
+            kv4, rope4, case["res_tbl"], case["host_tbl"], case["pool_idx"], case["topk"],
+            case["slots"], case["mask"], BLOCK_SIZE, bs, rmt_ch, rmt_kv, rmt_rope, block_dim=bd)
+
+    # eager warmup 首跑（hcomm.Init 图外纪律）+ 正确性对拍（不计入计时）
+    torch_npu.npu_dsa_gather_rmt(kv4, rope4, case["res_tbl"], case["host_tbl"], case["pool_idx"],
+                                 case["topk"], case["slots"], case["mask"], BLOCK_SIZE, bs,
+                                 rmt_ch, rmt_kv, rmt_rope, block_dim=bd)
+    n = golden_check(case["host_kv"], case["host_rope"], case["res_kv"], case["res_rope"],
+                     case["pool_idx"], case["topk"], case["slots"], case["mask"], case["ctx"])
+    print("[test] golden PASS (bd=%d records=%d perm=%s)" % (bd, n, "on" if case["perm"] is not None else "off"))
+
+    results = {}
+    if mode in ("eager", "both"):
+        results["eager"] = median_us(submit, repeat)
+
+    if mode in ("graph", "both"):
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, auto_dispatch_capture=True):
+            submit()
+        results["graph"] = median_us(lambda: graph.replay(), repeat)
+
+    pool.destroy()
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", type=int, default=7)
-    ap.add_argument("--ems-master", type=str, default="141.61.49.198:27000")
-    ap.add_argument("--perm", action="store_true", help="远端槽位乱序")
-    ap.add_argument("--block-dim", type=int, default=1, help="AIV 核数（D2 矩阵）")
+    ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--ems-master", type=str, default="10.83.40.200:27000")
+    ap.add_argument("--bs", type=int, default=4, help="num_requests")
+    ap.add_argument("--query-count", type=int, default=256, help="每请求 top-K query 槽位数")
+    ap.add_argument("--key-len", type=int, default=4096, help="每池行 KV 序列长度（token 数）")
+    ap.add_argument("--misses-per-req", type=int, default=64, help="每请求 miss 记录数（均匀散布）")
+    ap.add_argument("--perm", action="store_true", help="远端块布局随机洗牌（打散 placement）")
+    ap.add_argument("--block-dims", type=str, default="1,2,4,8")
+    ap.add_argument("--mode", type=str, default="both", choices=["eager", "graph", "both"])
+    ap.add_argument("--repeat", type=int, default=10)
     args = ap.parse_args()
+    assert args.query_count > 0 and args.key_len % BLOCK_SIZE == 0 and 0 < args.misses_per_req <= args.query_count, \
+        "query_count>0, key_len must be multiple of BLOCK_SIZE(128), 0<misses_per_req<=query_count"
 
     torch.manual_seed(42)
     dev = torch.device("npu", args.device)
     torch.npu.set_device(dev)
     fatbin = next((p for p in FATBIN_CANDIDATES if os.path.exists(p)), None)
     assert fatbin, "fatbin not found: %s" % FATBIN_CANDIDATES
+    load_dsa_gather_rmt_op()
     ip, port = args.ems_master.rsplit(":", 1)
 
-    # 单一大 hbm 张量：host staging（导出源）+ resident 池（ReadNbi dst，须整段注册）
-    hbm_elems = HOST_BLK_NUM * BLOCK_SIZE * (KV_DIM + ROPE_DIM) + RES_BLK_NUM * BLOCK_SIZE * (KV_DIM + ROPE_DIM)
-    hbm = torch.empty(hbm_elems, dtype=torch.float16, device=dev)
-    h_num = HOST_BLK_NUM * BLOCK_SIZE
-    host_kv = hbm[:h_num * KV_DIM].view(HOST_BLK_NUM, BLOCK_SIZE, KV_DIM)
-    host_rope = hbm[h_num * KV_DIM:h_num * (KV_DIM + ROPE_DIM)].view(HOST_BLK_NUM, BLOCK_SIZE, ROPE_DIM)
-    r_off = h_num * (KV_DIM + ROPE_DIM)
-    res_kv = hbm[r_off:r_off + RES_BLK_NUM * BLOCK_SIZE * KV_DIM].view(RES_BLK_NUM, BLOCK_SIZE, KV_DIM)
-    res_rope = hbm[r_off + RES_BLK_NUM * BLOCK_SIZE * KV_DIM:].view(RES_BLK_NUM, BLOCK_SIZE, ROPE_DIM)
-    fill_staging(host_kv.view(-1, KV_DIM), 0)
-    fill_staging(host_rope.view(-1, ROPE_DIM), 1024)
-    res_kv.fill_(SENTINEL)
-    res_rope.fill_(SENTINEL)
+    case = build_case(args.bs, args.query_count, args.key_len, args.misses_per_req, args.perm, dev)
+    bds = [int(x) for x in args.block_dims.split(",") if x.strip()]
+    print("[test] bs=%d query_count=%d key_len=%d misses_per_req=%d → records=%d rec_bytes=%d moved=%.1f MB" % (
+        args.bs, args.query_count, args.key_len, args.misses_per_req,
+        case["records"], REC_BYTES, case["records"] * REC_BYTES / 1e6))
+    print("[test] matrix: block_dims=%s mode=%s repeat=%d perm=%s" % (
+        bds, args.mode, args.repeat, "on" if args.perm else "off"))
 
-    pool = EmsPool(ip, int(port), args.device, layer_num=1, layer_rows=POOL_ROWS, row_bytes=KV_DIM * 2)
-    pool.create_pool(hbm.data_ptr(), hbm.numel() * 2, fatbin, n_channels=args.block_dim)
-    perm = torch.randperm(HOST_BLK_NUM) if args.perm else None
-    rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(host_kv, host_rope, BLOCK_SIZE, KV_DIM, ROPE_DIM, perm,
-                                                         n_core=args.block_dim)
-    print("[test] rmt tables: ch=0x%x kv[0]=0x%x rope[0]=0x%x perm=%s n_core=%d" % (
-        int(rmt_ch[0]), int(rmt_kv[0]), int(rmt_rope[0]), "on" if args.perm else "off", args.block_dim))
+    rows = []
+    base = {}
+    for bd in bds:
+        res = run_bd(bd, case, ip, int(port), args.device, fatbin, args.mode, args.repeat)
+        for m, us in res.items():
+            if bd == bds[0]:
+                base[m] = us
+            rows.append((bd, m, us))
+        print("[test] bd=%d %s" % (bd, " ".join("%s=%.1fus" % (m, us) for m, us in res.items())))
 
-    # 索引元数据（语义对齐原版 test.py 构造）
-    host_tbl = torch.arange(HOST_BLK_NUM, dtype=torch.int32, device=dev).view(BS, HOST_BLK_PER_REQ)
-    res_tbl = torch.arange(RES_BLK_NUM, dtype=torch.int32, device=dev).view(BS, RES_BLK_PER_REQ)
-    pool_idx = torch.roll(torch.arange(BS, dtype=torch.int32), shifts=1).to(dev)  # [3,0,1,2] 验证两跳
-    step = max(1, KEY_LEN // QUERY_COUNT)
-    topk = (torch.arange(QUERY_COUNT, dtype=torch.int32) * step).remainder(KEY_LEN).view(1, -1).repeat(
-        BS, 1).to(dev)
-    slots = (torch.arange(QUERY_COUNT, dtype=torch.int32) * 5).remainder(TOTAL_SLOTS).view(1, -1).repeat(
-        BS, 1).to(dev)
-    miss_pos = torch.arange(MISSES_PER_REQ, dtype=torch.int64) * QUERY_COUNT // MISSES_PER_REQ
-    mask_row = torch.zeros(QUERY_COUNT, dtype=torch.int32)
-    mask_row[miss_pos] = 1
-    mask = mask_row.view(1, -1).repeat(BS, 1).to(dev)
-
-    st = pool.next_status(args.block_dim)
-    stream = torch.npu.current_stream().npu_stream
-    _kvops.dsa_gather_rmt(
-        res_kv.data_ptr(), res_rope.data_ptr(), res_tbl.data_ptr(), host_tbl.data_ptr(),
-        pool_idx.data_ptr(), topk.data_ptr(), slots.data_ptr(), mask.data_ptr(),
-        rmt_ch.data_ptr(), rmt_kv.data_ptr(), rmt_rope.data_ptr(), st,
-        BS, QUERY_COUNT, BLOCK_SIZE, KV_DIM, ROPE_DIM, 2, 2,
-        BS, HOST_BLK_PER_REQ, RES_BLK_PER_REQ, HOST_BLK_NUM, RES_BLK_NUM, stream, args.block_dim)
-    pool.wait(st, block_dim=args.block_dim)  # 每核独立 64B 槽（status+coreId*64）
-    torch.npu.synchronize()
-
-    n = golden_check(host_kv, host_rope, res_kv, res_rope, pool_idx, topk, slots, mask)
-    pool.destroy()
-    print("[test] dsa_gather_rmt remote golden check PASS (records=%d blockDim=%d perm=%s)" % (
-        n, args.block_dim, "on" if args.perm else "off"))
+    print("\n| blockDim | mode | time_us | records | moved_MB | BW_GB/s | speedup_vs_bd1 |")
+    print("|---|---|---|---|---|---|---|")
+    for bd, m, us in rows:
+        moved = case["records"] * REC_BYTES
+        bw = moved / (us / 1e6) / 1e9
+        sp = base.get(m, us) / us if us > 0 else 0.0
+        print("| %d | %s | %.1f | %d | %.1f | %.2f | %.2fx |" % (bd, m, us, case["records"], moved / 1e6, bw, sp))
+    print("\n[test] done. （time=stream 内核数据面中位；moved=miss 记录 kv+rope 字节；"
+          "参照基线：原版 910_93 H2D 164 records 98.78us）")
     return 0
 
 

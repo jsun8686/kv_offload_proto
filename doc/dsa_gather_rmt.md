@@ -118,23 +118,35 @@ with torch.npu.graph(graph, auto_dispatch_capture=True):
 for _ in range(N):
     reset_outputs()                   # 图外 sentinel 重置
     graph.replay(); torch.npu.synchronize()
-    npu_dsa_gather_rmt_wait(h)        # 可选：图外错误码校验（golden 对拍亦兜底）
+    npu_dsa_gather_rmt_result(h)      # 可选：图外错误码校验（golden 对拍亦兜底；纯读，不等待）
 ```
 
 纪律（对齐 MemFabric 用例14）：warmup 图外 eager 首跑（内核 hcomm.Init 首执行不得在 capture 中）；
 三表/页表/输出张量引用持有至最后回放；status 槽模块级池化复用（地址固定）。
-eager 语义不变：`npu_dsa_gather_rmt` = submit + wait 一行组合（旧调用方零感知）。
+eager 语义不变：`npu_dsa_gather_rmt` = submit + synchronize + result 一行组合（旧调用方零感知）。
+完成判定归 stream 同步（synchronize/Event）；result 只读结果——完成位契约校验（未同步误用显性报错）
++ 错误码校验（图回放下拿到内核错误码的唯一通道）。
 
-## 8. 性能摸底（tests/test_bench_dsa_gather_rmt.py）
+## 8. 性能摸底（tests/test_dsa_gather_rmt.py，唯一测试）
 
-矩阵：`--block-dims 1,2,4,8` × `--scale s1|s2|s3` × `--mode eager|graph|both`；
-计时 `torch.npu.Event` × warmup3 + repeat10 取中位；输出 `time_us / miss_records / moved_bytes /
-有效带宽 GB/s / vs bd1 加速比`（markdown 表）。规模档：
+**接口面**：仅 `torch_npu` 三件套（`load_dsa_gather_rmt_op` 挂载 eager/submit/result）。
+**流程**：每 (blockDim, mode) 点 = 建池(n_channels=bd) → 导出（`--perm` 可选打散布局）→
+eager warmup 首跑 + **golden 对拍一次（PASS 行，不计入计时）** → `torch.npu.Event` 计时
+（warmup×3 + repeat 中位）→ markdown 报表（time_us / records / moved_MB / BW_GB/s / vs bd1）。
 
-| 档 | queryCount | keyLen | 说明 |
-|---|---|---|---|
-| s1 | 256 | 4096 | 正确性档（records≈256） |
-| s2 | 2048 | 32768 | 中档（records≈8K） |
-| s3 | 2048 | 131072 | 原版生产形状（对齐 vllm dsa_gather；staging≈67MB） |
+```
+python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
+    [--bs 4 --query-count 256 --key-len 4096 --misses-per-req 64]    # 规模全参数化（golden.py 命名）
+    [--block-dims 1,2,4,8] [--mode eager|graph|both] [--repeat 10] [--perm]
+```
 
-参照基线：原版 910_93 H2D 路径 164 miss 记录 98.78μs（dsa_gather 上游）。
+| 参数 | 含义（对齐 vllm-ascend-csrc dsa_gather） | 性能量级示例 |
+|---|---|---|
+| `--bs` | num_requests | 4 |
+| `--query-count` | 每请求 top-K query 槽位（决定 miss 记录数上限） | 256 / 2048 |
+| `--key-len` | 每池行 KV 序列长度（决定远端池容量） | 4096 / 32768 / 131072（生产形状≈585MB 池） |
+| `--misses-per-req` | 每请求 miss 记录数（均匀散布合成 miss_mask） | 64 / 512 / 2048 |
+| `--perm` | 远端块布局随机洗牌 | 多节点打散 placement（任意 miss 局部性摊到各段→带宽聚合）；防内核顺序假设作弊 |
+
+单 miss 记录 = 144 KB（kv 128KB + rope 16KB）；每次调用搬运量 = `bs×misses_per_req×144KB`。
+参照基线：原版 910_93 H2D 路径 164 miss 记录 98.78μs。

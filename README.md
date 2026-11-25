@@ -23,9 +23,8 @@ ems/      emsd（池服务，master/worker，HBM 段 + AIV server 通道）
 kvops/    dsa_gather_rmt.cpp（AIV 内核）+ kvc_scatter_rows_alllayer.cpp（导出链）
           kvops_ext（fatbin 显式加载 + WithHostArgs launch）
 xds/      EmsPool（建池/批量导出/三表 [channel×n_core, kv_addr, rope_addr]）
-torchops/ torch_npu.npu_dsa_gather_rmt（eager 同步 + submit 两层 API）
-tests/    test_dsa_gather_rmt（原生 golden）· test_torch_dsa_gather_rmt（e2e/--graph）
-          test_bench_dsa_gather_rmt（性能摸底）
+torchops/ torch_npu 三件套挂载（npu_dsa_gather_rmt / _submit / _result）
+tests/    test_dsa_gather_rmt（唯一测试：golden 对拍 + 性能矩阵）
 ```
 
 ## 快速开始（A5/CANN 9.1.0 单节点）
@@ -38,13 +37,10 @@ tests/    test_dsa_gather_rmt（原生 golden）· test_torch_dsa_gather_rmt（e
 ./build/emsd/emsd --role master --ip <node_ip> --port 27000 --device 3 --loc device \
   --members <node_ip>:27000 --pool-size-gb 1
 
-# 2) NPU 侧跑 golden / e2e（--block-dim 声明每段通道数=核数）
-python -m tests.test_dsa_gather_rmt     --device 0 --ems-master <node_ip>:27000 --block-dim 8
-python -m tests.test_torch_dsa_gather_rmt --device 0 --ems-master <node_ip>:27000 --block-dim 8 [--perm] [--graph]
-
-# 3) 性能摸底（矩阵：blockDim × 规模档 × eager/graph）
-python -m tests.test_bench_dsa_gather_rmt --device 0 --ems-master <node_ip>:27000 \
-  --block-dims 1,2,4,8 --scale s2 --mode both
+# 2) NPU 侧唯一测试：torch_npu 三件套接口 + golden 对拍 + 性能矩阵（规模全参数化）
+python -m tests.test_dsa_gather_rmt --device 0 --ems-master <node_ip>:27000 \
+  --bs 4 --query-count 256 --key-len 4096 --misses-per-req 64 \
+  --block-dims 1,2,4,8 --mode both [--perm]
 ```
 
 ## 运行前提

@@ -1,4 +1,4 @@
-# coding=utf-8
+﻿# coding=utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026-2026. All rights reserved.
 # KV offload prototype is licensed under Mulan PSL v2.
 """torch 算子挂载（npu_dsa_gather_rmt，D2a 多核版）。
@@ -18,9 +18,9 @@ from torchops.dsa_gather_rmt_op import (
     load_dsa_gather_rmt_op,
     npu_dsa_gather_rmt,
     npu_dsa_gather_rmt_submit,
-    npu_dsa_gather_rmt_wait,
+    npu_dsa_gather_rmt_result,
 )
 
 __all__ = [
-    "load_dsa_gather_rmt_op", "npu_dsa_gather_rmt", "npu_dsa_gather_rmt_submit", "npu_dsa_gather_rmt_wait",
+    "load_dsa_gather_rmt_op", "npu_dsa_gather_rmt", "npu_dsa_gather_rmt_submit", "npu_dsa_gather_rmt_result",
 ]
