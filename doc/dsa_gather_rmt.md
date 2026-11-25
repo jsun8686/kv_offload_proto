@@ -1,7 +1,7 @@
 ﻿# 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
 
-> 状态：**D1.0 / D1.1 / D1.2(图模式) / D2a(多核) 已验收**（远端 golden + torch e2e + NPUGraph + 
-> block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）
+> 状态：**D1.0 / D1.1 / D1.2(图模式) / D2a(多核) 已验收**（远端 golden + torch e2e + NPUGraph +
+> block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）；**每进程单 bd 值**约束见 §9 遗留问题
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
 > H2D 透明搬运）；golden 基准 = 其 `golden.py`（miss_mask 唯一闸门 + sentinel 零搬运对拍）
 > 本仓已简化为 dsa_gather_rmt 单算子形态（gather_selection 系列及 V0 流水已移除，git 历史可溯）
@@ -136,12 +136,14 @@ eager 语义 = 外层显式三件组合（submit → synchronize → result）�
 eager = 外层显式组合三件）。
 **流程**：每 (blockDim, mode) 点 = 建池(n_channels=bd) → 导出（`--perm` 可选打散布局）→
 eager warmup 首跑 + **golden 对拍一次（PASS 行，不计入计时）** → `torch.npu.Event` 计时
-（warmup×3 + repeat 中位）→ markdown 报表（time_us / records / moved_MB / BW_GB/s / vs bd1）。
+（warmup×3 + repeat 中位）→ 结果行（time_us / records / moved_MB / BW_GB/s）。
+**每进程单 bd 值**（规避 §9 遗留问题）；多 bd 矩阵 = 外层循环独立进程：
 
 ```
 python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
     [--bs 4 --query-count 256 --key-len 4096 --misses-per-req 64]    # 规模全参数化（golden.py 命名）
-    [--block-dims 1,2,4,8] [--mode eager|graph|both] [--repeat 10] [--perm]
+    [--block-dim 1] [--mode eager|graph|both] [--repeat 10] [--perm]
+# 矩阵（bash）：for bd in 1 2 4 8; do python -m tests.test_dsa_gather_rmt --block-dim $bd ...; done
 ```
 
 | 参数 | 含义（对齐 vllm-ascend-csrc dsa_gather） | 性能量级示例 |
@@ -154,3 +156,36 @@ python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
 
 单 miss 记录 = 144 KB（kv 128KB + rope 16KB）；每次调用搬运量 = `bs×misses_per_req×144KB`。
 参照基线：原版 910_93 H2D 路径 164 miss 记录 98.78μs。
+
+## 9. 遗留问题（open）
+
+### 9.1 进程内多池重建 × block_dim≥2：hcomm device 侧状态污染（必挂）
+
+**现象**（2026-11-25，稳定复现）：同一测试进程内跑完首个 bd 点（池销毁重建）后，后续任何
+bd≥2 的点，warmup 首跑 `result` 报 `core 1 rc=0x10004ff`（Commit 失败：`0x400 + (ci<<24) +
+ret=255`）。与 graph/eager、升/降序、launch 次数均无关；bd=1 作为后续点不挂（无 core1 参与）。
+
+| 首点→次点 | 结果 | 次点 core1 参与 |
+|---|---|---|
+| 1→2 / 4→2 / 2→4 | 挂 core1 ci=1 ret=255 | ✓ |
+| 2→1 | PASS | ✗（bd=1 仅 core0） |
+| 单点 / 独立进程每 bd | 全 PASS | —（首点） |
+
+**数学矛盾（未解）**：bd=2 单节点下 core1 去重后必然仅 1 条通道（`chTbl[q*2+1]` 恒 h1），
+Commit 循环 `ci` 只能为 0；实测恒 ci=1 → 错误码本身证明内核行为已偏离预期语义（ci 编码
+误读 / 内核读到 stale 表 / hcomm device 状态污染使计数错乱，三者未定）。
+
+**根因线索（源码实证，hcomm=D:\code\hcomm，与 NPU 9.1.0 二进制行号精确一致）**：
+- `AicpuTsChannelHelper::g_BinHandle`（静态全局，仅 AICPU/AICPU_TS 引擎路径赋值）——
+  我们全程 `COMM_ENGINE_AIV` → 恒 null → `HcommChannelDestroy` 内
+  `if (!deviceHandles.empty() && binHandle)` 静默跳过 `ChannelKernelDestroy`
+  （"RunAicpuChannelDestroyV2"）→ **AIV 通道 device 侧实体从不清理**（host 两张表清理正常）。
+- 日志佐证：`[pool] channel_destroy done (+0.0s)` 瞬间返回，无内核下发痕迹。
+- 已排除：本仓 host/Python/内核三层无"只首次赋值"全局（逐层排查过）；
+  impl 层（`asc/impl/.../platform_v310|hcomm_aiv_urma.h`）Commit ret=255 语义未取得。
+
+**规避（已落地）**：测试改 `--block-dim` 单值/进程（§8）；矩阵 = 外层循环独立进程。
+
+**待办**：① 回传 platform impl 头（device 侧 Commit/Init 与 255 返回点）；② emsd plog
+`pre-alloc dev entity` 行对比两次 ChannelCreate 的实体地址（复用旧位 vs 新分配）；③ 依据
+根因评估 kvops close→re-init 强制 device 上下文重建，或向 hcomm 侧上报（bug 素材已齐）。

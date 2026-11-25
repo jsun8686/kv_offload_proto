@@ -8,9 +8,13 @@
     torch_npu.npu_dsa_gather_rmt_result(h)     结果校验（调用方须已 synchronize）
 eager 语义 = 显式三件组合：submit → torch.npu.synchronize() → result。
 
-流程（每 (blockDim, mode) 点）：建池(n_channels=bd) → 导出三表 → eager warmup 首跑
+流程（单 (blockDim, mode) 点）：建池(n_channels=bd) → 导出三表 → eager warmup 首跑
     → golden 对拍一次（PASS 行，不计入计时）→ Event 计时（warmup×3 + repeat 中位）
-    → markdown 报表（time_us / records / moved_MB / BW_GB/s / vs bd1）。
+    → 结果行（time_us / records / moved_MB / BW_GB/s）。
+
+多 blockDim 矩阵 = 外层循环多次调用（每 bd 独立进程）——规避进程内多池重建的
+    hcomm device 状态问题（见 doc/dsa_gather_rmt.md 遗留问题）：
+    for bd in 1 2 4 8; do python -m tests.test_dsa_gather_rmt --block-dim $bd ...; done
 
 规模全参数化（对齐 vllm-ascend-csrc dsa_gather golden.py 命名）：
     --bs（num_requests）--query-count（每请求 top-K query 槽位）
@@ -20,7 +24,7 @@ eager 语义 = 显式三件组合：submit → torch.npu.synchronize() → resul
 
 用法：python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
     [--bs 4 --query-count 256 --key-len 4096 --misses-per-req 64]
-    [--block-dims 1,2,4,8] [--mode eager|graph|both] [--repeat 10] [--perm]
+    [--block-dim 1] [--mode eager|graph|both] [--repeat 10] [--perm]
 """
 
 import argparse
@@ -187,7 +191,7 @@ def main():
     ap.add_argument("--key-len", type=int, default=4096, help="每池行 KV 序列长度（token 数）")
     ap.add_argument("--misses-per-req", type=int, default=64, help="每请求 miss 记录数（均匀散布）")
     ap.add_argument("--perm", action="store_true", help="远端块布局随机洗牌（打散 placement）")
-    ap.add_argument("--block-dims", type=str, default="1,2,4,8")
+    ap.add_argument("--block-dim", type=int, default=1, help="每进程单值（多 bd 用外层循环独立进程）")
     ap.add_argument("--mode", type=str, default="both", choices=["eager", "graph", "both"])
     ap.add_argument("--repeat", type=int, default=10)
     args = ap.parse_args()
@@ -203,30 +207,20 @@ def main():
     ip, port = args.ems_master.rsplit(":", 1)
 
     case = build_case(args.bs, args.query_count, args.key_len, args.misses_per_req, args.perm, dev)
-    bds = [int(x) for x in args.block_dims.split(",") if x.strip()]
+    bd = args.block_dim
+    assert bd >= 1, "block-dim must be >= 1"
     print("[test] bs=%d query_count=%d key_len=%d misses_per_req=%d → records=%d rec_bytes=%d moved=%.1f MB" % (
         args.bs, args.query_count, args.key_len, args.misses_per_req,
         case["records"], REC_BYTES, case["records"] * REC_BYTES / 1e6))
-    print("[test] matrix: block_dims=%s mode=%s repeat=%d perm=%s" % (
-        bds, args.mode, args.repeat, "on" if args.perm else "off"))
+    print("[test] point: block_dim=%d mode=%s repeat=%d perm=%s" % (
+        bd, args.mode, args.repeat, "on" if args.perm else "off"))
 
-    rows = []
-    base = {}
-    for bd in bds:
-        res = run_bd(bd, case, ip, int(port), args.device, fatbin, args.mode, args.repeat)
-        for m, us in res.items():
-            if bd == bds[0]:
-                base[m] = us
-            rows.append((bd, m, us))
-        print("[test] bd=%d %s" % (bd, " ".join("%s=%.1fus" % (m, us) for m, us in res.items())))
-
-    print("\n| blockDim | mode | time_us | records | moved_MB | BW_GB/s | speedup_vs_bd1 |")
-    print("|---|---|---|---|---|---|---|")
-    for bd, m, us in rows:
-        moved = case["records"] * REC_BYTES
+    res = run_bd(bd, case, ip, int(port), args.device, fatbin, args.mode, args.repeat)
+    moved = case["records"] * REC_BYTES
+    for m, us in res.items():
         bw = moved / (us / 1e6) / 1e9
-        sp = base.get(m, us) / us if us > 0 else 0.0
-        print("| %d | %s | %.1f | %d | %.1f | %.2f | %.2fx |" % (bd, m, us, case["records"], moved / 1e6, bw, sp))
+        print("[test] bd=%d %s=%.1fus BW=%.2f GB/s (%d records, %.1f MB moved)" % (
+            bd, m, us, bw, case["records"], moved / 1e6))
     print("\n[test] done. （time=stream 内核数据面中位；moved=miss 记录 kv+rope 字节；"
           "参照基线：原版 910_93 H2D 164 records 98.78us）")
     return 0

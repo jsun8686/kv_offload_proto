@@ -37,10 +37,12 @@ tests/    test_dsa_gather_rmt（唯一测试：golden 对拍 + 性能矩阵）
 ./build/emsd/emsd --role master --ip <node_ip> --port 27000 --device 3 --loc device \
   --members <node_ip>:27000 --pool-size-gb 1
 
-# 2) NPU 侧唯一测试：torch_npu 三件套接口 + golden 对拍 + 性能矩阵（规模全参数化）
+# 2) NPU 侧唯一测试：torch_npu 两件套接口 + golden 对拍 + 性能（规模全参数化，每进程单 bd 值）
 python -m tests.test_dsa_gather_rmt --device 0 --ems-master <node_ip>:27000 \
   --bs 4 --query-count 256 --key-len 4096 --misses-per-req 64 \
-  --block-dims 1,2,4,8 --mode both [--perm]
+  --block-dim 4 --mode both [--perm]
+# 多 bd 矩阵 = 外层循环独立进程（规避 hcomm 多池重建问题，见 doc/dsa_gather_rmt.md §9）：
+for bd in 1 2 4 8; do python -m tests.test_dsa_gather_rmt --block-dim $bd ...; done
 ```
 
 ## 运行前提
