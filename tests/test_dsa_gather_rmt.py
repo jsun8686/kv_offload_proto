@@ -189,7 +189,7 @@ def _run_bd_inner(bd, case, ip, port, device, fatbin, mode, repeat, pool):
             submit()
         results["graph"] = median_us(lambda: graph.replay(), repeat)
 
-    pool.destroy()
+    # pool.destroy 由 run_bd 的 finally 单点负责（此处再调会双执行——实测两轮 channel_destroy）
     return results
 
 
