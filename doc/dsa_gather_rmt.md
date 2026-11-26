@@ -1,8 +1,9 @@
 ﻿# 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
 
 > 状态：**D1.0 / D1.1 / D1.2(图模式) / D2a(多核) 已验收**（远端 golden + torch e2e + NPUGraph +
-> block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）；**跨机性能收口**（2026-11-26：
-> 大档 graph bd=8 **740 GB/s**=全卡 87%，通道线性，跨机零损耗，§8.1）；
+> block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）；**跨机性能净载荷口径收口**
+> （2026-11-26：大档 graph bd=2/4/8 = 1.41/2.94/**5.78 GB/s**，通道线性，瓶颈=WJE 消息率，
+> UB 带宽未触及，§8.1；**粒度口径修正**——原版与内核均 per-token，早期 BW 数字虚高 128 倍已作废）
 > **每进程单 bd 值 + 重要测试前重启 emsd**约束见 §9 遗留问题
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
 > H2D 透明搬运）；golden 基准 = 其 `golden.py`（miss_mask 唯一闸门 + sentinel 零搬运对拍）
@@ -55,7 +56,10 @@ attr、resident 侧、pool entry 间接层、mask/校验语义**全部不变**�
 - 语义基准 = golden.py：miss_mask 闸门（命中/padding 零搬运）→ 索引非负 → 逻辑块不越表宽 →
   物理块不越池（三层校验全在 AIV，不回 CPU）
 - **纯 ReadNbi 直写 resident 池**（无 UB staging、无本地 MTE 流水——比 gather_selection_rmt 更薄）；
-  record 粒度 kv/rope 各一发（1KB/128B，ReadNbi 无对齐/粒度约束已实证）
+  **per-token 粒度** kv/rope 各一发（1KB/128B，ReadNbi 无对齐/粒度约束已实证）——
+  **与原版逐语义对齐**（原版 dsa_gather.cpp:130-139 `DataCopy len=kvRecordElements=size(3)`
+  单 token 向量；host 头 :293-296 "record dimension"=第 3 维——原版"record"即 token 级向量，
+  本仓早期 REC_BYTES 误乘 BLOCK_SIZE 的口径已修正，§8.1）
 - **原生多核数据并行**：pair（req_id×query_id）按核均分（尾核+1），核间零依赖；blockDim=1 即单核
   （同一代码路径，非独立分支）；status 每核独立 64B 槽（status + blockIdx*64）
 - 行首元数据（pool_entry）提循环外，行切换重取；`pair+1 < pairEnd` 防尾读
@@ -158,36 +162,40 @@ python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
 | `--misses-per-req` | 每请求 miss 记录数（均匀散布合成 miss_mask） | 64 / 512 / 2048 |
 | `--perm` | 远端块布局随机洗牌 | 多节点打散 placement（任意 miss 局部性摊到各段→带宽聚合）；防内核顺序假设作弊 |
 
-单 miss 记录 = 144 KB（kv 128KB + rope 16KB）；每次调用搬运量 = `bs×misses_per_req×144KB`。
+单 miss 记录 = 单 token 的 kv+rope = **1,152 B**（kv 1024B + rope 128B，fp16；与原版同
+per-token 口径）；每次调用净载荷 = `bs×misses_per_req×1152B`（大档 8192×1152 ≈ 9.4MB）。
 
-### 8.1 性能收口（2026-11-26，跨机 238→200，950PR，重启后干净态）
+### 8.1 性能收口（2026-11-26，跨机 238→200，950PR，重启后干净态，净载荷口径）
 
-**两个指标维度分开表述**：小档（256 records/37.7MB）= **端到端延迟指标**（浅队列，含
-launch/epilogue 固定开销，BW 数字不可外推）；大档（`--query-count 2048 --key-len 131072
---misses-per-req 2048`，8192 records/1.2GB）= **稳态带宽指标**。
+> **口径修正**：早期 REC_BYTES 误乘 BLOCK_SIZE（虚高 128 倍，所有旧 BW 数字作废）；修正后
+> 口径与原版/内核实现一致（per-token，§3 铁证）。**指标本质 = 消息率（WJE 吞吐）而非带宽**。
 
-| 大档 graph（跨机） | time_us | BW_GB/s | 扩展比 | 占理论上限 |
+| 大档 graph（跨机，1,632~6,700us） | time_us | 净载荷 BW | 消息率 | 扩展比 |
 |---|---|---|---|---|
-| bd=2 | 6,700.5 | 180.3 | 1x | — |
-| bd=4 | 3,211.0 | 376.2 | 2.09x | 双 plane 400 的 94% |
-| bd=8 | 1,632.2 | **740.1** | 4.11x | **全卡 850 的 87%** |
+| bd=2 | 6,700.5 | 1.41 GB/s | 2.44 M rec/s | 1x |
+| bd=4 | 3,211.0 | 2.94 GB/s | 5.10 M rec/s | 2.09x |
+| bd=8 | 1,632.2 | **5.78 GB/s** | **10.03 M rec/s** | 4.11x |
 
 | 小档（跨机，bd=2） | eager | graph |
 |---|---|---|
-| time_us / BW_GB/s | 223.3 / 169.1 | 202.3 / 186.6 |
+| time_us / 净载荷 BW | 223.3 / 1.46 GB/s | 202.3 / 1.46 GB/s |
 
-- **通道严格线性**：每通道 ~92.5 GB/s 恒定（D2a 每核独立通道扩展性在近极限带宽下保持）；
-- **740 GB/s 超双 plane 上限（400）**——8 通道 URMA 路由已吃满全卡 2 UDie 17 口
-  （线速 87%，扣协议/编码开销后贴物理极限）；
-- **跨机 = 同卡聚合带宽**（超节点 UB fabric 跨 Server 零损耗，极限带宽下再实证）；
-- 对 PCIe 参照：740 GB/s ≈ Gen5 x16 单向（~64 GB/s）的 **11.6 倍**。
+- **通道严格线性**（每通道 ~2.5M rec/s 恒定）——D2a 每核独立通道扩展性保持；
+- **真实瓶颈 = WJE 消息提交率**：bd=8 ≈ 10M 发/s（16384 发/1632us ≈ 100ns/发）——
+  **UB 带宽从未被触及**（5.78 vs 双 plane 400 GB/s，利用率 1.4%）——1152B 小包下
+  单位时间受限的是"发"数而非字节数；
+- **跨机 = 同机**（时延无差、扩展同形——UB fabric 跨 Server 零损耗在消息率口径下保持）；
+- **带宽优化方向（backlog）**：同块 miss 合并为整块 ReadNbi（len×128=144KB/发）→
+  单发字节数×128，同等消息率下带宽口径可达 ~400 GB/s（8 通道饱和）——语义变化
+  （同块 hit token 连带搬运，golden sentinel 对拍需联动），列为优化实验而非 bug。
 
 **UB 物理上限分档**（`hccn_tool -g dev_info` 实证每口 400 Gbps=50 GB/s；rootinfo 分层）：
 单口 50 / plane1（die0 双口）100 / plane2（die1 六口）300 / 双 plane 400 / 全卡 17 口
 850 GB/s。当前建链取层 0 本卡端点 EID（`0000:0300`），hccp 按 EID 内嵌 server 字段跨层
-路由（fabric 内 ECMP 多口负载均衡，实测 740 已证跨 die 调度）。
+路由（fabric 内 ECMP 多口负载均衡）。
 
-参照基线：原版 910_93 H2D 路径 164 miss 记录 98.78μs（PCIe 透明搬运，量级 <64 GB/s）。
+参照基线：原版 910_93 H2D 路径 164 token 记录 98.78μs ≈ **1.9 GB/s**（swap 缺页式换入，
+同 per-token 口径；本仓小档 1.46 GB/s 同量级，公平对拍需同规模条件，待 backlog）。
 
 ## 9. 遗留问题（open）
 

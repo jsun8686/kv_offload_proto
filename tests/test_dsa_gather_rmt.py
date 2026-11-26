@@ -18,8 +18,7 @@ eager 语义 = 显式三件组合：submit → torch.npu.synchronize() → resul
 
 规模全参数化（对齐 vllm-ascend-csrc dsa_gather golden.py 命名）：
     --bs（num_requests）--query-count（每请求 top-K query 槽位）
-    --key-len（每池行 KV 序列长度）--misses-per-req（每请求 miss 记录数，均匀散布）
-    --perm：远端块布局随机洗牌（验证查表寻址；多节点下即"打散"placement 策略，
+    --key-len（每池行 KV 序列长度）--misses-per-req（每请求 miss 记录数，均匀散布）    --perm：远端块布局随机洗牌（验证查表寻址；多节点下即"打散"placement 策略，
     任意 miss 局部性被平均摊到各段 → 带宽聚合）。
 
 用法：python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
@@ -47,7 +46,11 @@ FATBIN_CANDIDATES = [
 BLOCK_SIZE = 128
 KV_DIM, ROPE_DIM = 512, 64
 SENTINEL = -1000.0
-REC_BYTES = (BLOCK_SIZE * KV_DIM + BLOCK_SIZE * ROPE_DIM) * 2  # fp16：每 miss 记录搬运字节
+# 每 miss 记录搬运字节 = 单 token 的 kv+rope（fp16）。
+# 粒度铁证（对齐原版 dsa_gather）：原版内核 DataCopy len = kvRecordElements = 张量 size(3)（单
+# token 向量，dsa_gather.cpp:130-139 / dsa_gather_torch_adpt.h:293-296），per-token 换入；
+# 本仓内核 ReadNbi len = kvDim*elemSize 同粒度。早期版本误乘 BLOCK_SIZE（虚高 128 倍，已修正）。
+REC_BYTES = (KV_DIM + ROPE_DIM) * 2
 
 
 def fill_staging(flat, offset):
@@ -232,8 +235,8 @@ def main():
         bw = moved / (us / 1e6) / 1e9
         print("[test] bd=%d %s=%.1fus BW=%.2f GB/s (%d records, %.1f MB moved)" % (
             bd, m, us, bw, case["records"], moved / 1e6))
-    print("\n[test] done. （time=stream 内核数据面中位；moved=miss 记录 kv+rope 字节；"
-          "参照基线：原版 910_93 H2D 164 records 98.78us）")
+    print("\n[test] done. （time=stream 内核数据面中位；moved=miss 记录 per-token kv+rope 净载荷字节；"
+          "参照基线：原版 910_93 H2D 164 token 记录 98.78us≈1.9 GB/s（同 per-token 口径））")
     return 0
 
 
