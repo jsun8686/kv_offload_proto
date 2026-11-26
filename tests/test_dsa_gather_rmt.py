@@ -145,8 +145,19 @@ def median_us(launch, repeat):
 
 
 def run_bd(bd, case, ip, port, device, fatbin, mode, repeat):
-    """单 bd 点：建池 → 导出 → eager warmup+对拍 → eager/graph 计时。"""
+    """单 bd 点：建池 → 导出 → eager warmup+对拍 → eager/graph 计时。
+
+    pool.destroy 进 finally：任何失败（内核 errCode/poll 超时）都保证通道/池清理执行
+    （实测异常退出时跳过 destroy 会残留 hcomm 通道状态，进程退出触发 Bus error）。
+    """
     pool = EmsPool(ip, port, device, layer_num=1, layer_rows=case["pool_rows"], row_bytes=KV_DIM * 2)
+    try:
+        return _run_bd_inner(bd, case, ip, port, device, fatbin, mode, repeat, pool)
+    finally:
+        pool.destroy()
+
+
+def _run_bd_inner(bd, case, ip, port, device, fatbin, mode, repeat, pool):
     pool.create_pool(case["hbm"].data_ptr(), case["hbm"].numel() * 2, fatbin, n_channels=bd)
     rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(case["host_kv"], case["host_rope"],
                                                          BLOCK_SIZE, KV_DIM, ROPE_DIM, case["perm"],

@@ -66,6 +66,8 @@ class EmsPool:
         self._status_base = 0
         self._status_count = 0
         self._status_cursor = 0
+        # 单次 launch 写行数上限（WJE 深度保护，见 batch_write_alllayers 注释）
+        self._write_chunk_rows = 512
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
     def create_pool(self, hbm_pool_base: int, hbm_pool_size: int, fatbin_path: str,
@@ -181,6 +183,26 @@ class EmsPool:
                               block_dim: int = 1) -> int:
         if self.pool is None:
             raise RuntimeError("pool not created")
+        # 单次 launch 行数上限：WriteNbi<false> 累积 WJE 后才 Commit，单通道队列深度有限——
+        # 全量一次 launch 在大流量档（604MB/4096+ 行）实证溢出（errCode=0x3ff=Commit ret 255，
+        # 2026-11-26 跨机大档）。分片串行：每片独立 launch（内核内 Commit+Drain 清队列）+
+        # wait 后发下一片（导出为一次性建池操作，串行等待非热路径）。
+        chunk = self._write_chunk_rows
+        if row_cnt <= chunk:
+            return self._batch_write_once(row_lo, row_cnt, src_layer0_base, src_layer_stride, stream, block_dim)
+        st = 0
+        for sub_lo in range(0, row_cnt, chunk):
+            sub_cnt = min(chunk, row_cnt - sub_lo)
+            # 内核源寻址相对本片首行（src = srcLayer + (row - rowLo)*rowBytes），
+            # 故片间平移 src 基址；层间隔 stride 不受行平移影响。
+            st = self._batch_write_once(row_lo + sub_lo, sub_cnt,
+                                        src_layer0_base + sub_lo * self.row_bytes, src_layer_stride, stream,
+                                        block_dim)
+            self.wait(st, block_dim=block_dim)
+        return st  # 最后一片 status（已 wait；调用方再 wait 无害——槽已终态）
+
+    def _batch_write_once(self, row_lo: int, row_cnt: int, src_layer0_base, src_layer_stride: int, stream: int = 0,
+                          block_dim: int = 1) -> int:
         if stream == 0:  # 同 batch_read：对齐 torch_npu 当前流
             stream = torch.npu.current_stream().npu_stream
         status = self.next_status(self.node_num * block_dim)
