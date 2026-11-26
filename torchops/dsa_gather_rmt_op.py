@@ -23,7 +23,8 @@ import torch_npu
 
 import kvops_ext._kvops as _kvops
 
-_STATUS_POOL_SLOTS = 8  # 每 device 池化槽数（64B/槽，block_dim≤8 时单次最多全占）
+_STATUS_POOL_SLOTS = 48  # 每 device 池化槽数（64B/槽；对齐协议 KV_MAX_SEG_CHANNELS=48，
+#                         # block_dim 单次全占池深——bd=16 实证 8 槽池在 core 8 越界 peek）
 
 _DTYPE_PAIRS = {(torch.float16, torch.float16), (torch.bfloat16, torch.bfloat16),
                 (torch.int8, torch.bfloat16)}
