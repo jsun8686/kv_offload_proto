@@ -41,9 +41,17 @@ tests/    test_dsa_gather_rmt（唯一测试：golden 对拍 + 性能矩阵）
 python -m tests.test_dsa_gather_rmt --device 0 --ems-master <node_ip>:27000 \
   --bs 4 --query-count 256 --key-len 4096 --misses-per-req 64 \
   --block-dim 4 --mode both [--perm]
+# 大档带宽（1.2GB/次）：--query-count 2048 --key-len 131072 --misses-per-req 2048
 # 多 bd 矩阵 = 外层循环独立进程（规避 hcomm 多池重建问题，见 doc/dsa_gather_rmt.md §9）：
 for bd in 1 2 4 8; do python -m tests.test_dsa_gather_rmt --block-dim $bd ...; done
 ```
+
+## 性能参考（跨机 950PR，2026-11-26）
+
+大档 graph（8192 records / 1.2GB）：bd=2/4/8 → **180 / 376 / 740 GB/s**（通道线性，
+bd=8 达全卡 UB 线速 87%，≈PCIe Gen5 x16 单向的 11.6 倍）；小档（256 records）延迟
+graph 202us。跨机与同机带宽持平（超节点 UB fabric 零损耗）。详见
+`doc/dsa_gather_rmt.md` §8.1。
 
 ## 运行前提
 

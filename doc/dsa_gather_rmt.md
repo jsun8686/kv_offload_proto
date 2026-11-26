@@ -1,7 +1,9 @@
 ﻿# 设计：dsa_gather × 远端内存池适配（dsa_gather_rmt）
 
 > 状态：**D1.0 / D1.1 / D1.2(图模式) / D2a(多核) 已验收**（远端 golden + torch e2e + NPUGraph +
-> block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）；**每进程单 bd 值**约束见 §9 遗留问题
+> block-dim {1,2,4,8}×{恒等,perm,graph} 全绿，2026-11-24）；**跨机性能收口**（2026-11-26：
+> 大档 graph bd=8 **740 GB/s**=全卡 87%，通道线性，跨机零损耗，§8.1）；
+> **每进程单 bd 值 + 重要测试前重启 emsd**约束见 §9 遗留问题
 > 上游参照：vllm-ascend-csrc `csrc/attention/dsa_gather`（原算子：Host swap memory → resident HBM，
 > H2D 透明搬运）；golden 基准 = 其 `golden.py`（miss_mask 唯一闸门 + sentinel 零搬运对拍）
 > 本仓已简化为 dsa_gather_rmt 单算子形态（gather_selection 系列及 V0 流水已移除，git 历史可溯）
@@ -17,7 +19,7 @@
 DSA 三算子流水位置不变：`lookup → (hit SFA ∥ gather(miss)) → miss SFA → DA merge`，gather 独立
 stream 与 hit SFA 重叠（原版实测 98%+ 区间重叠）。
 
-## 2. 接口（10 tensor + 2 attr → 9 tensor + 2 attr）
+## 2. 接口（11 tensor + 2 attr = dsa_gather 8 保留 + 删 2 + 新增 3 rmt 表 + block_dim）
 
 ```python
 h = torch_npu.npu_dsa_gather_rmt_submit(     # 纯提交原语（图捕获区间 / eager 通用）
@@ -134,10 +136,12 @@ eager 语义 = 外层显式三件组合（submit → synchronize → result）�
 
 **接口面**：仅 `torch_npu` 两件套原语（`load_dsa_gather_rmt_op` 挂载 submit/result；
 eager = 外层显式组合三件）。
-**流程**：每 (blockDim, mode) 点 = 建池(n_channels=bd) → 导出（`--perm` 可选打散布局）→
-eager warmup 首跑 + **golden 对拍一次（PASS 行，不计入计时）** → `torch.npu.Event` 计时
-（warmup×3 + repeat 中位）→ 结果行（time_us / records / moved_MB / BW_GB/s）。
-**每进程单 bd 值**（规避 §9 遗留问题）；多 bd 矩阵 = 外层循环独立进程：
+**流程**：每 (blockDim, mode) 点 = 建池(n_channels=bd) → 导出（`--perm` 可选打散布局；
+大池导出按 512 行/片串行 launch+wait——`xds_ems_pool._write_chunk_rows`，WJE 深度保护，
+见 §9.3）→ eager warmup 首跑 + **golden 对拍一次（PASS 行，不计入计时）** →
+`torch.npu.Event` 计时（warmup×3 + repeat 中位）→ 结果行（time_us / records / moved_MB / BW_GB/s）。
+**每进程单 bd 值**（规避 §9 遗留问题）；**重要测试前重启 emsd**（规避 §9.2 跨池累积）；
+多 bd 矩阵 = 外层循环独立进程：
 
 ```
 python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
@@ -155,7 +159,35 @@ python -m tests.test_dsa_gather_rmt --device 0 --ems-master <ip:port>
 | `--perm` | 远端块布局随机洗牌 | 多节点打散 placement（任意 miss 局部性摊到各段→带宽聚合）；防内核顺序假设作弊 |
 
 单 miss 记录 = 144 KB（kv 128KB + rope 16KB）；每次调用搬运量 = `bs×misses_per_req×144KB`。
-参照基线：原版 910_93 H2D 路径 164 miss 记录 98.78μs。
+
+### 8.1 性能收口（2026-11-26，跨机 238→200，950PR，重启后干净态）
+
+**两个指标维度分开表述**：小档（256 records/37.7MB）= **端到端延迟指标**（浅队列，含
+launch/epilogue 固定开销，BW 数字不可外推）；大档（`--query-count 2048 --key-len 131072
+--misses-per-req 2048`，8192 records/1.2GB）= **稳态带宽指标**。
+
+| 大档 graph（跨机） | time_us | BW_GB/s | 扩展比 | 占理论上限 |
+|---|---|---|---|---|
+| bd=2 | 6,700.5 | 180.3 | 1x | — |
+| bd=4 | 3,211.0 | 376.2 | 2.09x | 双 plane 400 的 94% |
+| bd=8 | 1,632.2 | **740.1** | 4.11x | **全卡 850 的 87%** |
+
+| 小档（跨机，bd=2） | eager | graph |
+|---|---|---|
+| time_us / BW_GB/s | 223.3 / 169.1 | 202.3 / 186.6 |
+
+- **通道严格线性**：每通道 ~92.5 GB/s 恒定（D2a 每核独立通道扩展性在近极限带宽下保持）；
+- **740 GB/s 超双 plane 上限（400）**——8 通道 URMA 路由已吃满全卡 2 UDie 17 口
+  （线速 87%，扣协议/编码开销后贴物理极限）；
+- **跨机 = 同卡聚合带宽**（超节点 UB fabric 跨 Server 零损耗，极限带宽下再实证）；
+- 对 PCIe 参照：740 GB/s ≈ Gen5 x16 单向（~64 GB/s）的 **11.6 倍**。
+
+**UB 物理上限分档**（`hccn_tool -g dev_info` 实证每口 400 Gbps=50 GB/s；rootinfo 分层）：
+单口 50 / plane1（die0 双口）100 / plane2（die1 六口）300 / 双 plane 400 / 全卡 17 口
+850 GB/s。当前建链取层 0 本卡端点 EID（`0000:0300`），hccp 按 EID 内嵌 server 字段跨层
+路由（fabric 内 ECMP 多口负载均衡，实测 740 已证跨 die 调度）。
+
+参照基线：原版 910_93 H2D 路径 164 miss 记录 98.78μs（PCIe 透明搬运，量级 <64 GB/s）。
 
 ## 9. 遗留问题（open）
 
@@ -189,3 +221,26 @@ Commit 循环 `ci` 只能为 0；实测恒 ci=1 → 错误码本身证明内核�
 **待办**：① 回传 platform impl 头（device 侧 Commit/Init 与 255 返回点）；② emsd plog
 `pre-alloc dev entity` 行对比两次 ChannelCreate 的实体地址（复用旧位 vs 新分配）；③ 依据
 根因评估 kvops close→re-init 强制 device 上下文重建，或向 hcomm 侧上报（bug 素材已齐）。
+
+### 9.2 emsd 跨池累积（跨机放大）：多池后通道批量创建 HCCL_E_INTERNAL（重启恢复）
+
+**现象**（2026-11-26，跨机 238→200）：emsd（15:09 起）连续服务 4 个池（累计 10 条通道）
+后，第 5 池 `n_channels=8` 的 client 批量 `HcommChannelCreate` 返回 `ret=4`
+（`HCCL_E_INTERNAL`，hcomm 枚举实证）。**重启 emsd → 8 通道一次成功**（READY 全绿，
+性能正常）。
+
+**判别结论**：与 §9.1 同族的**跨机放大**——AIV 通道 device 实体不清理（§9.1 根因线索
+同源）+ URMA 资源随池数增长，触某个上限后批量创建报内部错误。规避 = **重要测试前重启
+emsd**（§8 纪律）；根治同 §9.1 待办（hcomm 侧）。
+
+### 9.3 失败池污染次池：首跑慢路径（归档，根因已消除）
+
+**现象链**（2026-11-26）：大档导出 0x3ff 失败（当时 scatter 单次 launch 全量行，Commit
+ret=255，§9.1 同族）→ 该池异常退出后**下一个池** gather graph 首组计时 306ms/3.94 GB/s
+（同命令稳态 6.7ms/180 GB/s，差 45.7 倍）→ 再下一个池自愈恢复；重启后首池首跑直接
+正常（1,632us）。**归因**：失败池通道残留 WJE（destroy 只清 host 侧）污染复用同地址的
+次池通道（首几批慢/重传），非"首跑慢"本身。
+
+**根治（已落地）**：导出分片（`batch_write_alllayers` 512 行/片串行 launch+wait，WJE
+深度保护）消灭 0x3ff 根因；`run_bd` try/finally 保证 destroy 执行（消灭 Bus error 次生、
+双执行已修）。此路径不再出现，归档备查。
