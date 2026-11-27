@@ -333,5 +333,9 @@ class EmsPool:
                             "kv op poll timeout on node {} block {} (kernel doneSeq not set in {:.0f}s, "
                             "slot=[0x{:016x} 0x{:016x} 0x{:016x} 0x{:016x}])".format(
                                 s, b, timeout_us / 1e6, words[0], words[1], words[2], words[3]))
-                    raise RuntimeError("kv op failed on node {} block {}: errCode=0x{:x}".format(
-                        s, b, rc & 0xFFFFFFFF))
+                    # 挂点飞行记录：读内核诊断槽 1（scatter 的 queued=本片已入队行数，
+                    # 在 Drain 后/Finish 前写入——区分"WriteNbi 循环中挂"（<片行数）与
+                    # "Commit/Drain 挂"（=片行数，PollCq 快速失败/超时）
+                    queued = _kvops.peek_status(slot + 8) & 0xFFFFFFFF
+                    raise RuntimeError("kv op failed on node {} block {}: errCode=0x{:x} queuedRows={}".format(
+                        s, b, rc & 0xFFFFFFFF, queued))
