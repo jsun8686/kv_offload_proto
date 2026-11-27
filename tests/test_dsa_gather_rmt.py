@@ -98,14 +98,20 @@ def build_case(bs, query_count, key_len, misses_per_req, perm, dev):
     ctx = dict(bs=bs, host_slots_per_entry=host_blk_per_req * BLOCK_SIZE,
                res_slots_per_req=res_blk_per_req * BLOCK_SIZE, res_blk_num=res_blk_num)
 
-    hbm_elems = (host_blk_num + res_blk_num) * BLOCK_SIZE * (KV_DIM + ROPE_DIM)
+    # staging：导出源缓冲常驻 hbm 尾区（整块 hbm 在 create_pool 走 MemReg 注册）——
+    # WriteNbi src 官方语义为"通过 HcommMemReg 注册的本端内存"，原 gsrc 是 contiguous 独立
+    # 张量未注册；1.0737GiB 过 / 1.125GiB 挂的边界疑似未注册地址的段表覆盖上限，此区判别+规避
+    staging_elems = pool_rows * KV_DIM + BLOCK_SIZE * (KV_DIM + ROPE_DIM) // KV_DIM
+    hbm_elems = (host_blk_num + res_blk_num) * BLOCK_SIZE * (KV_DIM + ROPE_DIM) + staging_elems
     hbm = torch.empty(hbm_elems, dtype=torch.float16, device=dev)
     h_num = host_blk_num * BLOCK_SIZE
     host_kv = hbm[:h_num * KV_DIM].view(host_blk_num, BLOCK_SIZE, KV_DIM)
     host_rope = hbm[h_num * KV_DIM:h_num * (KV_DIM + ROPE_DIM)].view(host_blk_num, BLOCK_SIZE, ROPE_DIM)
     r_off = h_num * (KV_DIM + ROPE_DIM)
+    res_end = r_off + res_blk_num * BLOCK_SIZE * (KV_DIM + ROPE_DIM)
     res_kv = hbm[r_off:r_off + res_blk_num * BLOCK_SIZE * KV_DIM].view(res_blk_num, BLOCK_SIZE, KV_DIM)
-    res_rope = hbm[r_off + res_blk_num * BLOCK_SIZE * KV_DIM:].view(res_blk_num, BLOCK_SIZE, ROPE_DIM)
+    res_rope = hbm[r_off + res_blk_num * BLOCK_SIZE * KV_DIM:res_end].view(res_blk_num, BLOCK_SIZE, ROPE_DIM)
+    staging = hbm[res_end:]
     fill_staging(host_kv.view(-1, KV_DIM), 0)
     fill_staging(host_rope.view(-1, ROPE_DIM), 1024)
     res_kv.fill_(SENTINEL)
@@ -124,6 +130,7 @@ def build_case(bs, query_count, key_len, misses_per_req, perm, dev):
 
     records = int(mask.sum().item())
     return dict(hbm=hbm, host_kv=host_kv, host_rope=host_rope, res_kv=res_kv, res_rope=res_rope,
+                staging=staging,
                 host_tbl=host_tbl, res_tbl=res_tbl, pool_idx=pool_idx, topk=topk, slots=slots, mask=mask,
                 pool_rows=pool_rows, ctx=ctx, records=records,
                 perm=torch.randperm(host_blk_num) if perm else None)
@@ -163,8 +170,8 @@ def run_bd(bd, case, ip, port, device, fatbin, mode, repeat):
 def _run_bd_inner(bd, case, ip, port, device, fatbin, mode, repeat, pool):
     pool.create_pool(case["hbm"].data_ptr(), case["hbm"].numel() * 2, fatbin, n_channels=bd)
     rmt_ch, rmt_kv, rmt_rope = pool.export_full_rmt_pool(case["host_kv"], case["host_rope"],
-                                                         BLOCK_SIZE, KV_DIM, ROPE_DIM, case["perm"],
-                                                         n_core=bd)
+                                                          BLOCK_SIZE, KV_DIM, ROPE_DIM, case["perm"],
+                                                          n_core=bd, staging=case["staging"])
     kv4 = case["res_kv"].view(case["res_kv"].shape[0], BLOCK_SIZE, 1, KV_DIM)
     rope4 = case["res_rope"].view(case["res_rope"].shape[0], BLOCK_SIZE, 1, ROPE_DIM)
     bs = case["mask"].shape[0]

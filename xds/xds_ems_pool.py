@@ -224,7 +224,7 @@ class EmsPool:
     # 内核寻址约定（gather_selection_rmt）：块内 kv 连续 / 块内 rope 连续，addr 表给每块基址。
     # perm[q] = 块 q 的全局槽位（None 恒等：段 q//per_node、槽 q%per_node）。
     def export_full_rmt_pool(self, full_kv, full_rope, block_size: int, kv_dim: int, rope_dim: int,
-                             perm=None, stream: int = 0, n_core: int = 1):
+                             perm=None, stream: int = 0, n_core: int = 1, staging=None):
         if self.pool is None or not self.channels:
             raise RuntimeError("pool not created")
         n = self.node_num
@@ -279,6 +279,16 @@ class EmsPool:
         seg_stream[:, kv_rows_full:, :] = seg_rope.reshape(n, rope_rows_full, row_elems)
         # 全局交错源：[段][段内行] → 转置 [段内行][段] → 展平（全局行 x = t*n + s）
         gsrc = seg_stream.transpose(0, 1).reshape(n * seg_rows, row_elems).contiguous()
+        if staging is not None:
+            # src 换乘已注册 MR：staging 为 create_pool MemReg 注册的 hbm 尾区 view（fp16 连续）。
+            # WriteNbi src 官方语义为"通过 HcommMemReg 注册的本端内存"；gsrc 独立分配未注册，
+            # 大池（>1.07GiB 实测边界）触发 Commit 255（0x3ff）——判别/规避（staging=None 走原路径）
+            if staging.dtype != full_kv.dtype or staging.device != dev:
+                raise ValueError("staging dtype/device mismatch: {} {} vs {} {}".format(
+                    staging.dtype, staging.device, full_kv.dtype, dev))
+            if staging.numel() < gsrc.numel():
+                raise ValueError("staging elems {} < gsrc elems {}".format(staging.numel(), gsrc.numel()))
+            gsrc = staging[:gsrc.numel()].view_as(gsrc).copy_(gsrc)
         st = self.batch_write_alllayers(0, n * seg_rows, gsrc.data_ptr(), 0, stream=stream)
         self.wait(st)
 
